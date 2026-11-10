@@ -32,7 +32,7 @@
   </ItemGroup>
 
   <ItemGroup>
-    <Content Include="../../website/static/img/logo_128.png" Pack="true" Visible="false" PackagePath="/" />
+    <Content Include="$(MSBuildThisFileDirectory)website/static/img/logo_128.png" Pack="true" Visible="false" PackagePath="/" />
   </ItemGroup>
 
 	<!-- Common properties for nuget packages -->
