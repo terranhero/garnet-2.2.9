@@ -1,0 +1,288 @@
+﻿// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using Garnet.server.Metrics;
+using Microsoft.Extensions.Logging;
+using Tsavorite.core;
+
+namespace Garnet.server
+{
+    /// <summary>
+    /// Interface for logical database management
+    /// </summary>
+    public interface IDatabaseManager : IDisposable
+    {
+        /// <summary>
+        /// Default database (DB 0)
+        /// </summary>
+        public GarnetDatabase DefaultDatabase { get; }
+
+        /// <summary>
+        /// Store (of DB 0)
+        /// </summary>
+        public TsavoriteKV<StoreFunctions, StoreAllocator> Store { get; }
+
+        /// <summary>
+        /// AOF (of DB 0)
+        /// </summary>
+        public GarnetAppendOnlyFile AppendOnlyFile { get; }
+
+        /// <summary>
+        /// Last save time (of DB 0)
+        /// </summary>
+        public DateTimeOffset LastSaveTime { get; }
+
+        /// <summary>
+        /// Object store size tracker (of DB 0)
+        /// </summary>
+        public CacheSizeTracker SizeTracker { get; }
+
+        /// <summary>
+        /// Version map (of DB 0)
+        /// </summary>
+        internal WatchVersionMap VersionMap { get; }
+
+        /// <summary>
+        /// Number of current logical databases
+        /// </summary>
+        public int DatabaseCount { get; }
+
+        /// <summary>
+        /// Current max database ID
+        /// </summary>
+        public int MaxDatabaseId { get; }
+
+        /// <summary>
+        /// Try to get or add a new database
+        /// </summary>
+        /// <param name="dbId">Database ID</param>
+        /// <param name="success">Database was found or added successfully</param>
+        /// <param name="added">True if database was added</param>
+        /// <returns>Retrieved or added database</returns>
+        public GarnetDatabase TryGetOrAddDatabase(int dbId, out bool success, out bool added);
+
+        /// <summary>
+        /// Mark the beginning of a checkpoint by taking and a lock to avoid concurrent checkpointing
+        /// </summary>
+        /// <param name="dbId">ID of database to lock</param>
+        /// <returns>True if lock acquired</returns>
+        public bool TryPauseCheckpoints(int dbId);
+
+        /// <summary>
+        /// Release checkpoint task lock
+        /// </summary>
+        /// <param name="dbId">ID of database to unlock</param>
+        public void ResumeCheckpoints(int dbId);
+
+        /// <summary>
+        /// Recover checkpoint
+        /// </summary>
+        /// <param name="replicaRecover"></param>
+        /// <param name="recoverFromToken"></param>        
+        public ValueTask RecoverCheckpointAsync(bool replicaRecover = false, bool recoverFromToken = false, CheckpointMetadata metadata = null);
+
+        /// <summary>
+        /// Take checkpoint of all active databases (or a specified database) if checkpointing is not in progress
+        /// </summary>
+        /// <param name="background">True if method can return before checkpoint is taken</param>
+        /// <param name="dbId">ID of database to checkpoint, or -1 (default) to checkpoint all active databases</param>
+        /// <param name="token">Cancellation token</param>
+        /// <param name="logger">Logger</param>
+        /// <returns>
+        /// <see cref="CheckpointStatus.AlreadyInProgress"/> if another checkpointing process is already in progress,
+        /// <see cref="CheckpointStatus.Failed"/> if a foreground checkpoint did not complete, otherwise
+        /// <see cref="CheckpointStatus.Success"/>. A background checkpoint reports success once it has started.
+        /// </returns>
+        public Task<CheckpointStatus> TakeCheckpointAsync(bool background, int dbId = -1, CancellationToken token = default, ILogger logger = null);
+
+        /// <summary>
+        /// Take a checkpoint if no checkpoint was taken after the provided time offset
+        /// </summary>
+        /// <param name="entryTime">Time offset</param>
+        /// <param name="dbId">ID of database to checkpoint (default: DB 0)</param>
+        /// <returns>Task</returns>
+        public Task TakeOnDemandCheckpointAsync(DateTimeOffset entryTime, int dbId = 0);
+
+        /// <summary>
+        /// Take a checkpoint of all active databases whose AOF size has reached a specified limit
+        /// </summary>
+        /// <param name="aofSizeLimit">AOF size limit</param>
+        /// <param name="token">Cancellation token</param>
+        /// <param name="logger">Logger</param>
+        /// <returns>Task</returns>
+        public Task TaskCheckpointBasedOnAofSizeLimitAsync(long aofSizeLimit, CancellationToken token = default,
+            ILogger logger = null);
+
+        /// <summary>
+        /// Commit to AOF for all active databases
+        /// </summary>
+        /// <param name="token">Cancellation token</param>
+        /// <param name="logger">Logger</param>
+        /// <returns>Task</returns>
+        public Task CommitToAofAsync(CancellationToken token = default, ILogger logger = null);
+
+        /// <summary>
+        /// Commit to AOF for specified database
+        /// </summary>
+        /// <param name="dbId">ID of database to commit</param>
+        /// <param name="token">Cancellation token</param>
+        /// <param name="logger">Logger</param>
+        /// <returns>Task</returns>
+        public Task CommitToAofAsync(int dbId, CancellationToken token = default, ILogger logger = null);
+
+        /// <summary>
+        /// Wait for commit to AOF for all active databases
+        /// </summary>
+        /// <param name="token">Cancellation token</param>
+        /// <param name="logger">Logger</param>
+        /// <returns>Task</returns>
+        public Task WaitForCommitToAofAsync(CancellationToken token = default, ILogger logger = null);
+
+        /// <summary>
+        /// Recover AOF
+        /// </summary>
+        public ValueTask RecoverAOFAsync();
+
+        /// <summary>
+        /// Verify that the state recovered from checkpoint and AOF can reconstruct everything that was durably
+        /// acknowledged before shutdown. Reports an incomplete recovery as an error, and throws when the server
+        /// is configured to fail on recovery errors.
+        ///
+        /// The default implementation does nothing. The check reads recovery state that a database manager records
+        /// while recovering its own databases, so an implementation that does not track that state has nothing to
+        /// verify, and defaulting here keeps existing external implementations source and binary compatible.
+        /// </summary>
+        /// <param name="canBeRepairedBySync">True if a full sync from a primary will reconcile this node, in which
+        /// case an incomplete local recovery is reported but is not fatal</param>
+        public void VerifyRecoveryIsComplete(bool canBeRepairedBySync = false) { }
+
+        /// <summary>
+        /// When replaying AOF we do not want to write AOF records again.
+        /// </summary>
+        public AofAddress ReplayAOF(AofAddress untilAddress);
+
+        /// <summary>
+        /// Do compaction
+        /// </summary>
+        public ValueTask DoCompactionAsync(CancellationToken token = default, ILogger logger = null);
+
+        /// <summary>
+        /// Grows indexes of both main store and object store for all active databases if current size is too small
+        /// </summary>
+        /// <returns>True if indexes are maxed out</returns>
+        public ValueTask<bool> GrowIndexesIfNeededAsync(CancellationToken token = default);
+
+        /// <summary>
+        /// Executes a store-wide object collect operation
+        /// </summary>
+        public void ExecuteObjectCollection();
+
+        /// <summary>
+        /// Executes a store-wide expired key deletion scan operation
+        /// </summary>
+        public void ExpiredKeyDeletionScan();
+
+        /// <summary>
+        /// Start size trackers for all active databases
+        /// </summary>
+        public void StartSizeTrackers(CancellationToken token = default);
+
+        /// <summary>
+        /// Reset
+        /// </summary>
+        /// <param name="dbId">Database ID</param>
+        public void Reset(int dbId = 0);
+
+        /// <summary>
+        /// Resets the revivification stats.
+        /// </summary>
+        public void ResetRevivificationStats();
+
+        /// <summary>
+        /// Append a checkpoint commit to the AOF
+        /// </summary>
+        /// <param name="entryType"></param>
+        /// <param name="version"></param>
+        /// <param name="dbId"></param>
+        public void EnqueueCommit(AofEntryType entryType, long version, int dbId = 0);
+
+        /// <summary>
+        /// Get a snapshot of all active databases
+        /// </summary>
+        /// <returns>Array of active databases</returns>
+        public GarnetDatabase[] GetDatabasesSnapshot();
+
+        /// <summary>
+        /// Get database DB ID
+        /// </summary>
+        /// <param name="dbId">DB Id</param>
+        /// <param name="found">True if database was found</param>
+        /// <returns>Retrieved database</returns>
+        public GarnetDatabase TryGetDatabase(int dbId, out bool found);
+
+        /// <summary>
+        /// Flush database with specified ID
+        /// </summary>
+        /// <param name="unsafeTruncateLog">Truncate log</param>
+        /// <param name="dbId">Database ID</param>
+        public void FlushDatabase(bool unsafeTruncateLog, int dbId = 0);
+
+        /// <summary>
+        /// Flush all active databases 
+        /// </summary>
+        /// <param name="unsafeTruncateLog">Truncate log</param>
+        public void FlushAllDatabases(bool unsafeTruncateLog);
+
+        /// <summary>
+        /// Try to swap between two database instances
+        /// </summary>
+        /// <param name="dbId1">First database ID</param>
+        /// <param name="dbId2">Second database ID</param>
+        /// <param name="token">Cancellation token</param>
+        /// <returns>True if swap successful</returns>
+        public bool TrySwapDatabases(int dbId1, int dbId2, CancellationToken token = default);
+
+        /// <summary>
+        /// Create a shallow copy of the IDatabaseManager instance and copy databases to the new instance
+        /// </summary>
+        /// <param name="enableAof">True if AOF should be enabled in the clone</param>
+        /// <returns></returns>
+        public IDatabaseManager Clone(bool enableAof);
+
+        /// <summary>
+        /// Create a database functions state
+        /// </summary>
+        /// <param name="dbId">Database ID</param>
+        /// <returns>Functions state</returns>
+        internal FunctionsState CreateFunctionsState(int dbId = 0, byte respProtocolVersion = ServerOptions.DEFAULT_RESP_VERSION);
+
+        /// <summary>
+        /// On Demand Expired Keys collection, for a db given its ID
+        /// </summary>
+        public (long numExpiredKeysFound, long totalRecordsScanned) ExpiredKeyDeletionScan(int dbId);
+
+        /// <summary>
+        /// Count live keys and live keys with an expiration set for a database given its ID.
+        /// Used to populate the <c>INFO KEYSPACE</c> section.
+        /// </summary>
+        /// <param name="dbId">Database ID</param>
+        /// <returns>A tuple of (live keys, live keys with an expiration set).</returns>
+        public (long keyCount, long expireCount) GetKeyspaceStats(int dbId);
+
+        /// <summary>
+        /// Collect and return an array mapping db Id to its stats
+        /// </summary>
+        /// <returns></returns>
+        public (HybridLogScanMetrics mainStore, HybridLogScanMetrics objectStore)[] CollectHybridLogStats();
+
+        /// <summary>
+        /// Perform any recovery necessary for Vector Sets.
+        /// 
+        /// Must be called after checkpoints are recovered, as Vector Sets may make modifications to the log.
+        /// </summary>
+        public void RecoverVectorSets();
+    }
+}

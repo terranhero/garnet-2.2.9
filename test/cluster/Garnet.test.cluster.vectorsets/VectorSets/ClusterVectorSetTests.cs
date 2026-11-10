@@ -1,0 +1,3268 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Buffers.Binary;
+using System.Collections.Concurrent;
+using System.Collections.Frozen;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Diagnostics.CodeAnalysis;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Runtime.CompilerServices;
+using System.Runtime.ExceptionServices;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using Garnet.client;
+using Garnet.common;
+using Garnet.server;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using NUnit.Framework;
+using NUnit.Framework.Legacy;
+using StackExchange.Redis;
+using Tsavorite.core;
+
+namespace Garnet.test.cluster
+{
+    [TestFixture(0)]
+    [TestFixture(1_000)]
+    [NonParallelizable]
+    public class ClusterVectorSetTests : TestBase
+    {
+        protected int sublogCount = 1;
+
+        private sealed class StringAndByteArrayComparer : IEqualityComparer<(string Key, byte[] Elem)>
+        {
+            public static readonly StringAndByteArrayComparer Instance = new();
+
+            private StringAndByteArrayComparer() { }
+
+            public bool Equals((string Key, byte[] Elem) x, (string Key, byte[] Elem) y)
+            => x.Key.Equals(y.Key) && x.Elem.SequenceEqual(y.Elem);
+
+            public int GetHashCode([DisallowNull] (string Key, byte[] Elem) obj)
+            {
+                HashCode code = default;
+                code.Add(obj.Key);
+                code.AddBytes(obj.Elem);
+
+                return code.ToHashCode();
+            }
+        }
+
+        private sealed class CaptureLogWriter(TextWriter passThrough) : TextWriter
+        {
+            public bool capture;
+            public readonly StringBuilder buffer = new();
+
+            public override Encoding Encoding
+            => passThrough.Encoding;
+
+            public override void Write(string value)
+            {
+                passThrough.Write(value);
+
+                if (capture)
+                {
+                    lock (buffer)
+                    {
+                        _ = buffer.Append(value);
+                    }
+                }
+            }
+        }
+
+        private const int DefaultShards = 2;
+        private const int HighReplicationShards = 6;
+        private const int DefaultMultiPrimaryShards = 4;
+        private const string DefaultAOFMemorySize = "2g";  // Very large because CI boxes have low IOPS, so try and flush to disk veeeeeery rarely
+
+        private static readonly Dictionary<string, LogLevel> MonitorTests = new()
+        {
+            [nameof(MigrateVectorStressAsync)] = LogLevel.Error,
+        };
+
+        private ClusterTestContext context;
+
+        private CaptureLogWriter captureLogWriter;
+
+        private readonly int preAllocatedContexts;
+
+        public ClusterVectorSetTests(int preAllocatedContexts)
+        {
+            this.preAllocatedContexts = preAllocatedContexts;
+        }
+
+        [SetUp]
+        public virtual void Setup()
+        {
+            captureLogWriter = new(TestContext.Progress);
+
+            context = new ClusterTestContext();
+            context.logTextWriter = captureLogWriter;
+            context.Setup(MonitorTests);
+        }
+
+        [TearDown]
+        public virtual void TearDown()
+        {
+            context?.TearDown();
+        }
+
+        [Test]
+        public async Task BasicVADDReplicatesAsync(
+            [Values("XU8", "XI8", "FP32", "VALUES")] string vectorFormat,
+            [Values("NOQUANT", "BIN", "Q8", "XNOQUANT_U8", "XNOQUANT_I8", "XBIN_U8", "XBIN_I8")] string quantizer
+        )
+        {
+            const int PrimaryIndex = 0;
+            const int SecondaryIndex = 1;
+
+            VectorValueType vectorFormatParsed;
+            if (vectorFormat == "VALUES")
+            {
+                vectorFormatParsed = VectorValueType.Invalid;
+            }
+            else
+            {
+                ClassicAssert.IsTrue(Enum.TryParse(vectorFormat, ignoreCase: true, out vectorFormatParsed));
+            }
+
+            ClassicAssert.IsTrue(Enum.TryParse<VectorQuantType>(quantizer, ignoreCase: true, out var quantTypeParsed));
+
+            _ = await SimpleSetupClusterAsync(DefaultShards, primaryCount: 1, replicaCount: 1).ConfigureAwait(false);
+
+            var primary = (IPEndPoint)context.endpoints[PrimaryIndex];
+            var secondary = (IPEndPoint)context.endpoints[SecondaryIndex];
+
+            ClassicAssert.AreEqual("master", context.clusterTestUtils.RoleCommand(primary).Value);
+            ClassicAssert.AreEqual("slave", context.clusterTestUtils.RoleCommand(secondary).Value);
+
+            int addRes;
+
+            if (vectorFormatParsed == VectorValueType.Invalid)
+            {
+                var vectorAddData = new string[75];
+                vectorAddData[0] = "1";
+                for (var i = 1; i < vectorAddData.Length; i++)
+                {
+                    vectorAddData[i] = ((byte)(int.Parse(vectorAddData[i - 1]) + 1)).ToString();
+                }
+
+                addRes = (int)context.clusterTestUtils.Execute(primary, "VADD", ["foo", "VALUES", vectorAddData.Length.ToString(), .. vectorAddData, new byte[] { 0, 0, 0, 0 }, quantizer]);
+            }
+            else
+            {
+                byte[] vectorAddData;
+                if (vectorFormatParsed == VectorValueType.XU8)
+                {
+                    vectorAddData = new byte[75];
+                    vectorAddData[0] = 1;
+                    for (var i = 1; i < vectorAddData.Length; i++)
+                    {
+                        vectorAddData[i] = (byte)(vectorAddData[i - 1] + 1);
+                    }
+                }
+                else if (vectorFormatParsed == VectorValueType.XI8)
+                {
+                    var sbytes = new sbyte[75];
+                    sbytes[0] = 1;
+                    for (var i = 1; i < sbytes.Length; i++)
+                    {
+                        sbytes[i] = (sbyte)(sbytes[i - 1] + 1);
+                    }
+
+                    vectorAddData = MemoryMarshal.Cast<sbyte, byte>(sbytes).ToArray();
+                }
+                else if (vectorFormatParsed == VectorValueType.FP32)
+                {
+                    var floats = new float[75];
+                    floats[0] = 1;
+                    for (var i = 1; i < floats.Length; i++)
+                    {
+                        floats[i] = floats[i - 1] + 1;
+                    }
+
+                    vectorAddData = MemoryMarshal.Cast<float, byte>(floats).ToArray();
+                }
+                else
+                {
+                    ClassicAssert.Fail("Unexpected vector format");
+                    return;
+                }
+
+                addRes = (int)context.clusterTestUtils.Execute(primary, "VADD", ["foo", vectorFormat, vectorAddData, new byte[] { 0, 0, 0, 0 }, quantizer]);
+            }
+
+            ClassicAssert.AreEqual(1, addRes);
+
+            if (vectorFormatParsed == VectorValueType.Invalid)
+            {
+                var vectorSimData = new string[75];
+                vectorSimData[0] = "2";
+                for (var i = 1; i < vectorSimData.Length; i++)
+                {
+                    vectorSimData[i] = ((byte)(int.Parse(vectorSimData[i - 1]) + 1)).ToString();
+                }
+
+                var simRes = (byte[][])context.clusterTestUtils.Execute(primary, "VSIM", ["foo", "VALUES", vectorSimData.Length.ToString(), .. vectorSimData]);
+
+                ClassicAssert.IsTrue(simRes.Length > 0);
+
+                context.clusterTestUtils.WaitForReplicaAofSync(PrimaryIndex, SecondaryIndex);
+
+                var readonlyOnReplica = (string)context.clusterTestUtils.Execute(secondary, "READONLY", []);
+                ClassicAssert.AreEqual("OK", readonlyOnReplica);
+
+                var simOnReplica = (byte[][])context.clusterTestUtils.Execute(secondary, "VSIM", ["foo", "VALUES", vectorSimData.Length.ToString(), .. vectorSimData]);
+                ClassicAssert.IsTrue(simOnReplica.Length > 0);
+            }
+            else
+            {
+                byte[] vectorSimData;
+                if (vectorFormatParsed == VectorValueType.XU8)
+                {
+                    vectorSimData = new byte[75];
+                    vectorSimData[0] = 2;
+                    for (var i = 1; i < vectorSimData.Length; i++)
+                    {
+                        vectorSimData[i] = (byte)(vectorSimData[i - 1] + 1);
+                    }
+                }
+                else if (vectorFormatParsed == VectorValueType.XI8)
+                {
+                    var sbytes = new sbyte[75];
+                    sbytes[0] = 2;
+                    for (var i = 1; i < sbytes.Length; i++)
+                    {
+                        sbytes[i] = (sbyte)(sbytes[i - 1] + 1);
+                    }
+
+                    vectorSimData = MemoryMarshal.Cast<sbyte, byte>(sbytes).ToArray();
+                }
+                else if (vectorFormatParsed == VectorValueType.FP32)
+                {
+                    var floats = new float[75];
+                    floats[0] = 2;
+                    for (var i = 1; i < floats.Length; i++)
+                    {
+                        floats[i] = floats[i - 1] + 1;
+                    }
+
+                    vectorSimData = MemoryMarshal.Cast<float, byte>(floats).ToArray();
+                }
+                else
+                {
+                    ClassicAssert.Fail("Unexpected vector format");
+                    return;
+                }
+
+                var simRes = (byte[][])context.clusterTestUtils.Execute(primary, "VSIM", ["foo", vectorFormat, vectorSimData]);
+
+                ClassicAssert.IsTrue(simRes.Length > 0);
+
+                context.clusterTestUtils.WaitForReplicaAofSync(PrimaryIndex, SecondaryIndex);
+
+                var readonlyOnReplica = (string)context.clusterTestUtils.Execute(secondary, "READONLY", []);
+                ClassicAssert.AreEqual("OK", readonlyOnReplica);
+
+                var simOnReplica = (byte[][])context.clusterTestUtils.Execute(secondary, "VSIM", ["foo", vectorFormat, vectorSimData]);
+                ClassicAssert.IsTrue(simOnReplica.Length > 0);
+            }
+        }
+
+        [Test]
+        [TestCase(false)]
+        [TestCase(true)]
+        public async Task ConcurrentVADDReplicatedVSimsAsync(bool withAttributes)
+        {
+            const int PrimaryIndex = 0;
+            const int SecondaryIndex = 1;
+            const int Vectors = 2_000;
+            const string Key = nameof(ConcurrentVADDReplicatedVSimsAsync);
+
+            _ = await SimpleSetupClusterAsync(DefaultShards, primaryCount: 1, replicaCount: 1).ConfigureAwait(false);
+
+            var primary = (IPEndPoint)context.endpoints[PrimaryIndex];
+            var secondary = (IPEndPoint)context.endpoints[SecondaryIndex];
+
+            ClassicAssert.AreEqual("master", context.clusterTestUtils.RoleCommand(primary).Value);
+            ClassicAssert.AreEqual("slave", context.clusterTestUtils.RoleCommand(secondary).Value);
+
+            // Build some repeatably random data for inserts
+            var vectors = new byte[Vectors][];
+            {
+                var r = new Random(2025_09_15_00);
+
+                for (var i = 0; i < vectors.Length; i++)
+                {
+                    vectors[i] = new byte[75];
+                    r.NextBytes(vectors[i]);
+                }
+            }
+
+            using var sync = new SemaphoreSlim(2);
+
+            var writeTask =
+                Task.Run(
+                    async () =>
+                    {
+                        await sync.WaitAsync().ConfigureAwait(false);
+
+                        var key = new byte[4];
+                        for (var i = 0; i < vectors.Length; i++)
+                        {
+                            BinaryPrimitives.WriteInt32LittleEndian(key, i);
+                            var val = vectors[i];
+                            int addRes;
+                            if (withAttributes)
+                            {
+                                addRes = (int)context.clusterTestUtils.Execute(primary, "VADD", [Key, "XB8", val, key, "XPREQ8", "SETATTR", $"{{ \"id\": {i} }}"]);
+                            }
+                            else
+                            {
+                                addRes = (int)context.clusterTestUtils.Execute(primary, "VADD", [Key, "XB8", val, key, "XPREQ8"]);
+                            }
+                            ClassicAssert.AreEqual(1, addRes);
+                        }
+                    }
+                );
+
+            using var cts = new CancellationTokenSource();
+
+            var readTask =
+                Task.Run(
+                    async () =>
+                    {
+                        var r = new Random(2025_09_15_01);
+
+                        var readonlyOnReplica = (string)context.clusterTestUtils.Execute(secondary, "READONLY", []);
+                        ClassicAssert.AreEqual("OK", readonlyOnReplica);
+
+                        await sync.WaitAsync().ConfigureAwait(false);
+
+                        var nonZeroReturns = 0;
+                        var gotAttrs = 0;
+
+                        while (!cts.Token.IsCancellationRequested)
+                        {
+                            var val = vectors[r.Next(vectors.Length)];
+
+                            if (withAttributes)
+                            {
+                                var readRes = (byte[][])context.clusterTestUtils.Execute(secondary, "VSIM", [Key, "XB8", val, "WITHATTRIBS"]);
+                                if (readRes.Length > 0)
+                                {
+                                    nonZeroReturns++;
+                                }
+
+                                if ((readRes.Length % 2) != 0)
+                                {
+                                    var joined = string.Join(Environment.NewLine, readRes.Select(static x => Encoding.UTF8.GetString(x)));
+
+                                    ClassicAssert.Fail($"Unexpected response structure, entries={readRes.Length}{Environment.NewLine}{joined}");
+                                }
+
+                                for (var i = 0; i < readRes.Length; i += 2)
+                                {
+                                    var id = readRes[i];
+                                    var attr = readRes[i + 1];
+
+                                    var asInt = BinaryPrimitives.ReadInt32LittleEndian(id);
+
+                                    var actualAttr = Encoding.UTF8.GetString(attr);
+                                    var expectedAttr = $"{{ \"id\": {asInt} }}";
+
+                                    ClassicAssert.AreEqual(expectedAttr, actualAttr);
+
+                                    gotAttrs++;
+                                }
+                            }
+                            else
+                            {
+                                var readRes = (byte[][])context.clusterTestUtils.Execute(secondary, "VSIM", [Key, "XB8", val]);
+                                if (readRes.Length > 0)
+                                {
+                                    nonZeroReturns++;
+
+                                    for (var i = 0; i < readRes.Length; i++)
+                                    {
+                                        ClassicAssert.AreEqual(4, readRes[i].Length, $"Unexpected response: {Encoding.UTF8.GetString(readRes[i])}");
+                                    }
+                                }
+                            }
+                        }
+
+                        return (nonZeroReturns, gotAttrs);
+                    }
+                );
+
+            _ = sync.Release(2);
+            await writeTask.ConfigureAwait(false);
+
+            context.clusterTestUtils.WaitForReplicaAofSync(PrimaryIndex, SecondaryIndex);
+
+            cts.CancelAfter(TimeSpan.FromSeconds(1));
+
+            var (searchesWithNonZeroResults, searchesWithAttrs) = await readTask.ConfigureAwait(false);
+
+            ClassicAssert.IsTrue(searchesWithNonZeroResults > 0);
+
+            if (withAttributes)
+            {
+                ClassicAssert.IsTrue(searchesWithAttrs > 0);
+            }
+
+            // Validate all nodes have same vector embeddings
+            {
+                var idBytes = new byte[4];
+                for (var id = 0; id < vectors.Length; id++)
+                {
+                    BinaryPrimitives.WriteInt32LittleEndian(idBytes, id);
+                    var expected = vectors[id];
+
+                    var fromPrimary = (string[])context.clusterTestUtils.Execute(primary, "VEMB", [Key, idBytes]);
+                    var fromSecondary = (string[])context.clusterTestUtils.Execute(secondary, "VEMB", [Key, idBytes]);
+
+                    ClassicAssert.AreEqual(expected.Length, fromPrimary.Length);
+                    ClassicAssert.AreEqual(expected.Length, fromSecondary.Length);
+
+                    for (var i = 0; i < expected.Length; i++)
+                    {
+                        var p = (byte)float.Parse(fromPrimary[i]);
+                        var s = (byte)float.Parse(fromSecondary[i]);
+
+                        ClassicAssert.AreEqual(expected[i], p);
+                        ClassicAssert.AreEqual(expected[i], s);
+                    }
+                }
+            }
+        }
+
+        [Test]
+        [CancelAfter(120_000)]
+        public async Task RepeatedCreateDeleteAsync(CancellationToken testCancellationToken)
+        {
+            const int PrimaryIndex = 0;
+            const int SecondaryIndex = 1;
+
+            _ = await SimpleSetupClusterAsync(DefaultShards, primaryCount: 1, replicaCount: 1).ConfigureAwait(false);
+
+            var primary = (IPEndPoint)context.endpoints[PrimaryIndex];
+            var secondary = (IPEndPoint)context.endpoints[SecondaryIndex];
+
+            ClassicAssert.AreEqual("master", context.clusterTestUtils.RoleCommand(primary).Value);
+            ClassicAssert.AreEqual("slave", context.clusterTestUtils.RoleCommand(secondary).Value);
+
+            var bytes1 = new byte[75];
+            bytes1[0] = 1;
+            for (var j = 1; j < bytes1.Length; j++)
+            {
+                bytes1[j] = (byte)(bytes1[j - 1] + 1);
+            }
+
+            var bytes2 = new byte[75];
+            bytes2[0] = 5;
+            for (var j = 1; j < bytes2.Length; j++)
+            {
+                bytes2[j] = (byte)(bytes2[j - 1] + 1);
+            }
+
+            var bytes3 = new byte[75];
+            bytes3[0] = 10;
+            for (var j = 1; j < bytes3.Length; j++)
+            {
+                bytes3[j] = (byte)(bytes3[j - 1] + 1);
+            }
+
+            var key0 = new byte[4];
+            key0[0] = 1;
+            var key1 = new byte[4];
+            key1[0] = 2;
+
+            for (var i = 0; i < 100; i++)
+            {
+                var delRes = (int)context.clusterTestUtils.Execute(primary, "DEL", ["foo"]);
+
+                if (i != 0)
+                {
+                    ClassicAssert.AreEqual(1, delRes);
+                }
+                else
+                {
+                    ClassicAssert.AreEqual(0, delRes);
+                }
+
+                var addRes1 = (int)context.clusterTestUtils.Execute(primary, "VADD", ["foo", "XB8", bytes1, key0, "XPREQ8"]);
+                ClassicAssert.AreEqual(1, addRes1);
+
+                var addRes2 = (int)context.clusterTestUtils.Execute(primary, "VADD", ["foo", "XB8", bytes2, key1, "XPREQ8"]);
+                ClassicAssert.AreEqual(1, addRes2);
+
+                var readPrimaryExc = (string)context.clusterTestUtils.Execute(primary, "GET", ["foo"]);
+                ClassicAssert.IsTrue(readPrimaryExc.StartsWith("WRONGTYPE "));
+
+                var queryPrimary = (byte[][])context.clusterTestUtils.Execute(primary, "VSIM", ["foo", "XB8", bytes3]);
+                ClassicAssert.AreEqual(2, queryPrimary.Length);
+
+                _ = context.clusterTestUtils.Execute(secondary, "READONLY", []);
+
+                // The vector set has either replicated, or not
+                // If so - we get WRONGTYPE
+                // If not - we get a null
+                var readSecondary = (string)context.clusterTestUtils.Execute(secondary, "GET", ["foo"]);
+                ClassicAssert.IsTrue(readSecondary is null || readSecondary.StartsWith("WRONGTYPE "));
+
+                context.clusterTestUtils.WaitForReplicaAofSync(PrimaryIndex, SecondaryIndex);
+
+                var querySecondary = (byte[][])context.clusterTestUtils.Execute(secondary, "VSIM", ["foo", "XB8", bytes3]);
+                ClassicAssert.IsTrue(querySecondary.Length is (1 or 2));
+
+                for (var j = 0; j < querySecondary.Length; j++)
+                {
+                    var expected =
+                        querySecondary[j].AsSpan().SequenceEqual(key0) ||
+                        querySecondary[j].AsSpan().SequenceEqual(key1);
+
+                    ClassicAssert.IsTrue(expected);
+                }
+
+                Incr(key0);
+                Incr(key1);
+            }
+
+            static void Incr(byte[] k)
+            {
+                var ix = k.Length - 1;
+                while (true)
+                {
+                    k[ix]++;
+                    if (k[ix] == 0)
+                    {
+                        ix--;
+                    }
+                    else
+                    {
+                        break;
+                    }
+                }
+            }
+        }
+
+        [Test]
+        [CancelAfter(180_000)]
+        public async Task MultipleReplicasWithVectorSetsAsync()
+        {
+            const int PrimaryIndex = 0;
+            const int SecondaryStartIndex = 1;
+            const int SecondaryEndIndex = 5;
+            const int Vectors = 2_000;
+            const string Key = nameof(MultipleReplicasWithVectorSetsAsync);
+
+            _ = await SimpleSetupClusterAsync(HighReplicationShards, primaryCount: 1, replicaCount: 5).ConfigureAwait(false);
+
+            var primary = (IPEndPoint)context.endpoints[PrimaryIndex];
+            var secondaries = new IPEndPoint[SecondaryEndIndex - SecondaryStartIndex + 1];
+            for (var i = SecondaryStartIndex; i <= SecondaryEndIndex; i++)
+            {
+                secondaries[i - SecondaryStartIndex] = (IPEndPoint)context.endpoints[i];
+            }
+
+            ClassicAssert.AreEqual("master", context.clusterTestUtils.RoleCommand(primary).Value);
+
+            foreach (var secondary in secondaries)
+            {
+                ClassicAssert.AreEqual("slave", context.clusterTestUtils.RoleCommand(secondary).Value);
+            }
+
+            // Build some repeatably random data for inserts
+            var vectors = new byte[Vectors][];
+            {
+                var r = new Random(2025_09_23_00);
+
+                for (var i = 0; i < vectors.Length; i++)
+                {
+                    vectors[i] = new byte[75];
+                    r.NextBytes(vectors[i]);
+                }
+            }
+
+            using var sync = new SemaphoreSlim(2);
+
+            var writeTask =
+                Task.Run(
+                    async () =>
+                    {
+                        await sync.WaitAsync().ConfigureAwait(false);
+
+                        var key = new byte[4];
+                        for (var i = 0; i < vectors.Length; i++)
+                        {
+                            BinaryPrimitives.WriteInt32LittleEndian(key, i);
+                            var val = vectors[i];
+                            var addRes = (int)context.clusterTestUtils.Execute(primary, "VADD", [Key, "XB8", val, key, "XPREQ8"]);
+                            ClassicAssert.AreEqual(1, addRes);
+                        }
+                    }
+                );
+
+            using var cts = new CancellationTokenSource();
+
+            var readTasks = new Task<int>[secondaries.Length];
+
+            for (var i = 0; i < secondaries.Length; i++)
+            {
+                var secondary = secondaries[i];
+                var readTask =
+                    Task.Run(
+                        async () =>
+                        {
+                            var r = new Random(2025_09_23_01);
+
+                            var readonlyOnReplica = (string)context.clusterTestUtils.Execute(secondary, "READONLY", []);
+                            ClassicAssert.AreEqual("OK", readonlyOnReplica);
+
+                            await sync.WaitAsync().ConfigureAwait(false);
+
+                            var nonZeroReturns = 0;
+
+                            while (!cts.Token.IsCancellationRequested)
+                            {
+                                var val = vectors[r.Next(vectors.Length)];
+
+                                var readRes = (byte[][])context.clusterTestUtils.Execute(secondary, "VSIM", [Key, "XB8", val]);
+                                if (readRes.Length > 0)
+                                {
+                                    nonZeroReturns++;
+                                }
+                            }
+
+                            return nonZeroReturns;
+                        }
+                    );
+
+                readTasks[i] = readTask;
+            }
+
+            _ = sync.Release(secondaries.Length + 1);
+            await writeTask.ConfigureAwait(false);
+
+            for (var secondaryIndex = SecondaryStartIndex; secondaryIndex <= SecondaryEndIndex; secondaryIndex++)
+            {
+                context.clusterTestUtils.WaitForReplicaAofSync(PrimaryIndex, secondaryIndex);
+            }
+
+            cts.CancelAfter(TimeSpan.FromSeconds(1));
+
+            var searchesWithNonZeroResults = await Task.WhenAll(readTasks).ConfigureAwait(false);
+
+            ClassicAssert.IsTrue(searchesWithNonZeroResults.All(static x => x > 0));
+
+
+            // Validate all nodes have same vector embeddings
+            {
+                var idBytes = new byte[4];
+                for (var id = 0; id < vectors.Length; id++)
+                {
+                    BinaryPrimitives.WriteInt32LittleEndian(idBytes, id);
+                    var expected = vectors[id];
+
+                    var fromPrimary = (string[])context.clusterTestUtils.Execute(primary, "VEMB", [Key, idBytes]);
+
+                    ClassicAssert.AreEqual(expected.Length, fromPrimary.Length);
+
+                    for (var i = 0; i < expected.Length; i++)
+                    {
+                        var p = (byte)float.Parse(fromPrimary[i]);
+                        ClassicAssert.AreEqual(expected[i], p);
+                    }
+
+                    for (var secondaryIx = 0; secondaryIx < secondaries.Length; secondaryIx++)
+                    {
+                        var secondary = secondaries[secondaryIx];
+                        var fromSecondary = (string[])context.clusterTestUtils.Execute(secondary, "VEMB", [Key, idBytes]);
+
+                        ClassicAssert.AreEqual(expected.Length, fromSecondary.Length);
+
+                        for (var i = 0; i < expected.Length; i++)
+                        {
+                            var s = (byte)float.Parse(fromSecondary[i]);
+                            ClassicAssert.AreEqual(expected[i], s);
+                        }
+                    }
+                }
+            }
+        }
+
+        [Test]
+        [CancelAfter(180_000)]
+        public async Task MultipleReplicasWithVectorSetsAndDeletesAsync()
+        {
+            const int PrimaryIndex = 0;
+            const int SecondaryStartIndex = 1;
+            const int SecondaryEndIndex = 5;
+            const int Vectors = 2_000;
+            const int Deletes = Vectors / 10;
+            const string Key = nameof(MultipleReplicasWithVectorSetsAndDeletesAsync);
+
+            _ = await SimpleSetupClusterAsync(HighReplicationShards, primaryCount: 1, replicaCount: 5).ConfigureAwait(false);
+
+            var primary = (IPEndPoint)context.endpoints[PrimaryIndex];
+            var secondaries = new IPEndPoint[SecondaryEndIndex - SecondaryStartIndex + 1];
+            for (var i = SecondaryStartIndex; i <= SecondaryEndIndex; i++)
+            {
+                secondaries[i - SecondaryStartIndex] = (IPEndPoint)context.endpoints[i];
+            }
+
+            ClassicAssert.AreEqual("master", context.clusterTestUtils.RoleCommand(primary).Value);
+
+            foreach (var secondary in secondaries)
+            {
+                ClassicAssert.AreEqual("slave", context.clusterTestUtils.RoleCommand(secondary).Value);
+            }
+
+            // Build some repeatably random data for inserts
+            var vectors = new byte[Vectors][];
+            var toDeleteVectors = new HashSet<int>();
+            var pendingRemove = new List<int>();
+            {
+                var r = new Random(2025_10_20_00);
+
+                for (var i = 0; i < vectors.Length; i++)
+                {
+                    vectors[i] = new byte[75];
+                    r.NextBytes(vectors[i]);
+                }
+
+                while (toDeleteVectors.Count < Deletes)
+                {
+                    _ = toDeleteVectors.Add(r.Next(vectors.Length));
+                }
+
+                pendingRemove.AddRange(toDeleteVectors);
+            }
+
+            using var sync = new SemaphoreSlim(2);
+
+            var writeTask =
+                Task.Run(
+                    async () =>
+                    {
+                        await sync.WaitAsync().ConfigureAwait(false);
+
+                        var key = new byte[4];
+                        for (var i = 0; i < vectors.Length; i++)
+                        {
+                            BinaryPrimitives.WriteInt32LittleEndian(key, i);
+                            var val = vectors[i];
+                            var addRes = (int)context.clusterTestUtils.Execute(primary, "VADD", [Key, "XB8", val, key, "XPREQ8"]);
+                            ClassicAssert.AreEqual(1, addRes);
+                        }
+                    }
+                );
+
+            var deleteTask =
+                Task.Run(
+                    async () =>
+                    {
+                        await sync.WaitAsync().ConfigureAwait(false);
+
+                        var key = new byte[4];
+
+                        while (pendingRemove.Count > 0)
+                        {
+                            var i = Random.Shared.Next(pendingRemove.Count);
+                            var id = pendingRemove[i];
+
+                            BinaryPrimitives.WriteInt32LittleEndian(key, id);
+                            var remRes = (int)context.clusterTestUtils.Execute(primary, "VREM", [Key, key]);
+                            if (remRes == 1)
+                            {
+                                pendingRemove.RemoveAt(i);
+                            }
+                        }
+                    }
+                );
+
+            using var cts = new CancellationTokenSource();
+
+            var readTasks = new Task<int>[secondaries.Length];
+
+            for (var i = 0; i < secondaries.Length; i++)
+            {
+                var secondary = secondaries[i];
+                var readTask =
+                    Task.Run(
+                        async () =>
+                        {
+                            var r = new Random(2025_09_23_01);
+
+                            var readonlyOnReplica = (string)context.clusterTestUtils.Execute(secondary, "READONLY", []);
+                            ClassicAssert.AreEqual("OK", readonlyOnReplica);
+
+                            await sync.WaitAsync().ConfigureAwait(false);
+
+                            var nonZeroReturns = 0;
+
+                            while (!cts.Token.IsCancellationRequested)
+                            {
+                                var val = vectors[r.Next(vectors.Length)];
+
+                                var readRes = (byte[][])context.clusterTestUtils.Execute(secondary, "VSIM", [Key, "XB8", val]);
+                                if ((readRes?.Length ?? 0) > 0)
+                                {
+                                    nonZeroReturns++;
+                                }
+                            }
+
+                            return nonZeroReturns;
+                        }
+                    );
+
+                readTasks[i] = readTask;
+            }
+
+            _ = sync.Release(secondaries.Length + 2);
+            await writeTask.ConfigureAwait(false);
+            await deleteTask.ConfigureAwait(false);
+
+            for (var secondaryIndex = SecondaryStartIndex; secondaryIndex <= SecondaryEndIndex; secondaryIndex++)
+            {
+                context.clusterTestUtils.WaitForReplicaAofSync(PrimaryIndex, secondaryIndex);
+            }
+
+            cts.CancelAfter(TimeSpan.FromSeconds(1));
+
+            var searchesWithNonZeroResults = await Task.WhenAll(readTasks).ConfigureAwait(false);
+
+            ClassicAssert.IsTrue(searchesWithNonZeroResults.All(static x => x > 0));
+
+            // Validate all nodes have same vector embeddings
+            {
+                var idBytes = new byte[4];
+                for (var id = 0; id < vectors.Length; id++)
+                {
+                    BinaryPrimitives.WriteInt32LittleEndian(idBytes, id);
+                    var expected = vectors[id];
+
+                    var fromPrimary = (string[])context.clusterTestUtils.Execute(primary, "VEMB", [Key, idBytes]);
+
+                    var shouldBePresent = !toDeleteVectors.Contains(id);
+                    if (shouldBePresent)
+                    {
+                        ClassicAssert.AreEqual(expected.Length, fromPrimary.Length);
+
+                        for (var i = 0; i < expected.Length; i++)
+                        {
+                            var p = (byte)float.Parse(fromPrimary[i]);
+                            ClassicAssert.AreEqual(expected[i], p);
+                        }
+                    }
+                    else
+                    {
+                        ClassicAssert.IsEmpty(fromPrimary);
+                    }
+
+                    for (var secondaryIx = 0; secondaryIx < secondaries.Length; secondaryIx++)
+                    {
+                        var secondary = secondaries[secondaryIx];
+                        var fromSecondary = (string[])context.clusterTestUtils.Execute(secondary, "VEMB", [Key, idBytes]);
+
+                        if (shouldBePresent)
+                        {
+                            ClassicAssert.AreEqual(expected.Length, fromSecondary.Length);
+
+                            for (var i = 0; i < expected.Length; i++)
+                            {
+                                var s = (byte)float.Parse(fromSecondary[i]);
+
+                                if (expected[i] != s)
+                                {
+                                    var actual = fromSecondary.Select(f => (byte)float.Parse(f)).ToArray();
+                                    int? matchesId = null;
+                                    for (var otherId = 0; otherId < vectors.Length; otherId++)
+                                    {
+                                        if (vectors[otherId].SequenceEqual(actual))
+                                        {
+                                            matchesId = otherId;
+                                            break;
+                                        }
+                                    }
+
+                                    if (matchesId != null)
+                                    {
+                                        ClassicAssert.Fail($"For Id = {id}, mismatch at {i} ({expected[i]} != {s}); matches vector with Id = {matchesId.Value}");
+                                    }
+                                    else
+                                    {
+                                        ClassicAssert.Fail($"For Id = {id}, mismatch at {i} ({expected[i]} != {s}); does not match any expected vector");
+                                    }
+                                }
+                            }
+                        }
+                        else
+                        {
+                            ClassicAssert.IsEmpty(fromSecondary);
+                        }
+                    }
+                }
+            }
+        }
+
+        [Test]
+        public async Task VectorSetMigrateSingleBySlotAsync()
+        {
+            // Test migrating a single slot with a vector set of one element in it
+
+            const int Primary0Index = 0;
+            const int Primary1Index = 1;
+            const int Secondary0Index = 2;
+            const int Secondary1Index = 3;
+
+            _ = await SimpleSetupClusterAsync(DefaultMultiPrimaryShards, primaryCount: DefaultMultiPrimaryShards / 2, replicaCount: 1).ConfigureAwait(false);
+
+            var primary0 = (IPEndPoint)context.endpoints[Primary0Index];
+            var primary1 = (IPEndPoint)context.endpoints[Primary1Index];
+            var secondary0 = (IPEndPoint)context.endpoints[Secondary0Index];
+            var secondary1 = (IPEndPoint)context.endpoints[Secondary1Index];
+
+            ClassicAssert.AreEqual("master", context.clusterTestUtils.RoleCommand(primary0).Value);
+            ClassicAssert.AreEqual("master", context.clusterTestUtils.RoleCommand(primary1).Value);
+            ClassicAssert.AreEqual("slave", context.clusterTestUtils.RoleCommand(secondary0).Value);
+            ClassicAssert.AreEqual("slave", context.clusterTestUtils.RoleCommand(secondary1).Value);
+
+            var primary0Id = context.clusterTestUtils.ClusterMyId(primary0);
+
+            var slots = context.clusterTestUtils.ClusterSlots(primary0);
+
+            string primary0Key;
+            int primary0HashSlot;
+            {
+                var ix = 0;
+
+                while (true)
+                {
+                    primary0Key = $"{nameof(VectorSetMigrateSingleBySlotAsync)}_{ix}";
+                    primary0HashSlot = context.clusterTestUtils.HashSlot(primary0Key);
+
+                    if (slots.Any(x => x.nnInfo.Any(y => y.nodeid == primary0Id) && primary0HashSlot >= x.startSlot && primary0HashSlot <= x.endSlot))
+                    {
+                        break;
+                    }
+
+                    ix++;
+                }
+            }
+
+            // Setup simple vector set on Primary0 in some hash slot
+
+            var vectorData = Enumerable.Range(0, 75).Select(static x => (byte)x).ToArray();
+            var vectorSimData = Enumerable.Range(0, 75).Select(static x => (byte)(x * 2)).ToArray();
+
+            var add0Res = (int)context.clusterTestUtils.Execute(primary0, "VADD", [primary0Key, "XB8", vectorData, new byte[] { 0, 0, 0, 0 }, "XPREQ8", "SETATTR", "{\"hello\": \"world\"}"], flags: CommandFlags.NoRedirect);
+            ClassicAssert.AreEqual(1, add0Res);
+
+            var sim0Res = (byte[][])context.clusterTestUtils.Execute(primary0, "VSIM", [primary0Key, "XB8", vectorSimData, "WITHSCORES", "WITHATTRIBS"], flags: CommandFlags.NoRedirect);
+            ClassicAssert.AreEqual(3, sim0Res.Length);
+            ClassicAssert.IsTrue(new byte[] { 0, 0, 0, 0 }.SequenceEqual(sim0Res[0]));
+            ClassicAssert.IsFalse(float.IsNaN(float.Parse(Encoding.ASCII.GetString(sim0Res[1]))));
+            ClassicAssert.IsTrue("{\"hello\": \"world\"}"u8.SequenceEqual(sim0Res[2]));
+
+            context.clusterTestUtils.WaitForReplicaAofSync(Primary0Index, Secondary0Index);
+
+            var readonlyOnReplica0 = (string)context.clusterTestUtils.Execute(secondary0, "READONLY", [], flags: CommandFlags.NoRedirect);
+            ClassicAssert.AreEqual("OK", readonlyOnReplica0);
+
+            var simOnReplica0 = (byte[][])context.clusterTestUtils.Execute(secondary0, "VSIM", [primary0Key, "XB8", vectorSimData, "WITHSCORES", "WITHATTRIBS"], flags: CommandFlags.NoRedirect);
+            ClassicAssert.IsTrue(simOnReplica0.Length > 0);
+            for (var i = 0; i < sim0Res.Length; i++)
+            {
+                ClassicAssert.IsTrue(sim0Res[i].AsSpan().SequenceEqual(simOnReplica0[i]));
+            }
+
+            // Move to other primary
+
+            context.clusterTestUtils.MigrateSlots(primary0, primary1, [primary0HashSlot]);
+            context.clusterTestUtils.WaitForMigrationCleanup(Primary0Index);
+            context.clusterTestUtils.WaitForMigrationCleanup(Primary1Index);
+
+            context.clusterTestUtils.WaitForReplicaAofSync(Primary0Index, Secondary0Index);
+            context.clusterTestUtils.WaitForReplicaAofSync(Primary1Index, Secondary1Index);
+
+            var curPrimary0Slots = context.clusterTestUtils.GetOwnedSlotsFromNode(primary0, NullLogger.Instance);
+            var curPrimary1Slots = context.clusterTestUtils.GetOwnedSlotsFromNode(primary1, NullLogger.Instance);
+
+            ClassicAssert.IsFalse(curPrimary0Slots.Contains(primary0HashSlot));
+            ClassicAssert.IsTrue(curPrimary1Slots.Contains(primary0HashSlot));
+
+            // Check available on other primary & secondary
+
+            var sim1Res = (byte[][])context.clusterTestUtils.Execute(primary1, "VSIM", [primary0Key, "XB8", vectorSimData, "WITHSCORES", "WITHATTRIBS"], flags: CommandFlags.NoRedirect);
+            ClassicAssert.IsTrue(sim1Res.Length > 0);
+            for (var i = 0; i < sim0Res.Length; i++)
+            {
+                ClassicAssert.IsTrue(sim0Res[i].AsSpan().SequenceEqual(sim1Res[i]));
+            }
+
+            var readonlyOnReplica1 = (string)context.clusterTestUtils.Execute(secondary1, "READONLY", [], flags: CommandFlags.NoRedirect);
+            ClassicAssert.AreEqual("OK", readonlyOnReplica1);
+
+            var simOnReplica1 = (byte[][])context.clusterTestUtils.Execute(secondary1, "VSIM", [primary0Key, "XB8", vectorSimData, "WITHSCORES", "WITHATTRIBS"], flags: CommandFlags.NoRedirect);
+            ClassicAssert.IsTrue(simOnReplica1.Length > 0);
+            for (var i = 0; i < sim0Res.Length; i++)
+            {
+                ClassicAssert.IsTrue(sim0Res[i].AsSpan().SequenceEqual(simOnReplica0[i]));
+            }
+
+            // Check no longer available on old primary or secondary
+            var exc0 = (string)context.clusterTestUtils.Execute(primary0, "VSIM", [primary0Key, "XB8", vectorSimData, "WITHSCORES", "WITHATTRIBS"], flags: CommandFlags.NoRedirect);
+            ClassicAssert.IsTrue(exc0.StartsWith("Key has MOVED to "), $"Expected exc0 to start with 'Key has MOVED to '; actual is {exc0}");
+
+            // After migration the source replica (secondary0) keeps serving the key for a short
+            // while, then passes through a brief window where the slot is not yet known-stable on the
+            // new owner from its point of view (VSIM can momentarily return CLUSTERDOWN) before it
+            // settles on redirecting to the new primary. Poll until it redirects. A transient serving
+            // or CLUSTERDOWN response is expected here, so do NOT assert inside the loop: a failed
+            // NUnit assertion is recorded on the test result even when caught, which would fail the
+            // whole test on a transient state that the very next poll resolves.
+            var start = Stopwatch.GetTimestamp();
+
+            var success = false;
+            string lastResponse = null;
+            while (Stopwatch.GetElapsedTime(start) < TimeSpan.FromSeconds(5))
+            {
+                try
+                {
+                    var exc1 = (string)context.clusterTestUtils.Execute(secondary0, "VSIM", [primary0Key, "XB8", vectorSimData, "WITHSCORES", "WITHATTRIBS"], flags: CommandFlags.NoRedirect);
+                    lastResponse = exc1;
+                    if (exc1 is not null && exc1.StartsWith("Key has MOVED to "))
+                    {
+                        success = true;
+                        break;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Secondary can still have the key for a bit (VSIM returns vector data, not a string)
+                    lastResponse = ex.Message;
+                }
+
+                Thread.Sleep(100);
+            }
+
+            ClassicAssert.IsTrue(success, $"Original replica still has Vector Set long after primary has completed; last response was '{lastResponse}'");
+        }
+
+        [Test]
+        public async Task VectorSetMigrateByKeysAsync()
+        {
+            // Based on : ClusterSimpleMigrateKeys test
+
+            const int ShardCount = 3;
+            const int KeyCount = 10;
+
+            _ = await SimpleSetupClusterAsync(ShardCount, primaryCount: -1, replicaCount: -1).ConfigureAwait(false);
+
+            var otherNodeIndex = 0;
+            var sourceNodeIndex = 1;
+            var targetNodeIndex = 2;
+            var sourceNodeId = context.clusterTestUtils.GetNodeIdFromNode(sourceNodeIndex, NullLogger.Instance);
+            var targetNodeId = context.clusterTestUtils.GetNodeIdFromNode(targetNodeIndex, NullLogger.Instance);
+
+            var key = Encoding.ASCII.GetBytes("{abc}a");
+            List<byte[]> keys = [];
+            List<(byte[] Key, byte[] Data)> vectors = [];
+            List<byte[]> attributes = [];
+
+            var _workingSlot = ClusterTestUtils.HashSlot(key);
+            ClassicAssert.AreEqual(7638, _workingSlot);
+
+            Random rand = new(2025_11_04_00);
+
+            for (var i = 0; i < KeyCount; i++)
+            {
+                var newKey = new byte[key.Length];
+                Array.Copy(key, 0, newKey, 0, key.Length);
+                newKey[^1] = (byte)(newKey[^1] + i);
+                ClassicAssert.AreEqual(_workingSlot, ClusterTestUtils.HashSlot(newKey));
+
+                var elem = new byte[4];
+                rand.NextBytes(elem);
+
+                var data = new byte[75];
+                rand.NextBytes(data);
+
+                var attrs = new byte[16];
+                rand.NextBytes(attrs);
+
+                var addRes = (int)context.clusterTestUtils.Execute(context.clusterTestUtils.GetEndPoint(sourceNodeIndex), "VADD", [newKey, "XB8", data, elem, "XPREQ8", "SETATTR", attrs]);
+                ClassicAssert.AreEqual(1, addRes);
+
+                keys.Add(newKey);
+                vectors.Add((elem, data));
+                attributes.Add(attrs);
+            }
+
+            // Start migration
+            var respImport = context.clusterTestUtils.SetSlot(targetNodeIndex, _workingSlot, "IMPORTING", sourceNodeId);
+            ClassicAssert.AreEqual(respImport, "OK");
+
+            var respMigrate = context.clusterTestUtils.SetSlot(sourceNodeIndex, _workingSlot, "MIGRATING", targetNodeId);
+            ClassicAssert.AreEqual(respMigrate, "OK");
+
+            // Check key count
+            var countKeys = context.clusterTestUtils.CountKeysInSlot(sourceNodeIndex, _workingSlot);
+            ClassicAssert.AreEqual(countKeys, KeyCount);
+
+            // Enumerate keys in slots
+            var keysInSlot = context.clusterTestUtils.GetKeysInSlot(sourceNodeIndex, _workingSlot, countKeys);
+            ClassicAssert.AreEqual(keys, keysInSlot);
+
+            // Migrate keys, but in a random-ish order so context reservation gets stressed
+            var toMigrate = keysInSlot.ToList();
+            while (toMigrate.Count > 0)
+            {
+                var migrateSingleIx = rand.Next(toMigrate.Count);
+                var migrateKey = toMigrate[migrateSingleIx];
+                context.clusterTestUtils.MigrateKeys(context.clusterTestUtils.GetEndPoint(sourceNodeIndex), context.clusterTestUtils.GetEndPoint(targetNodeIndex), [migrateKey], NullLogger.Instance);
+
+                toMigrate.RemoveAt(migrateSingleIx);
+            }
+
+            // Finish migration
+            var respNodeTarget = context.clusterTestUtils.SetSlot(targetNodeIndex, _workingSlot, "NODE", targetNodeId);
+            ClassicAssert.AreEqual(respNodeTarget, "OK");
+            context.clusterTestUtils.BumpEpoch(targetNodeIndex, waitForSync: true);
+
+            var respNodeSource = context.clusterTestUtils.SetSlot(sourceNodeIndex, _workingSlot, "NODE", targetNodeId);
+            ClassicAssert.AreEqual(respNodeSource, "OK");
+            context.clusterTestUtils.BumpEpoch(sourceNodeIndex, waitForSync: true);
+            // End Migration
+
+            // Check config
+            var targetConfigEpochFromTarget = context.clusterTestUtils.GetConfigEpochOfNodeFromNodeIndex(targetNodeIndex, targetNodeId, NullLogger.Instance);
+            var targetConfigEpochFromSource = context.clusterTestUtils.GetConfigEpochOfNodeFromNodeIndex(sourceNodeIndex, targetNodeId, NullLogger.Instance);
+            var targetConfigEpochFromOther = context.clusterTestUtils.GetConfigEpochOfNodeFromNodeIndex(otherNodeIndex, targetNodeId, NullLogger.Instance);
+
+            while (targetConfigEpochFromOther != targetConfigEpochFromTarget || targetConfigEpochFromSource != targetConfigEpochFromTarget)
+            {
+                _ = Thread.Yield();
+                targetConfigEpochFromTarget = context.clusterTestUtils.GetConfigEpochOfNodeFromNodeIndex(targetNodeIndex, targetNodeId, NullLogger.Instance);
+                targetConfigEpochFromSource = context.clusterTestUtils.GetConfigEpochOfNodeFromNodeIndex(sourceNodeIndex, targetNodeId, NullLogger.Instance);
+                targetConfigEpochFromOther = context.clusterTestUtils.GetConfigEpochOfNodeFromNodeIndex(otherNodeIndex, targetNodeId, NullLogger.Instance);
+            }
+            ClassicAssert.AreEqual(targetConfigEpochFromTarget, targetConfigEpochFromOther);
+            ClassicAssert.AreEqual(targetConfigEpochFromTarget, targetConfigEpochFromSource);
+
+            // Check migration in progress
+            foreach (var _key in keys)
+            {
+                var respEndpoint = context.clusterTestUtils.GetEndPoint(targetNodeIndex);
+                var resp = context.clusterTestUtils.GetKey(otherNodeIndex, _key, out var slot, out var endpoint, out var responseState);
+
+
+                while (endpoint.Port != (respEndpoint = context.clusterTestUtils.GetEndPoint(targetNodeIndex)).Port && responseState != ResponseState.OK)
+                {
+                    resp = context.clusterTestUtils.GetKey(otherNodeIndex, _key, out slot, out endpoint, out responseState);
+                }
+
+                // This is inherently race-y, so only validate if we got the "MOVED" response we expected
+                if (resp == "MOVED")
+                {
+                    ClassicAssert.AreEqual(_workingSlot, slot);
+                    ClassicAssert.AreEqual(respEndpoint, endpoint);
+                }
+            }
+
+            // Finish migration
+            context.clusterTestUtils.WaitForMigrationCleanup();
+
+            // Validate vector sets coherent
+            for (var i = 0; i < keys.Count; i++)
+            {
+                var _key = keys[i];
+                var (elem, data) = vectors[i];
+                var attrs = attributes[i];
+
+                var res = (byte[][])context.clusterTestUtils.Execute(context.clusterTestUtils.GetEndPoint(targetNodeIndex), "VSIM", [_key, "XB8", data, "WITHATTRIBS"]);
+                ClassicAssert.AreEqual(2, res.Length);
+                ClassicAssert.IsTrue(res[0].SequenceEqual(elem));
+                ClassicAssert.IsTrue(res[1].SequenceEqual(attrs));
+            }
+        }
+
+        [Test]
+        public void VectorSetMigrateManyBySlot()
+        {
+            // Test migrating several vector sets from one primary to another primary, which already has vectors sets of its own
+
+            const int Primary0Index = 0;
+            const int Primary1Index = 1;
+            const int Secondary0Index = 2;
+            const int Secondary1Index = 3;
+
+            const int VectorSetsPerPrimary = 4;
+
+            context.CreateInstances(DefaultMultiPrimaryShards, useTLS: true, enableAOF: true, AofMemorySize: DefaultAOFMemorySize);
+            context.CreateConnection(useTLS: true);
+            _ = context.clusterTestUtils.SimpleSetupCluster(primary_count: DefaultMultiPrimaryShards / 2, replica_count: 1);
+
+            var primary0 = (IPEndPoint)context.endpoints[Primary0Index];
+            var primary1 = (IPEndPoint)context.endpoints[Primary1Index];
+            var secondary0 = (IPEndPoint)context.endpoints[Secondary0Index];
+            var secondary1 = (IPEndPoint)context.endpoints[Secondary1Index];
+
+            ClassicAssert.AreEqual("master", context.clusterTestUtils.RoleCommand(primary0).Value);
+            ClassicAssert.AreEqual("master", context.clusterTestUtils.RoleCommand(primary1).Value);
+            ClassicAssert.AreEqual("slave", context.clusterTestUtils.RoleCommand(secondary0).Value);
+            ClassicAssert.AreEqual("slave", context.clusterTestUtils.RoleCommand(secondary1).Value);
+
+            var primary0Id = context.clusterTestUtils.ClusterMyId(primary0);
+            var primary1Id = context.clusterTestUtils.ClusterMyId(primary1);
+
+            var slots = context.clusterTestUtils.ClusterSlots(primary0);
+
+            List<(string Key, ushort HashSlot, byte[] Element, byte[] Data, byte[] Attr)> primary0Keys = [];
+            List<(string Key, ushort HashSlot, byte[] Element, byte[] Data, byte[] Attr)> primary1Keys = [];
+
+            {
+                var ix = 0;
+
+                while (primary0Keys.Count < VectorSetsPerPrimary || primary1Keys.Count < VectorSetsPerPrimary)
+                {
+                    var key = $"{nameof(VectorSetMigrateManyBySlot)}_{ix}";
+                    var hashSlot = context.clusterTestUtils.HashSlot(key);
+
+                    var isOnPrimary0 = slots.Any(x => x.nnInfo.Any(y => y.nodeid == primary0Id) && hashSlot >= x.startSlot && hashSlot <= x.endSlot);
+                    var isOnPrimary1 = slots.Any(x => x.nnInfo.Any(y => y.nodeid == primary1Id) && hashSlot >= x.startSlot && hashSlot <= x.endSlot);
+
+                    if (isOnPrimary0 && primary0Keys.Count < VectorSetsPerPrimary)
+                    {
+                        var elem = new byte[4];
+                        var data = new byte[75];
+                        var attr = new byte[10];
+                        Random.Shared.NextBytes(elem);
+                        Random.Shared.NextBytes(data);
+                        Random.Shared.NextBytes(attr);
+
+                        primary0Keys.Add((key, (ushort)hashSlot, elem, data, attr));
+                    }
+
+                    if (isOnPrimary1 && primary1Keys.Count < VectorSetsPerPrimary)
+                    {
+                        var elem = new byte[4];
+                        var data = new byte[75];
+                        var attr = new byte[10];
+                        Random.Shared.NextBytes(elem);
+                        Random.Shared.NextBytes(data);
+                        Random.Shared.NextBytes(attr);
+
+                        primary1Keys.Add((key, (ushort)hashSlot, elem, data, attr));
+                    }
+
+                    ix++;
+                }
+            }
+
+            // Setup vectors on the primaries
+            foreach (var (key, _, elem, data, attr) in primary0Keys)
+            {
+                var add0Res = (int)context.clusterTestUtils.Execute(primary0, "VADD", [key, "XB8", data, elem, "XPREQ8", "SETATTR", attr], flags: CommandFlags.NoRedirect);
+                ClassicAssert.AreEqual(1, add0Res);
+            }
+
+            foreach (var (key, _, elem, data, attr) in primary1Keys)
+            {
+                var add1Res = (int)context.clusterTestUtils.Execute(primary1, "VADD", [key, "XB8", data, elem, "XPREQ8", "SETATTR", attr], flags: CommandFlags.NoRedirect);
+                ClassicAssert.AreEqual(1, add1Res);
+            }
+
+            // Query expected results
+            Dictionary<(string Key, byte[] Data), (byte[] Elem, byte[] Attr, float Score)> expected = new(StringAndByteArrayComparer.Instance);
+
+            foreach (var (key, _, _, data, _) in primary0Keys)
+            {
+                var sim0Res = (byte[][])context.clusterTestUtils.Execute(primary0, "VSIM", [key, "XB8", data, "WITHSCORES", "WITHATTRIBS"], flags: CommandFlags.NoRedirect);
+                ClassicAssert.AreEqual(3, sim0Res.Length);
+                expected.Add((key, data), (sim0Res[0], sim0Res[2], float.Parse(Encoding.ASCII.GetString(sim0Res[1]))));
+            }
+
+            foreach (var (key, _, _, data, _) in primary1Keys)
+            {
+                var sim1Res = (byte[][])context.clusterTestUtils.Execute(primary1, "VSIM", [key, "XB8", data, "WITHSCORES", "WITHATTRIBS"], flags: CommandFlags.NoRedirect);
+                ClassicAssert.AreEqual(3, sim1Res.Length);
+                expected.Add((key, data), (sim1Res[0], sim1Res[2], float.Parse(Encoding.ASCII.GetString(sim1Res[1]))));
+            }
+
+            context.clusterTestUtils.WaitForReplicaAofSync(Primary0Index, Secondary0Index);
+
+            // Move from primary0 to primary1
+            var migratedHashSlots = primary0Keys.Select(static t => t.HashSlot).Distinct().Select(static s => (int)s).ToList();
+
+            context.clusterTestUtils.MigrateSlots(primary0, primary1, migratedHashSlots);
+            context.clusterTestUtils.WaitForMigrationCleanup(Primary0Index);
+            context.clusterTestUtils.WaitForMigrationCleanup(Primary1Index);
+
+            context.clusterTestUtils.WaitForReplicaAofSync(Primary0Index, Secondary0Index);
+            context.clusterTestUtils.WaitForReplicaAofSync(Primary1Index, Secondary1Index);
+
+            var curPrimary0Slots = context.clusterTestUtils.GetOwnedSlotsFromNode(primary0, NullLogger.Instance);
+            var curPrimary1Slots = context.clusterTestUtils.GetOwnedSlotsFromNode(primary1, NullLogger.Instance);
+
+            foreach (var hashSlot in migratedHashSlots)
+            {
+                ClassicAssert.IsFalse(curPrimary0Slots.Contains(hashSlot));
+                ClassicAssert.IsTrue(curPrimary1Slots.Contains(hashSlot));
+            }
+
+            // Check available on other primary
+            foreach (var (key, _, _, data, _) in primary0Keys.Concat(primary1Keys))
+            {
+                var migrateSimRes = (byte[][])context.clusterTestUtils.Execute(primary1, "VSIM", [key, "XB8", data, "WITHSCORES", "WITHATTRIBS"], flags: CommandFlags.NoRedirect);
+                ClassicAssert.AreEqual(3, migrateSimRes.Length);
+
+                var (elem, attr, score) = expected[(key, data)];
+
+                ClassicAssert.IsTrue(elem.SequenceEqual(migrateSimRes[0]));
+                ClassicAssert.AreEqual(score, float.Parse(Encoding.ASCII.GetString(migrateSimRes[1])));
+                ClassicAssert.IsTrue(attr.SequenceEqual(migrateSimRes[2]));
+            }
+
+            // Check no longer available on old primary or secondary
+            foreach (var (key, _, _, data, _) in primary0Keys.Concat(primary1Keys))
+            {
+                var exc0 = (string)context.clusterTestUtils.Execute(primary0, "VSIM", [key, "XB8", data, "WITHSCORES", "WITHATTRIBS"], flags: CommandFlags.NoRedirect);
+                ClassicAssert.IsTrue(exc0.StartsWith("Key has MOVED to "));
+            }
+
+            // Every path through this loop has to sleep. Polling without one spins a core flat out for the
+            // whole window, and on a two-core runner that starves the cluster nodes this is waiting on, so
+            // the convergence it is polling for cannot happen until the window has already elapsed.
+            var start = Stopwatch.GetTimestamp();
+
+            var success = false;
+            string lastResponse = null;
+            while (Stopwatch.GetElapsedTime(start) < TimeSpan.FromSeconds(5))
+            {
+                try
+                {
+                    var migrationNotFinished = false;
+                    foreach (var (key, _, _, data, _) in primary0Keys.Concat(primary1Keys))
+                    {
+                        var exc1 = (string)context.clusterTestUtils.Execute(secondary0, "VSIM", [key, "XB8", data, "WITHSCORES", "WITHATTRIBS"], flags: CommandFlags.NoRedirect);
+                        lastResponse = exc1;
+                        if (exc1 is null || !exc1.StartsWith("Key has MOVED to "))
+                        {
+                            migrationNotFinished = true;
+                            break;
+                        }
+                    }
+
+                    if (!migrationNotFinished)
+                    {
+                        success = true;
+                        break;
+                    }
+                }
+                catch (Exception ex)
+                {
+                    // Secondary can still have the key for a bit (VSIM returns vector data, not a string)
+                    lastResponse = ex.Message;
+                }
+
+                Thread.Sleep(100);
+            }
+
+            ClassicAssert.IsTrue(success, $"Original replica still has Vector Set long after primary has completed; last response was '{lastResponse}'");
+
+            // Check available on new secondary
+            var readonlyOnReplica1 = (string)context.clusterTestUtils.Execute(secondary1, "READONLY", [], flags: CommandFlags.NoRedirect);
+            ClassicAssert.AreEqual("OK", readonlyOnReplica1);
+
+            start = Stopwatch.GetTimestamp();
+
+            success = false;
+            lastResponse = null;
+
+            // Poll until every migrated key is readable on the new replica, and only then assert on the
+            // contents. ClusterTestUtils.Execute turns any exception into a single-element reply holding the
+            // message, and a VSIM ... WITHSCORES WITHATTRIBS hit is always three elements, so a single element
+            // always means the read did not land: MOVED while this replica's view of slot ownership catches up,
+            // CLUSTERDOWN, or an SE.Redis timeout. Asserting inside the loop would record a failure on the test
+            // result even for a poll that the very next one resolves.
+            List<(string Key, byte[] Data, byte[][] Reply)> replicated = [];
+
+            while (Stopwatch.GetElapsedTime(start) < TimeSpan.FromSeconds(5))
+            {
+                success = true;
+                replicated.Clear();
+
+                foreach (var (key, _, _, data, _) in primary0Keys.Concat(primary1Keys))
+                {
+                    byte[][] migrateSimRes;
+                    try
+                    {
+                        migrateSimRes = (byte[][])context.clusterTestUtils.Execute(secondary1, "VSIM", [key, "XB8", data, "WITHSCORES", "WITHATTRIBS"], flags: CommandFlags.NoRedirect);
+                    }
+                    catch (Exception ex)
+                    {
+                        lastResponse = ex.Message;
+                        success = false;
+                        break;
+                    }
+
+                    // A nil reply casts to a null array, so null must be handled alongside the
+                    // single-element error reply.
+                    if (migrateSimRes is null || migrateSimRes.Length == 1)
+                    {
+                        lastResponse = migrateSimRes is null ? "<nil>" : Encoding.UTF8.GetString(migrateSimRes[0]);
+                        success = false;
+                        break;
+                    }
+
+                    replicated.Add((key, data, migrateSimRes));
+                }
+
+                if (success)
+                {
+                    break;
+                }
+
+                Thread.Sleep(100);
+            }
+
+            ClassicAssert.IsTrue(success, $"New replica hasn't replicated Vector Set long after primary has received data; last response was '{lastResponse}'");
+
+            foreach (var (key, data, migrateSimRes) in replicated)
+            {
+                ClassicAssert.AreEqual(3, migrateSimRes.Length, $"Unexpected VSIM reply length for key '{key}'");
+
+                var (elem, attr, score) = expected[(key, data)];
+
+                ClassicAssert.IsTrue(elem.SequenceEqual(migrateSimRes[0]));
+                ClassicAssert.AreEqual(score, float.Parse(Encoding.ASCII.GetString(migrateSimRes[1])));
+                ClassicAssert.IsTrue(attr.SequenceEqual(migrateSimRes[2]));
+            }
+        }
+
+        [Test]
+        [CancelAfter(120_000)]
+        public async Task MigrateVectorSetWhileModifyingAsync(CancellationToken testCancellationToken)
+        {
+            // Test migrating a single slot with a vector set while moving it
+
+            const int Primary0Index = 0;
+            const int Primary1Index = 1;
+            const int Secondary0Index = 2;
+            const int Secondary1Index = 3;
+
+            _ = await SimpleSetupClusterAsync(DefaultMultiPrimaryShards, primaryCount: DefaultMultiPrimaryShards / 2, replicaCount: 1, onDemandCheckpoint: true);
+
+            var primary0 = (IPEndPoint)context.endpoints[Primary0Index];
+            var primary1 = (IPEndPoint)context.endpoints[Primary1Index];
+            var secondary0 = (IPEndPoint)context.endpoints[Secondary0Index];
+            var secondary1 = (IPEndPoint)context.endpoints[Secondary1Index];
+
+            ClassicAssert.AreEqual("master", context.clusterTestUtils.RoleCommand(primary0).Value);
+            ClassicAssert.AreEqual("master", context.clusterTestUtils.RoleCommand(primary1).Value);
+            ClassicAssert.AreEqual("slave", context.clusterTestUtils.RoleCommand(secondary0).Value);
+            ClassicAssert.AreEqual("slave", context.clusterTestUtils.RoleCommand(secondary1).Value);
+
+            var primary0Id = context.clusterTestUtils.ClusterMyId(primary0);
+
+            var slots = context.clusterTestUtils.ClusterSlots(primary0);
+
+            string primary0Key;
+            int primary0HashSlot;
+            {
+                var ix = 0;
+
+                while (true)
+                {
+                    primary0Key = $"{nameof(MigrateVectorSetWhileModifyingAsync)}_{ix}";
+                    primary0HashSlot = context.clusterTestUtils.HashSlot(primary0Key);
+
+                    if (slots.Any(x => x.nnInfo.Any(y => y.nodeid == primary0Id) && primary0HashSlot >= x.startSlot && primary0HashSlot <= x.endSlot))
+                    {
+                        break;
+                    }
+
+                    ix++;
+                }
+            }
+
+            // Start writing to this Vector Set
+            using var cts = new CancellationTokenSource();
+
+            var added = new ConcurrentBag<(byte[] Elem, byte[] Data, byte[] Attr)>();
+
+            var writeTask =
+                Task.Run(
+                    async () =>
+                    {
+                        // Force async
+                        await Task.Yield();
+
+                        using var readWriteCon = ConnectionMultiplexer.Connect(context.clusterTestUtils.GetRedisConfig(context.endpoints));
+                        var readWriteDb = readWriteCon.GetDatabase();
+
+                        var ix = 0;
+
+                        var elem = new byte[4];
+                        var data = new byte[75];
+                        var attr = new byte[100];
+
+                        BinaryPrimitives.WriteInt32LittleEndian(elem, ix);
+                        Random.Shared.NextBytes(data);
+                        Random.Shared.NextBytes(attr);
+
+                        while (!cts.IsCancellationRequested)
+                        {
+                            if (TestUtils.IsRunningAsGitHubAction)
+                            {
+                                // Throw some delay in when running as a GitHub Action to work around the weak drives those VMs have
+                                await Task.Delay(1).ConfigureAwait(false);
+                            }
+
+                            // This should follow redirects, so migration shouldn't cause any failures.
+                            // StackExchange.Redis 2.11.8 changed MOVED handling: when MOVED points to the same endpoint,
+                            // it reconnects before retrying, which can throw RedisConnectionException or RedisTimeoutException
+                            // instead of (or in addition to) RedisServerException("MOVED ...").
+                            try
+                            {
+                                var addRes = (int)readWriteDb.Execute("VADD", [new RedisKey(primary0Key), "XB8", data, elem, "XPREQ8", "SETATTR", attr]);
+                                ClassicAssert.AreEqual(1, addRes);
+                            }
+                            // Catch Exception (not RedisException) because RedisTimeoutException extends
+                            // TimeoutException, not RedisException. Two MOVED message formats exist:
+                            // - Server: "MOVED N host:port"
+                            // - Client (SE.Redis 2.11.8+): "Key has MOVED to Endpoint X:port..."
+                            catch (Exception exc) when (
+                                exc is RedisTimeoutException
+                                || exc is RedisConnectionException
+                                || (exc is RedisServerException rse && (
+                                    rse.Message.StartsWith("MOVED ")
+                                    || rse.Message.StartsWith("Key has MOVED to "))))
+                            {
+                                continue;
+                            }
+
+                            added.Add((elem.ToArray(), data.ToArray(), attr.ToArray()));
+
+                            ix++;
+                            BinaryPrimitives.WriteInt32LittleEndian(elem, ix);
+                            Random.Shared.NextBytes(data);
+                            Random.Shared.NextBytes(attr);
+                        }
+                    }
+                );
+
+            await Task.Delay(1_000).ConfigureAwait(false);
+
+            var lenPreMigration = added.Count;
+            ClassicAssert.IsTrue(lenPreMigration > 0, "Should have seen some writes pre-migration");
+
+            // Move to other primary
+            using (var migrateToken = new CancellationTokenSource())
+            {
+                migrateToken.CancelAfter(30_000);
+
+                context.clusterTestUtils.MigrateSlots(primary0, primary1, [primary0HashSlot]);
+                context.clusterTestUtils.WaitForMigrationCleanup(Primary0Index, cancellationToken: migrateToken.Token);
+                context.clusterTestUtils.WaitForMigrationCleanup(Primary1Index, cancellationToken: migrateToken.Token);
+            }
+
+            var curPrimary0Slots = context.clusterTestUtils.GetOwnedSlotsFromNode(primary0, NullLogger.Instance);
+            var curPrimary1Slots = context.clusterTestUtils.GetOwnedSlotsFromNode(primary1, NullLogger.Instance);
+
+            ClassicAssert.IsFalse(curPrimary0Slots.Contains(primary0HashSlot));
+            ClassicAssert.IsTrue(curPrimary1Slots.Contains(primary0HashSlot));
+
+            var lenPrePause = added.Count;
+            await Task.Delay(5_000).ConfigureAwait(false);
+            var lenPostPause = added.Count;
+
+            ClassicAssert.IsTrue(lenPostPause > lenPrePause, "Writes after migration did not resume");
+
+            // Stop Writes and wait for replication to catch up
+            cts.Cancel();
+            await writeTask.ConfigureAwait(false);
+
+            var addedLookup = added.ToFrozenDictionary(static t => t.Elem, t => t, ByteArrayComparer.Instance);
+
+            // Check available on other primary & secondary
+
+            foreach (var (_, data, _) in added)
+            {
+                var sim1Res = (byte[][])context.clusterTestUtils.Execute(primary1, "VSIM", [primary0Key, "XB8", data, "WITHSCORES", "WITHATTRIBS", "COUNT", "1"], flags: CommandFlags.NoRedirect);
+                ClassicAssert.AreEqual(3, sim1Res.Length);
+
+                // No guarantee we'll get the exact same element, but we should always get _a_ result and the correct associated attribute
+                var resElem = sim1Res[0];
+                var resAttr = sim1Res[2];
+                var expectedAttr = addedLookup[resElem].Attr;
+                ClassicAssert.IsTrue(resAttr.SequenceEqual(expectedAttr));
+            }
+
+            var readonlyOnReplica1 = (string)context.clusterTestUtils.Execute(secondary1, "READONLY", [], flags: CommandFlags.NoRedirect);
+            ClassicAssert.AreEqual("OK", readonlyOnReplica1);
+
+            foreach (var (elem, data, attr) in added)
+            {
+                var simOnReplica1Res = (byte[][])context.clusterTestUtils.Execute(secondary1, "VSIM", [primary0Key, "XB8", data, "WITHSCORES", "WITHATTRIBS", "COUNT", "1"], flags: CommandFlags.NoRedirect);
+
+                // No guarantee we'll get the exact same element, but we should always get _a_ result and the correct associated attribute
+                var resElem = simOnReplica1Res[0];
+                var resAttr = simOnReplica1Res[2];
+                var expectedAttr = addedLookup[resElem].Attr;
+                ClassicAssert.IsTrue(resAttr.SequenceEqual(expectedAttr));
+            }
+        }
+
+        [Test]
+        public async Task MigrateVectorSetBackAsync()
+        {
+            const int Primary0Index = 0;
+            const int Primary1Index = 1;
+
+            _ = await SimpleSetupClusterAsync(DefaultShards, primaryCount: DefaultShards, replicaCount: 0).ConfigureAwait(false);
+
+            var primary0 = (IPEndPoint)context.endpoints[Primary0Index];
+            var primary1 = (IPEndPoint)context.endpoints[Primary1Index];
+
+            ClassicAssert.AreEqual("master", context.clusterTestUtils.RoleCommand(primary0).Value);
+            ClassicAssert.AreEqual("master", context.clusterTestUtils.RoleCommand(primary1).Value);
+
+            var primary0Id = context.clusterTestUtils.ClusterMyId(primary0);
+
+            var slots = context.clusterTestUtils.ClusterSlots(primary0);
+
+            string vectorSetKey;
+            int vectorSetKeySlot;
+            {
+                var ix = 0;
+
+                while (true)
+                {
+                    vectorSetKey = $"{nameof(MigrateVectorSetBackAsync)}_{ix}";
+                    vectorSetKeySlot = context.clusterTestUtils.HashSlot(vectorSetKey);
+
+                    var isPrimary0Slot = slots.Any(x => x.nnInfo.Any(y => y.nodeid == primary0Id) && vectorSetKeySlot >= x.startSlot && vectorSetKeySlot <= x.endSlot);
+                    if (isPrimary0Slot)
+                    {
+                        break;
+                    }
+
+                    ix++;
+                }
+            }
+
+            using var readWriteCon = ConnectionMultiplexer.Connect(context.clusterTestUtils.GetRedisConfig(context.endpoints));
+            var readWriteDB = readWriteCon.GetDatabase();
+
+            var data0 = Enumerable.Range(0, 75).Select(static x => (byte)x).ToArray();
+            byte[] elem0 = [1, 2, 3, 0];
+            var attr0 = "hello world"u8.ToArray();
+
+            var add0Res = (int)readWriteDB.Execute("VADD", [new RedisKey(vectorSetKey), "XB8", data0, elem0, "XPREQ8", "SETATTR", attr0]);
+            ClassicAssert.AreEqual(1, add0Res);
+
+            // Migrate 0 -> 1
+            {
+                using (var migrateToken = new CancellationTokenSource())
+                {
+                    migrateToken.CancelAfter(30_000);
+
+                    context.clusterTestUtils.MigrateSlots(primary0, primary1, [vectorSetKeySlot]);
+                    context.clusterTestUtils.WaitForMigrationCleanup(Primary0Index, cancellationToken: migrateToken.Token);
+                    context.clusterTestUtils.WaitForMigrationCleanup(Primary1Index, cancellationToken: migrateToken.Token);
+                }
+
+                var nodePropSuccess = false;
+                var start = Stopwatch.GetTimestamp();
+                while (Stopwatch.GetElapsedTime(start) < TimeSpan.FromSeconds(5))
+                {
+                    var curPrimary0Slots = context.clusterTestUtils.GetOwnedSlotsFromNode(primary0, NullLogger.Instance);
+                    var curPrimary1Slots = context.clusterTestUtils.GetOwnedSlotsFromNode(primary1, NullLogger.Instance);
+
+                    var movedOffPrimary0 = !curPrimary0Slots.Contains(vectorSetKeySlot);
+                    var movedOntoPrimary1 = curPrimary1Slots.Contains(vectorSetKeySlot);
+
+                    if (movedOffPrimary0 && movedOntoPrimary1)
+                    {
+                        nodePropSuccess = true;
+                        break;
+                    }
+                }
+
+                ClassicAssert.IsTrue(nodePropSuccess, "Node propagation after 0 -> 1 migration took too long");
+            }
+
+            // Confirm still valid to add, with client side routing
+            var data1 = Enumerable.Range(0, 75).Select(static x => (byte)(x * 2)).ToArray();
+            byte[] elem1 = [4, 5, 6, 7];
+            var attr1 = "fizz buzz"u8.ToArray();
+
+            var add1Res = (int)readWriteDB.Execute("VADD", [new RedisKey(vectorSetKey), "XB8", data1, elem1, "XPREQ8", "SETATTR", attr1]);
+            ClassicAssert.AreEqual(1, add1Res);
+
+            // Migrate 1 -> 0
+            {
+                using (var migrateToken = new CancellationTokenSource())
+                {
+                    migrateToken.CancelAfter(30_000);
+
+                    context.clusterTestUtils.MigrateSlots(primary1, primary0, [vectorSetKeySlot]);
+                    context.clusterTestUtils.WaitForMigrationCleanup(Primary0Index, cancellationToken: migrateToken.Token);
+                    context.clusterTestUtils.WaitForMigrationCleanup(Primary1Index, cancellationToken: migrateToken.Token);
+                }
+
+                var nodePropSuccess = false;
+                var start = Stopwatch.GetTimestamp();
+                while (Stopwatch.GetElapsedTime(start) < TimeSpan.FromSeconds(5))
+                {
+                    var curPrimary0Slots = context.clusterTestUtils.GetOwnedSlotsFromNode(primary0, NullLogger.Instance);
+                    var curPrimary1Slots = context.clusterTestUtils.GetOwnedSlotsFromNode(primary1, NullLogger.Instance);
+
+                    var movedOntoPrimary0 = curPrimary0Slots.Contains(vectorSetKeySlot);
+                    var movedOffPrimary1 = !curPrimary1Slots.Contains(vectorSetKeySlot);
+
+                    if (movedOntoPrimary0 && movedOffPrimary1)
+                    {
+                        nodePropSuccess = true;
+                        break;
+                    }
+                }
+
+                ClassicAssert.IsTrue(nodePropSuccess, "Node propagation after 1 -> 0 migration took too long");
+            }
+
+            // Confirm still valid to add, with client side routing
+            var data2 = Enumerable.Range(0, 75).Select(static x => (byte)(x * 3)).ToArray();
+            byte[] elem2 = [8, 9, 10, 11];
+            var attr2 = "foo bar"u8.ToArray();
+
+            var add2Res = (int)readWriteDB.Execute("VADD", [new RedisKey(vectorSetKey), "XB8", data2, elem2, "XPREQ8", "SETATTR", attr2]);
+            ClassicAssert.AreEqual(1, add2Res);
+
+            // Confirm no data loss
+            var emb0 = ((string[])readWriteDB.Execute("VEMB", [new RedisKey(vectorSetKey), elem0])).Select(static x => (byte)float.Parse(x)).ToArray();
+            var emb1 = ((string[])readWriteDB.Execute("VEMB", [new RedisKey(vectorSetKey), elem1])).Select(static x => (byte)float.Parse(x)).ToArray();
+            var emb2 = ((string[])readWriteDB.Execute("VEMB", [new RedisKey(vectorSetKey), elem2])).Select(static x => (byte)float.Parse(x)).ToArray();
+            ClassicAssert.IsTrue(data0.SequenceEqual(emb0));
+            ClassicAssert.IsTrue(data1.SequenceEqual(emb1));
+            ClassicAssert.IsTrue(data2.SequenceEqual(emb2));
+        }
+
+        [Test]
+        [CancelAfter(120_000)]
+        public async Task MigrateVectorStressAsync(CancellationToken testCancellationToken)
+        {
+            // Move vector sets back and forth between replicas, making sure we don't drop data
+            // Keeps reads and writes going continuously
+
+            const int Primary0Index = 0;
+            const int Primary1Index = 1;
+            const int Secondary0Index = 2;
+            const int Secondary1Index = 3;
+
+            const int VectorSetsPerPrimary = 2;
+
+            var gossipFaultsAtTestStart = 0;
+
+            captureLogWriter.capture = true;
+
+            try
+            {
+                _ = await SimpleSetupClusterAsync(DefaultMultiPrimaryShards, primaryCount: DefaultMultiPrimaryShards / 2, replicaCount: 1);
+
+                var primary0 = (IPEndPoint)context.endpoints[Primary0Index];
+                var primary1 = (IPEndPoint)context.endpoints[Primary1Index];
+                var secondary0 = (IPEndPoint)context.endpoints[Secondary0Index];
+                var secondary1 = (IPEndPoint)context.endpoints[Secondary1Index];
+
+                ClassicAssert.AreEqual("master", context.clusterTestUtils.RoleCommand(primary0).Value);
+                ClassicAssert.AreEqual("master", context.clusterTestUtils.RoleCommand(primary1).Value);
+                ClassicAssert.AreEqual("slave", context.clusterTestUtils.RoleCommand(secondary0).Value);
+                ClassicAssert.AreEqual("slave", context.clusterTestUtils.RoleCommand(secondary1).Value);
+
+                var primary0Id = context.clusterTestUtils.ClusterMyId(primary0);
+
+                var slots = context.clusterTestUtils.ClusterSlots(primary0);
+
+                var vectorSetKeys = new List<(string Key, ushort HashSlot)>();
+
+                {
+                    var ix = 0;
+
+                    var numP0 = 0;
+                    var numP1 = 0;
+
+                    while (numP0 < VectorSetsPerPrimary || numP1 < VectorSetsPerPrimary)
+                    {
+                        var key = $"{nameof(MigrateVectorStressAsync)}_{ix}";
+                        var slot = context.clusterTestUtils.HashSlot(key);
+
+                        var isPrimary0Slot = slots.Any(x => x.nnInfo.Any(y => y.nodeid == primary0Id) && slot >= x.startSlot && slot <= x.endSlot);
+
+                        if (isPrimary0Slot)
+                        {
+                            if (numP0 < VectorSetsPerPrimary)
+                            {
+                                vectorSetKeys.Add((key, (ushort)slot));
+                                numP0++;
+                            }
+                        }
+                        else
+                        {
+                            if (numP1 < VectorSetsPerPrimary)
+                            {
+                                vectorSetKeys.Add((key, (ushort)slot));
+                                numP1++;
+                            }
+                        }
+
+                        ix++;
+                    }
+                }
+
+                // Remember how cluster looked right after it was stable
+                gossipFaultsAtTestStart = CountGossipFaults(captureLogWriter);
+
+                // Start writing to this Vector Set
+                using var writeCancel = new CancellationTokenSource();
+
+                using var readWriteCon = ConnectionMultiplexer.Connect(context.clusterTestUtils.GetRedisConfig(context.endpoints));
+                var readWriteDB = readWriteCon.GetDatabase();
+
+                var writeTasks = new Task[vectorSetKeys.Count];
+                var writeResults = new ConcurrentBag<(byte[] Elem, byte[] Data, byte[] Attr, DateTime InsertionTime)>[vectorSetKeys.Count];
+
+                var mostRecentWrite = 0L;
+
+                var commonRandom = new Random(2025_02_18_00);
+
+                for (var i = 0; i < vectorSetKeys.Count; i++)
+                {
+                    var (key, _) = vectorSetKeys[i];
+                    var written = writeResults[i] = new();
+
+                    var writeTaskRandom = new Random((int)commonRandom.NextInt64());
+
+                    writeTasks[i] =
+                        Task.Run(
+                            async () =>
+                            {
+                                // Force async
+                                await Task.Yield();
+
+                                var ix = -1;
+
+                                while (!writeCancel.IsCancellationRequested)
+                                {
+                                    var elem = new byte[4];
+                                    BinaryPrimitives.WriteInt32LittleEndian(elem, ix);
+
+                                    var data = new byte[75];
+                                    writeTaskRandom.NextBytes(data);
+
+                                    var attr = new byte[100];
+                                    writeTaskRandom.NextBytes(attr);
+
+                                    var firstAttempt = true;
+
+                                    while (true)
+                                    {
+                                        try
+                                        {
+                                            var vaddRes = readWriteDB.Execute("VADD", [new RedisKey(key), "XB8", data, elem, "XPREQ8", "SETATTR", attr]);
+
+                                            // Retries may results in updates (depending on what SE.Redis's map of the cluster currently is), so track that for result validation
+                                            firstAttempt = false;
+
+                                            // During slot migration the raw command can transiently come back as a
+                                            // nil/null result (e.g., routing resolves to a node mid-migration) rather
+                                            // than raising a redirect exception. Casting nil to int throws a
+                                            // NullReferenceException, so treat it as one more retryable transient
+                                            // alongside MOVED/timeout/connection below rather than failing the test.
+                                            if (vaddRes is null || vaddRes.IsNull)
+                                            {
+                                                if (writeCancel.IsCancellationRequested)
+                                                {
+                                                    return;
+                                                }
+
+                                                continue;
+                                            }
+
+                                            var addRes = (int)vaddRes;
+                                            if (firstAttempt)
+                                            {
+                                                ClassicAssert.AreEqual(1, addRes);
+                                            }
+                                            else
+                                            {
+                                                ClassicAssert.IsTrue(addRes is 0 or 1);
+                                            }
+
+                                            break;
+                                        }
+                                        // Catch Exception (not RedisException) because RedisTimeoutException extends
+                                        // TimeoutException, not RedisException. Two MOVED message formats exist:
+                                        // - Server: "MOVED N host:port"
+                                        // - Client (SE.Redis 2.11.8+): "Key has MOVED to Endpoint X:port..."
+                                        catch (Exception exc) when (
+                                            exc is RedisTimeoutException
+                                            || exc is RedisConnectionException
+                                            || (exc is RedisServerException rse && (
+                                                rse.Message.StartsWith("MOVED ")
+                                                || rse.Message.StartsWith("Key has MOVED to "))))
+                                        {
+                                            // These are all retryable transient errors during slot migration:
+                                            // - RedisServerException("MOVED"): slot has moved, retry
+                                            // - RedisTimeoutException: server blocked in WaitForSlotToStabilize, timed out
+                                            // - RedisConnectionException: reconnect triggered by StackExchange.Redis 2.11.8+
+                                            //   MOVED-to-same-endpoint handling
+                                            if (writeCancel.IsCancellationRequested)
+                                            {
+                                                return;
+                                            }
+
+                                            continue;
+                                        }
+                                    }
+
+                                    var now = DateTime.UtcNow;
+                                    written.Add((elem, data, attr, now));
+
+                                    var mostRecentCopy = mostRecentWrite;
+                                    while (mostRecentCopy < now.Ticks)
+                                    {
+                                        var currentMostRecent = Interlocked.CompareExchange(ref mostRecentWrite, now.Ticks, mostRecentCopy);
+                                        if (currentMostRecent == mostRecentCopy)
+                                        {
+                                            break;
+                                        }
+                                        mostRecentCopy = currentMostRecent;
+                                    }
+
+                                    ix++;
+                                }
+                            }
+                        );
+                }
+
+                using var readCancel = new CancellationTokenSource();
+
+                var readTasks = new Task<int>[vectorSetKeys.Count];
+                for (var i = 0; i < vectorSetKeys.Count; i++)
+                {
+                    var (key, _) = vectorSetKeys[i];
+                    var written = writeResults[i];
+
+                    var readTaskRandom = new Random((int)commonRandom.NextInt64());
+
+                    readTasks[i] =
+                        Task.Run(
+                            async () =>
+                            {
+                                await Task.Yield();
+
+                                var successfulReads = 0;
+
+                                while (!readCancel.IsCancellationRequested)
+                                {
+                                    var r = written.Count;
+                                    if (r == 0)
+                                    {
+                                        await Task.Delay(10).ConfigureAwait(false);
+                                        continue;
+                                    }
+
+                                    var (elem, data, _, _) = written.ToList()[readTaskRandom.Next(r)];
+
+                                    string[] emb;
+                                    try
+                                    {
+                                        emb = (string[])readWriteDB.Execute("VEMB", [new RedisKey(key), elem]);
+                                    }
+                                    // Catch Exception (not RedisException) because RedisTimeoutException extends
+                                    // TimeoutException, not RedisException. Two MOVED message formats exist:
+                                    // - Server: "MOVED N host:port"
+                                    // - Client (SE.Redis 2.11.8+): "Key has MOVED to Endpoint X:port..."
+                                    catch (Exception exc) when (
+                                        exc is RedisTimeoutException
+                                        || exc is RedisConnectionException
+                                        || (exc is RedisServerException rse && (
+                                            rse.Message.StartsWith("MOVED ")
+                                            || rse.Message.StartsWith("Key has MOVED to "))))
+                                    {
+                                        // Transient errors during slot migration are expected; retry
+                                        continue;
+                                    }
+
+                                    if (emb is null || emb.Length == 0)
+                                    {
+                                        // Migration might make this temporarily unavailable due to connection state
+                                        // (a nil VEMB result casts to a null array), so retry.
+                                        //
+                                        // Because we check for presence of all data at the end of test, we can safely ignore this for now
+                                        continue;
+                                    }
+
+                                    // If we got data, make sure it's coherent
+                                    ClassicAssert.AreEqual(data.Length, emb.Length);
+
+                                    var embParsed = emb.Select(static e => (byte)float.Parse(e)).ToArray();
+
+                                    for (var i = 0; i < data.Length; i++)
+                                    {
+                                        var expected = data[i];
+                                        var actual = embParsed[i];
+
+                                        if (expected != actual)
+                                        {
+                                            var wholeExpected = $"0x{string.Join("", data.Select(static q => q.ToString("X2")))}";
+                                            var wholeActual = $"0x{string.Join("", emb.Select(static q => ((byte)float.Parse(q)).ToString("X2")))}";
+
+                                            var matchData = written.Where(t => t.Data.SequenceEqual(embParsed));
+                                            var sb = new StringBuilder();
+                                            foreach (var m in matchData)
+                                            {
+                                                _ = sb.Append($"; matches {BinaryPrimitives.ReadInt32LittleEndian(m.Elem)} data");
+                                            }
+
+                                            var matchAttr = written.Where(t => t.Attr.SequenceEqual(embParsed));
+                                            foreach (var m in matchAttr)
+                                            {
+                                                _ = sb.Append($"; matches {BinaryPrimitives.ReadInt32LittleEndian(m.Elem)} attr");
+                                            }
+
+                                            ClassicAssert.Fail($"Unexpected embedded value for {BinaryPrimitives.ReadInt32LittleEndian(elem)} at {i}, expected {expected} != actual {actual} ({wholeExpected} != {wholeActual})" + sb.ToString());
+                                        }
+                                    }
+
+                                    successfulReads++;
+                                }
+
+                                return successfulReads;
+                            }
+                        );
+                }
+
+                await Task.Delay(1_000).ConfigureAwait(false);
+
+                ClassicAssert.IsTrue(writeResults.All(static r => !r.IsEmpty), "Should have seen some writes pre-migration");
+
+                // Task to flip back and forth between primaries
+                using var migrateCancel = new CancellationTokenSource();
+
+                var migrateTask =
+                    Task.Run(
+                        async () =>
+                        {
+                            var hashSlotsOnP0 = new List<int>();
+                            var hashSlotsOnP1 = new List<int>();
+                            foreach (var (_, slot) in vectorSetKeys)
+                            {
+                                var isPrimary0Slot = slots.Any(x => x.nnInfo.Any(y => y.nodeid == primary0Id) && slot >= x.startSlot && slot <= x.endSlot);
+                                if (isPrimary0Slot)
+                                {
+                                    if (!hashSlotsOnP0.Contains(slot))
+                                    {
+                                        hashSlotsOnP0.Add(slot);
+                                    }
+                                }
+                                else
+                                {
+                                    if (!hashSlotsOnP1.Contains(slot))
+                                    {
+                                        hashSlotsOnP1.Add(slot);
+                                    }
+                                }
+                            }
+
+                            var migrationTimes = new List<DateTime>();
+
+                            var mostRecentMigration = 0L;
+
+                            while (!migrateCancel.IsCancellationRequested)
+                            {
+                                await Task.Delay(100).ConfigureAwait(false);
+
+                                // Don't start another migration until we get at least one successful write
+                                if (Interlocked.CompareExchange(ref mostRecentWrite, 0, 0) < mostRecentMigration)
+                                {
+                                    continue;
+                                }
+
+                                // Move 0 -> 1
+                                if (hashSlotsOnP0.Count > 0)
+                                {
+                                    using (var migrateToken = new CancellationTokenSource())
+                                    {
+                                        migrateToken.CancelAfter(30_000);
+
+                                        context.clusterTestUtils.MigrateSlots(primary0, primary1, hashSlotsOnP0);
+                                        context.clusterTestUtils.WaitForMigrationCleanup(Primary0Index, cancellationToken: migrateToken.Token);
+                                        context.clusterTestUtils.WaitForMigrationCleanup(Primary1Index, cancellationToken: migrateToken.Token);
+                                    }
+
+                                    var nodePropSuccess = false;
+                                    var start = Stopwatch.GetTimestamp();
+                                    while (Stopwatch.GetElapsedTime(start) < TimeSpan.FromSeconds(5))
+                                    {
+                                        var curPrimary0Slots = context.clusterTestUtils.GetOwnedSlotsFromNode(primary0, NullLogger.Instance);
+                                        var curPrimary1Slots = context.clusterTestUtils.GetOwnedSlotsFromNode(primary1, NullLogger.Instance);
+
+                                        var movedOffPrimary0 = !curPrimary0Slots.Any(h => hashSlotsOnP0.Contains(h));
+                                        var movedOntoPrimary1 = hashSlotsOnP0.All(h => curPrimary1Slots.Contains(h));
+
+                                        if (movedOffPrimary0 && movedOntoPrimary1)
+                                        {
+                                            nodePropSuccess = true;
+                                            break;
+                                        }
+                                    }
+
+                                    ClassicAssert.IsTrue(nodePropSuccess, "Node propagation after 0 -> 1 migration took too long");
+                                }
+
+                                // Move 1 -> 0
+                                if (hashSlotsOnP1.Count > 0)
+                                {
+                                    using (var migrateToken = new CancellationTokenSource())
+                                    {
+                                        migrateToken.CancelAfter(30_000);
+
+                                        context.clusterTestUtils.MigrateSlots(primary1, primary0, hashSlotsOnP1);
+                                        context.clusterTestUtils.WaitForMigrationCleanup(Primary1Index, cancellationToken: migrateToken.Token);
+                                        context.clusterTestUtils.WaitForMigrationCleanup(Primary0Index, cancellationToken: migrateToken.Token);
+                                    }
+
+                                    var nodePropSuccess = false;
+                                    var start = Stopwatch.GetTimestamp();
+                                    while (Stopwatch.GetElapsedTime(start) < TimeSpan.FromSeconds(5))
+                                    {
+                                        var curPrimary0Slots = context.clusterTestUtils.GetOwnedSlotsFromNode(primary0, NullLogger.Instance);
+                                        var curPrimary1Slots = context.clusterTestUtils.GetOwnedSlotsFromNode(primary1, NullLogger.Instance);
+
+                                        var movedOffPrimary1 = !curPrimary1Slots.Any(h => hashSlotsOnP1.Contains(h));
+                                        var movedOntoPrimary0 = hashSlotsOnP1.All(h => curPrimary0Slots.Contains(h));
+
+                                        if (movedOffPrimary1 && movedOntoPrimary0)
+                                        {
+                                            nodePropSuccess = true;
+                                            break;
+                                        }
+                                    }
+
+                                    ClassicAssert.IsTrue(nodePropSuccess, "Node propagation after 1 -> 0 migration took too long");
+                                }
+
+                                // Remember for next iteration
+                                var now = DateTime.UtcNow;
+                                mostRecentMigration = now.Ticks;
+                                migrationTimes.Add(now);
+
+                                // Flip around assignment for next pass
+                                (hashSlotsOnP0, hashSlotsOnP1) = (hashSlotsOnP1, hashSlotsOnP0);
+                            }
+
+                            return migrationTimes;
+                        }
+                    );
+
+                await Task.Delay(10_000).ConfigureAwait(false);
+
+                migrateCancel.Cancel();
+                var migrationTimes = await migrateTask.ConfigureAwait(false);
+
+                ClassicAssert.IsTrue(migrationTimes.Count >= 2, $"Should have moved back and forth, saw {migrationTimes}");
+
+                writeCancel.Cancel();
+                await Task.WhenAll(writeTasks).ConfigureAwait(false);
+
+                readCancel.Cancel();
+                var readResults = await Task.WhenAll(readTasks).ConfigureAwait(false);
+                ClassicAssert.IsTrue(readResults.All(static r => r > 0), "Should have successful reads on all Vector Sets");
+
+                // Check that everything written survived all the migrations
+                {
+                    var curPrimary0Slots = context.clusterTestUtils.GetOwnedSlotsFromNode(primary0, NullLogger.Instance);
+                    var curPrimary1Slots = context.clusterTestUtils.GetOwnedSlotsFromNode(primary1, NullLogger.Instance);
+
+                    for (var i = 0; i < vectorSetKeys.Count; i++)
+                    {
+                        var (key, slot) = vectorSetKeys[i];
+
+                        var isOnPrimary0 = curPrimary0Slots.Contains(slot);
+                        var isOnPrimary1 = curPrimary1Slots.Contains(slot);
+
+                        ClassicAssert.IsTrue(isOnPrimary0 || isOnPrimary1, "Hash slot not found on either node");
+                        ClassicAssert.IsFalse(isOnPrimary0 && isOnPrimary1, "Hash slot found on both nodes");
+
+                        var endpoint = isOnPrimary0 ? primary0 : primary1;
+
+                        foreach (var (elem, data, attr, _) in writeResults[i])
+                        {
+                            var actualData = (string[])context.clusterTestUtils.Execute(endpoint, "VEMB", [key, elem]);
+
+                            for (var j = 0; j < data.Length; j++)
+                            {
+                                ClassicAssert.AreEqual(data[j], (byte)float.Parse(actualData[j]));
+                            }
+                        }
+                    }
+                }
+
+            }
+            catch (Exception exc)
+            {
+                var gossipFaultsAtEnd = CountGossipFaults(captureLogWriter);
+
+                if (gossipFaultsAtTestStart != gossipFaultsAtEnd)
+                {
+                    // The cluster broke in some way, so data loss is _expected_
+                    ClassicAssert.Inconclusive($"Gossip fault lead to data loss, Vector Set migration is (probably) not to blame: {exc.Message}");
+                }
+
+                // Anything else, keep it going up
+                throw;
+            }
+
+            static int CountGossipFaults(CaptureLogWriter captureLogWriter)
+            {
+                var capturedLog = captureLogWriter.buffer.ToString();
+
+                // These kinds of errors happen from stressing migration independent of Vector Sets
+                // 
+                // TODO: These ought to be fixed outside of Vector Set work
+                var faultRound = capturedLog.Split("^GOSSIP round faulted^").Length - 1;
+                var faultResponse = capturedLog.Split("^GOSSIP faulted processing response^").Length - 1;
+                var faultMergeMap = capturedLog.Split("ClusterConfig.MergeSlotMap(").Length - 1;
+
+                return faultRound + faultResponse + faultMergeMap;
+            }
+        }
+
+        [Test]
+        public async Task FailoverStopsVectorManagerReplicationTasksAsync()
+        {
+            const int PrimaryIndex = 0;
+            const int ReplicaIndex = 1;
+
+            _ = await SimpleSetupClusterAsync(DefaultShards, primaryCount: DefaultShards / 2, replicaCount: 1);
+
+            var primary = (IPEndPoint)context.endpoints[PrimaryIndex];
+            var replica = (IPEndPoint)context.endpoints[ReplicaIndex];
+
+            var primaryVectorManager = GetStoreWrapper(context.nodes[PrimaryIndex]).DefaultDatabase.VectorManager;
+            var replicaVectorManager = GetStoreWrapper(context.nodes[ReplicaIndex]).DefaultDatabase.VectorManager;
+
+            ClassicAssert.AreEqual("master", context.clusterTestUtils.RoleCommand(primary).Value);
+            ClassicAssert.AreEqual("slave", context.clusterTestUtils.RoleCommand(replica).Value);
+
+            var vectorData0 = Enumerable.Range(0, 75).Select(static x => (byte)x).ToArray();
+
+            var vadd0Res = (int)context.clusterTestUtils.Execute(primary, "VADD", [new RedisKey("foo"), "XB8", vectorData0, new byte[] { 1, 0, 0, 0 }, "XPREQ8"]);
+            ClassicAssert.AreEqual(1, vadd0Res);
+
+            context.clusterTestUtils.WaitForReplicaAofSync(PrimaryIndex, ReplicaIndex);
+            await Task.Delay(10).ConfigureAwait(false);
+
+            ClassicAssert.IsFalse(primaryVectorManager.AreReplicationTasksActive);
+            ClassicAssert.IsTrue(replicaVectorManager.AreReplicationTasksActive);
+
+            context.ClusterFailoverSpinWait(ReplicaIndex, NullLogger.Instance);
+
+            context.clusterTestUtils.WaitForReplicaAofSync(ReplicaIndex, PrimaryIndex);
+            await Task.Delay(10).ConfigureAwait(false);
+
+            var vectorData1 = Enumerable.Range(0, 75).Select(static x => (byte)(x * 2)).ToArray();
+
+            var vadd1Res = (int)context.clusterTestUtils.Execute(replica, "VADD", [new RedisKey("foo"), "XB8", vectorData1, new byte[] { 2, 0, 0, 0 }, "XPREQ8"]);
+            ClassicAssert.AreEqual(1, vadd1Res);
+
+            ClassicAssert.IsTrue(primaryVectorManager.AreReplicationTasksActive);
+            ClassicAssert.IsFalse(replicaVectorManager.AreReplicationTasksActive);
+
+            var vsimRes = (byte[][])context.clusterTestUtils.Execute(replica, "VSIM", [new RedisKey("foo"), "XB8", vectorData0]);
+            ClassicAssert.IsTrue(vsimRes.Length > 0);
+        }
+
+        /// <summary>
+        /// Replica view of the delete-during-synthetic-replication race. A paused primary VADD is raced
+        /// by DEL then String SET, so its synthetic append-log RMW runs against a String record; the
+        /// updaters must cancel it (no AOF entry) so the replica stays converged with the primary.
+        /// </summary>
+        [Test]
+        public async Task ReplicaReplaysSyntheticVAddAgainstStringKeyAfterRacedDeleteAsync()
+        {
+            ClusterTestUtils.IgnoreIfExceptionInjectionDisabled();
+
+            const int PrimaryIndex = 0;
+            const int SecondaryIndex = 1;
+            const string Key = "foo";
+
+            _ = await SimpleSetupClusterAsync(DefaultShards, primaryCount: 1, replicaCount: 1, useTLS: false).ConfigureAwait(false);
+
+            var primary = (IPEndPoint)context.endpoints[PrimaryIndex];
+            var secondary = (IPEndPoint)context.endpoints[SecondaryIndex];
+
+            ClassicAssert.AreEqual("master", context.clusterTestUtils.RoleCommand(primary).Value);
+            ClassicAssert.AreEqual("slave", context.clusterTestUtils.RoleCommand(secondary).Value);
+
+            // The parked VADD blocks its own session thread, so DEL/SET must run on a different TCP connection.
+            using var opConn = await ConnectionMultiplexer.ConnectAsync(context.clusterTestUtils.GetRedisConfig(context.endpoints)).ConfigureAwait(false);
+            var opDb = opConn.GetDatabase();
+
+            Exception vaddError = null;
+            RedisResult vaddResult = null;
+
+            ExceptionInjectionHelper.EnableException(ExceptionInjectionType.VectorSet_Pause_Before_Synthetic_Replication_Rmw);
+            try
+            {
+                var vaddTask = Task.Run(() =>
+                {
+                    try
+                    {
+                        vaddResult = opDb.Execute("VADD", Key, "VALUES", "3", "1", "2", "3", "elemA");
+                    }
+                    catch (Exception ex)
+                    {
+                        vaddError = ex;
+                    }
+                });
+
+                // Wait until the primary VADD has built its index and parked right before writing the synthetic append-log entry to the AOF.
+                await ExceptionInjectionHelper.WaitOnClearAsync(ExceptionInjectionType.VectorSet_Pause_Before_Synthetic_Replication_Rmw).WaitAsync(TimeSpan.FromSeconds(30)).ConfigureAwait(false);
+
+                // DEL bypasses the vector lock the parked VADD still holds, so it wins the race; the following SET turns the key into a String.
+                var delRes = (long)context.clusterTestUtils.Execute(primary, "DEL", [new RedisKey(Key)]);
+                ClassicAssert.AreEqual(1, delRes);
+
+                var setRes = (string)context.clusterTestUtils.Execute(primary, "SET", [new RedisKey(Key), "not-a-vector-index"]);
+                ClassicAssert.AreEqual("OK", setRes);
+
+                // Release the parked VADD so it emits the synthetic append-log entry after DEL and SET.
+                ExceptionInjectionHelper.EnableException(ExceptionInjectionType.VectorSet_Pause_Before_Synthetic_Replication_Rmw);
+
+                await vaddTask.ConfigureAwait(false);
+            }
+            finally
+            {
+                ExceptionInjectionHelper.DisableException(ExceptionInjectionType.VectorSet_Pause_Before_Synthetic_Replication_Rmw);
+            }
+
+            var primaryType = (string)context.clusterTestUtils.Execute(primary, "TYPE", [new RedisKey(Key)]);
+            TestContext.Out.WriteLine($"[replica-synthetic-vadd] vaddResult={vaddResult}, vaddError={vaddError?.Message}, primaryType={primaryType}");
+
+            // Replaying the synthetic VADD against a String key must not livelock the replica nor stall replication: the AOF sync must converge.
+            context.clusterTestUtils.WaitForReplicaAofSync(PrimaryIndex, SecondaryIndex);
+
+            var readonlyOnReplica = (string)context.clusterTestUtils.Execute(secondary, "READONLY", []);
+            ClassicAssert.AreEqual("OK", readonlyOnReplica);
+
+            var replicaType = (string)context.clusterTestUtils.Execute(secondary, "TYPE", [new RedisKey(Key)]);
+            TestContext.Out.WriteLine($"[replica-synthetic-vadd] replicaType={replicaType}");
+
+            ClassicAssert.AreEqual("string", primaryType, "Synthetic VADD must not change the raced String key away from String on the primary");
+            ClassicAssert.AreEqual(primaryType, replicaType, "Replica diverged from primary after replaying a synthetic VADD against a String key");
+        }
+
+        [Test]
+        public async Task VSETATTRReplicatesAsync([Values(32, 3 * 1024 * 1024)] int attributeSize)
+        {
+            const int PrimaryIndex = 0;
+            const int SecondaryIndex = 1;
+            const string Key = nameof(VSETATTRReplicatesAsync);
+            const string Element = Key + "_Element";
+
+            _ = await SimpleSetupClusterAsync(DefaultShards, primaryCount: 1, replicaCount: 1, useTLS: false).ConfigureAwait(false);
+
+            var primary = (IPEndPoint)context.endpoints[PrimaryIndex];
+            var secondary = (IPEndPoint)context.endpoints[SecondaryIndex];
+
+            ClassicAssert.AreEqual("master", context.clusterTestUtils.RoleCommand(primary).Value);
+            ClassicAssert.AreEqual("slave", context.clusterTestUtils.RoleCommand(secondary).Value);
+
+            await using var connection = await ConnectionMultiplexer.ConnectAsync(context.clusterTestUtils.GetRedisConfig(context.endpoints)).ConfigureAwait(false);
+            var primaryServer = connection.GetServer(primary);
+            var secondaryServer = connection.GetServer(secondary);
+
+            var attributes = new string('a', attributeSize);
+            var updatedAttributes = new string('b', attributeSize + 1);
+            var addRes = (int)await primaryServer.ExecuteAsync(0, "VADD", [Key, "VALUES", "3", "1", "2", "3", Element, "NOQUANT", "SETATTR", attributes]).ConfigureAwait(false);
+            ClassicAssert.AreEqual(1, addRes);
+            context.clusterTestUtils.WaitForReplicaAofSync(PrimaryIndex, SecondaryIndex);
+            ClassicAssert.AreEqual("OK", (string)await secondaryServer.ExecuteAsync(0, "READONLY", []).ConfigureAwait(false));
+            ClassicAssert.AreEqual(attributes, (string)await secondaryServer.ExecuteAsync(0, "VGETATTR", [Key, Element], flags: CommandFlags.NoRedirect).ConfigureAwait(false));
+
+            var setRes = (int)await primaryServer.ExecuteAsync(0, "VSETATTR", [Key, Element, updatedAttributes]).ConfigureAwait(false);
+            ClassicAssert.AreEqual(1, setRes);
+
+            context.clusterTestUtils.WaitForReplicaAofSync(PrimaryIndex, SecondaryIndex);
+
+            var getRes = (string)await secondaryServer.ExecuteAsync(0, "VGETATTR", [Key, Element], flags: CommandFlags.NoRedirect).ConfigureAwait(false);
+            ClassicAssert.AreEqual(updatedAttributes, getRes);
+            ClassicAssert.AreEqual(1, (int)await secondaryServer.ExecuteAsync(0, "VCARD", [Key], flags: CommandFlags.NoRedirect).ConfigureAwait(false));
+            CollectionAssert.AreEqual(new[] { Element }, (string[])await secondaryServer.ExecuteAsync(0, "VSIM", [Key, "VALUES", 3, 1, 2, 3, "COUNT", 1], flags: CommandFlags.NoRedirect).ConfigureAwait(false));
+
+            ClassicAssert.AreEqual(1, (int)await primaryServer.ExecuteAsync(0, "VREM", [Key, Element]).ConfigureAwait(false));
+            context.clusterTestUtils.WaitForReplicaAofSync(PrimaryIndex, SecondaryIndex);
+            ClassicAssert.AreEqual(0, (int)await secondaryServer.ExecuteAsync(0, "VISMEMBER", [Key, Element], flags: CommandFlags.NoRedirect).ConfigureAwait(false));
+            ClassicAssert.IsTrue((await secondaryServer.ExecuteAsync(0, "VGETATTR", [Key, Element], flags: CommandFlags.NoRedirect).ConfigureAwait(false)).IsNull);
+        }
+
+        [Test]
+        public async Task ConcurrentVADDUpdatesAsync()
+        {
+            const int PrimaryIndex = 0;
+            const int SecondaryIndex = 1;
+            const string Key = nameof(ConcurrentVADDUpdatesAsync);
+            const string Element = Key + "_Element";
+
+            const int ConnectionCount = 4;
+            const int Pauses = 10;
+
+            const int WriteCount = 100;
+
+            _ = await SimpleSetupClusterAsync(DefaultShards, primaryCount: 1, replicaCount: 1, useTLS: false).ConfigureAwait(false);
+
+            var primary = (IPEndPoint)context.endpoints[PrimaryIndex];
+            var secondary = (IPEndPoint)context.endpoints[SecondaryIndex];
+
+            ClassicAssert.AreEqual("master", context.clusterTestUtils.RoleCommand(primary).Value);
+            ClassicAssert.AreEqual("slave", context.clusterTestUtils.RoleCommand(secondary).Value);
+
+            var cons = new ConnectionMultiplexer[ConnectionCount];
+            try
+            {
+                for (var i = 0; i < cons.Length; i++)
+                {
+                    cons[i] = await ConnectionMultiplexer.ConnectAsync(context.clusterTestUtils.GetRedisConfig(context.endpoints)).ConfigureAwait(false);
+                }
+
+                var initialRes = await cons[0].GetDatabase().VectorSetAddAsync(Key, VectorSetAddRequest.Member(Element, new float[] { 0, 0, 0 }, "{\"invalid\": \"data\"}")).ConfigureAwait(false);
+                ClassicAssert.IsTrue(initialRes);
+
+                for (var pause = 0; pause < Pauses; pause++)
+                {
+                    var writeTasks = new Task[cons.Length];
+
+                    using var startGate = new SemaphoreSlim(0, writeTasks.Length);
+
+                    for (var i = 0; i < writeTasks.Length; i++)
+                    {
+                        var writeIx = i;
+                        var con = cons[writeIx];
+                        writeTasks[writeIx] =
+                            Task.Run(
+                                async () =>
+                                {
+                                    var db = con.GetDatabase();
+
+                                    var buff = new float[3];
+
+                                    await startGate.WaitAsync().ConfigureAwait(false);
+
+                                    for (var j = 0; j < WriteCount; j++)
+                                    {
+                                        var rawVal = Random.Shared.Next(1_000);
+
+                                        buff[0] = rawVal;
+                                        for (var k = 1; k < buff.Length; k++)
+                                        {
+                                            buff[k] = buff[k - 1] + 1;
+                                        }
+
+                                        var json = $"{{\"data\": {rawVal} }}";
+
+                                        var updateRes = await db.VectorSetAddAsync(Key, VectorSetAddRequest.Member(Element, buff, json)).ConfigureAwait(false);
+                                        ClassicAssert.IsFalse(updateRes);
+                                    }
+                                }
+                            );
+                    }
+
+                    _ = startGate.Release(writeTasks.Length);
+
+                    await Task.WhenAll(writeTasks).ConfigureAwait(false);
+
+                    context.clusterTestUtils.WaitForReplicaAofSync(PrimaryIndex, SecondaryIndex);
+
+                    var onPrimaryData = (double[])await cons[0].GetServer(primary).ExecuteAsync(database: 0, "VEMB", [Key, Element]).ConfigureAwait(false);
+                    var onPrimaryAttr = (string)await cons[0].GetServer(primary).ExecuteAsync(database: 0, "VGETATTR", [Key, Element]).ConfigureAwait(false);
+
+                    var onSecondaryData = (double[])await cons[0].GetServer(secondary).ExecuteAsync(database: 0, "VEMB", [Key, Element]).ConfigureAwait(false);
+                    var onSecondaryAttr = (string)await cons[0].GetServer(secondary).ExecuteAsync(database: 0, "VGETATTR", [Key, Element]).ConfigureAwait(false);
+
+                    // Valid
+                    ClassicAssert.AreEqual(3, onPrimaryData.Length);
+                    for (var k = 1; k < onPrimaryData.Length; k++)
+                    {
+                        ClassicAssert.AreEqual((int)(onPrimaryData[k - 1] + 1), (int)onPrimaryData[k]);
+                    }
+                    ClassicAssert.AreEqual($"{{\"data\": {(int)onPrimaryData[0]} }}", onPrimaryAttr);
+
+                    // Matching
+                    ClassicAssert.True(onPrimaryData.SequenceEqual(onSecondaryData));
+                    ClassicAssert.AreEqual(onPrimaryAttr, onSecondaryAttr);
+                }
+            }
+            finally
+            {
+                foreach (var con in cons)
+                {
+                    if (con != null)
+                    {
+                        await con.DisposeAsync().ConfigureAwait(false);
+                    }
+                }
+            }
+        }
+
+        [Test]
+        public async Task ConcurrentVSETATTRUpdatesAsync()
+        {
+            const int PrimaryIndex = 0;
+            const int SecondaryIndex = 1;
+            const string Key = nameof(ConcurrentVSETATTRUpdatesAsync);
+            const string Element = Key + "_Element";
+
+            const int ConnectionCount = 4;
+            const int Pauses = 10;
+
+            const int WriteCount = 100;
+
+            _ = await SimpleSetupClusterAsync(DefaultShards, primaryCount: 1, replicaCount: 1, useTLS: false).ConfigureAwait(false);
+
+            var primary = (IPEndPoint)context.endpoints[PrimaryIndex];
+            var secondary = (IPEndPoint)context.endpoints[SecondaryIndex];
+
+            ClassicAssert.AreEqual("master", context.clusterTestUtils.RoleCommand(primary).Value);
+            ClassicAssert.AreEqual("slave", context.clusterTestUtils.RoleCommand(secondary).Value);
+
+            var cons = new ConnectionMultiplexer[ConnectionCount];
+            try
+            {
+                for (var i = 0; i < cons.Length; i++)
+                {
+                    cons[i] = await ConnectionMultiplexer.ConnectAsync(context.clusterTestUtils.GetRedisConfig(context.endpoints)).ConfigureAwait(false);
+                }
+
+                var initialRes = await cons[0].GetDatabase().VectorSetAddAsync(Key, VectorSetAddRequest.Member(Element, new float[] { 1, 2, 3 }, "{\"invalid\": \"data\"}")).ConfigureAwait(false);
+                ClassicAssert.IsTrue(initialRes);
+
+                for (var pause = 0; pause < Pauses; pause++)
+                {
+                    var writeTasks = new Task[cons.Length];
+
+                    using var startGate = new SemaphoreSlim(0, writeTasks.Length);
+
+                    for (var i = 0; i < writeTasks.Length; i++)
+                    {
+                        var writeIx = i;
+                        var con = cons[writeIx];
+                        writeTasks[writeIx] =
+                            Task.Run(
+                                async () =>
+                                {
+                                    var db = con.GetDatabase();
+
+                                    await startGate.WaitAsync().ConfigureAwait(false);
+
+                                    for (var j = 0; j < WriteCount; j++)
+                                    {
+                                        var val = Random.Shared.Next(1_000);
+
+                                        var json = $"{{\"data\": {val} }}";
+
+                                        var setRes = await db.VectorSetSetAttributesJsonAsync(Key, Element, json).ConfigureAwait(false);
+                                        ClassicAssert.IsTrue(setRes);
+                                    }
+                                }
+                            );
+                    }
+
+                    _ = startGate.Release(writeTasks.Length);
+
+                    await Task.WhenAll(writeTasks).ConfigureAwait(false);
+
+                    await Task.Delay(1_000).ConfigureAwait(false);
+
+                    var onPrimaryAttr = (string)await cons[0].GetServer(primary).ExecuteAsync(database: 0, "VGETATTR", [Key, Element]).ConfigureAwait(false);
+                    var onSecondaryAttr = (string)await cons[0].GetServer(secondary).ExecuteAsync(database: 0, "VGETATTR", [Key, Element]).ConfigureAwait(false);
+
+                    // Matching
+                    ClassicAssert.AreEqual(onPrimaryAttr, onSecondaryAttr);
+                }
+            }
+            finally
+            {
+                foreach (var con in cons)
+                {
+                    if (con != null)
+                    {
+                        await con.DisposeAsync().ConfigureAwait(false);
+                    }
+                }
+            }
+        }
+
+        [Test]
+        public async Task ConcurrentVREMUpdatesAsync()
+        {
+            const int PrimaryIndex = 0;
+            const int SecondaryIndex = 1;
+            const string Key = nameof(ConcurrentVREMUpdatesAsync);
+            const string ElementPrefix = Key + "_Element";
+
+            const int ConnectionCount = 4;
+            const int Pauses = 10;
+
+            const int WriteCount = 100;
+            const int ElementCount = 20;
+
+            _ = await SimpleSetupClusterAsync(DefaultShards, primaryCount: 1, replicaCount: 1, useTLS: false).ConfigureAwait(false);
+
+            var primary = (IPEndPoint)context.endpoints[PrimaryIndex];
+            var secondary = (IPEndPoint)context.endpoints[SecondaryIndex];
+
+            ClassicAssert.AreEqual("master", context.clusterTestUtils.RoleCommand(primary).Value);
+            ClassicAssert.AreEqual("slave", context.clusterTestUtils.RoleCommand(secondary).Value);
+
+            var allElements = new List<string>();
+            for (var i = 0; i < ElementCount; i++)
+            {
+                allElements.Add(ElementPrefix + "_" + i);
+            }
+
+            var cons = new ConnectionMultiplexer[ConnectionCount];
+            try
+            {
+                for (var i = 0; i < cons.Length; i++)
+                {
+                    cons[i] = await ConnectionMultiplexer.ConnectAsync(context.clusterTestUtils.GetRedisConfig(context.endpoints)).ConfigureAwait(false);
+                }
+
+                foreach (var element in allElements)
+                {
+                    var initialRes = await cons[0].GetDatabase().VectorSetAddAsync(Key, VectorSetAddRequest.Member(element, new float[] { 1, 2, 3 }, "{\"invalid\": \"data\"}")).ConfigureAwait(false);
+                    ClassicAssert.IsTrue(initialRes);
+                }
+
+                for (var pause = 0; pause < Pauses; pause++)
+                {
+                    var writeTasks = new Task[cons.Length];
+
+                    using var startGate = new SemaphoreSlim(0, writeTasks.Length);
+
+                    for (var i = 0; i < writeTasks.Length; i++)
+                    {
+                        var writeIx = i;
+                        var con = cons[writeIx];
+                        writeTasks[writeIx] =
+                            Task.Run(
+                                async () =>
+                                {
+                                    var db = con.GetDatabase();
+
+                                    await startGate.WaitAsync().ConfigureAwait(false);
+
+                                    for (var j = 0; j < WriteCount; j++)
+                                    {
+                                        var element = allElements[Random.Shared.Next(allElements.Count)];
+
+                                        if (Random.Shared.Next(2) == 0)
+                                        {
+                                            var rawVal = Random.Shared.Next(1_000);
+
+                                            var json = $"{{\"data\": {rawVal} }}";
+                                            var buff = new float[] { rawVal, rawVal + 1, rawVal + 2 };
+
+                                            // Because of (intentional) racing we can't know the expected response here
+                                            _ = await db.VectorSetAddAsync(Key, VectorSetAddRequest.Member(element, buff, json)).ConfigureAwait(false);
+                                        }
+                                        else
+                                        {
+                                            // Because of (intentional) racing we can't know the expected response here
+                                            _ = await db.VectorSetRemoveAsync(Key, element).ConfigureAwait(false);
+                                        }
+                                    }
+                                }
+                            );
+                    }
+
+                    _ = startGate.Release(writeTasks.Length);
+
+                    await Task.WhenAll(writeTasks).ConfigureAwait(false);
+
+                    context.clusterTestUtils.WaitForReplicaAofSync(PrimaryIndex, SecondaryIndex);
+
+                    // Check that state is consistent between primary and secondary
+                    foreach (var element in allElements)
+                    {
+                        var onPrimary = (bool)await cons[0].GetServer(primary).ExecuteAsync(database: 0, "VISMEMBER", [Key, element]).ConfigureAwait(false);
+
+                        if (onPrimary)
+                        {
+                            var onPrimaryData = (double[])await cons[0].GetServer(primary).ExecuteAsync(database: 0, "VEMB", [Key, element]).ConfigureAwait(false);
+                            var onPrimaryAttr = (string)await cons[0].GetServer(primary).ExecuteAsync(database: 0, "VGETATTR", [Key, element]).ConfigureAwait(false);
+
+                            var onSecondaryData = (double[])await cons[0].GetServer(secondary).ExecuteAsync(database: 0, "VEMB", [Key, element]).ConfigureAwait(false);
+                            var onSecondaryAttr = (string)await cons[0].GetServer(secondary).ExecuteAsync(database: 0, "VGETATTR", [Key, element]).ConfigureAwait(false);
+
+                            // Valid
+                            ClassicAssert.AreEqual(3, onPrimaryData.Length);
+                            for (var k = 1; k < onPrimaryData.Length; k++)
+                            {
+                                ClassicAssert.AreEqual((int)(onPrimaryData[k - 1] + 1), (int)onPrimaryData[k]);
+                            }
+                            ClassicAssert.AreEqual($"{{\"data\": {(int)onPrimaryData[0]} }}", onPrimaryAttr);
+
+                            // Matching
+                            ClassicAssert.True(onPrimaryData.SequenceEqual(onSecondaryData));
+                            ClassicAssert.AreEqual(onPrimaryAttr, onSecondaryAttr);
+                        }
+                        else
+                        {
+                            var onSecondary = (bool)await cons[0].GetServer(secondary).ExecuteAsync(database: 0, "VISMEMBER", [Key, element]).ConfigureAwait(false);
+                            ClassicAssert.IsFalse(onSecondary);
+                        }
+                    }
+                }
+            }
+            finally
+            {
+                foreach (var con in cons)
+                {
+                    if (con != null)
+                    {
+                        await con.DisposeAsync().ConfigureAwait(false);
+                    }
+                }
+            }
+        }
+
+        [Test]
+        [CancelAfter(30_000)]
+        public async Task VectorSetMigrationPreservesExpirationAsync(CancellationToken cancellation)
+        {
+            const string Key = nameof(VectorSetMigrationPreservesExpirationAsync);
+            const string Element = Key + "_Element";
+
+            // Cluster with multiple primaries and a replica for each primary
+            _ = await SimpleSetupClusterAsync(DefaultMultiPrimaryShards, primaryCount: DefaultMultiPrimaryShards / 2, replicaCount: 1, useTLS: false).ConfigureAwait(false);
+
+            await using var connection = await ConnectionMultiplexer.ConnectAsync(context.clusterTestUtils.GetRedisConfig(context.endpoints)).ConfigureAwait(false);
+
+            var hashSlot = connection.HashSlot(Key);
+
+            var initialPrimaryId = connection.GetServers()[0].ClusterConfiguration.GetBySlot(Key).NodeId;
+            var initialPrimary = connection.GetServers().Single(x => !x.IsReplica && initialPrimaryId.Equals(x.ClusterConfiguration.Nodes.Single(static n => n.IsMyself).NodeId));
+
+            var finalPrimary = connection.GetServers().Single(x => !x.IsReplica && !initialPrimaryId.Equals(x.ClusterConfiguration.Nodes.Single(static n => n.IsMyself).NodeId));
+            var finalPrimaryId = finalPrimary.ClusterConfiguration.Nodes.Single(static n => n.IsMyself).NodeId;
+            var finalPrimaryIndex = context.endpoints.IndexOf(finalPrimary.EndPoint);
+
+            var finalReplicaNode = finalPrimary.ClusterConfiguration.Nodes.Single(n => n.ParentNodeId != null && n.ParentNodeId.Equals(finalPrimaryId));
+            var finalReplica = connection.GetServers().Single(x => x.IsReplica && x.EndPoint.Equals(finalReplicaNode.EndPoint));
+            var finalReplicaIndex = context.endpoints.IndexOf(finalReplica.EndPoint);
+
+            // Check expiration on initial node
+            {
+                var res0 = await initialPrimary.ExecuteAsync(database: 0, "VADD", [Key, "VALUES", "3", "1.0", "2.0", "3.0", Element], flags: CommandFlags.NoRedirect).ConfigureAwait(false);
+                ClassicAssert.AreEqual(1, (int)res0);
+
+                var res1 = await initialPrimary.ExecuteAsync(database: 0, "EXPIRE", [Key, "1"], flags: CommandFlags.NoRedirect | CommandFlags.DemandMaster).ConfigureAwait(false);
+                ClassicAssert.AreEqual(1, (int)res1);
+
+                var res2 = await initialPrimary.ExecuteAsync(database: 0, "EXISTS", [Key], flags: CommandFlags.NoRedirect | CommandFlags.DemandMaster).ConfigureAwait(false);
+                ClassicAssert.AreEqual(1, (int)res2);
+
+                await Task.Delay(TimeSpan.FromSeconds(3), cancellation).ConfigureAwait(false);
+
+                // Expired
+                var res3 = await initialPrimary.ExecuteAsync(database: 0, "EXISTS", [Key], flags: CommandFlags.NoRedirect | CommandFlags.DemandMaster).ConfigureAwait(false);
+                ClassicAssert.AreEqual(0, (int)res3);
+            }
+
+            // Migrate slots after setting expiration
+            {
+                var res0 = await initialPrimary.ExecuteAsync(database: 0, "VADD", [Key, "VALUES", "3", "1.0", "2.0", "3.0", Element], flags: CommandFlags.NoRedirect).ConfigureAwait(false);
+                ClassicAssert.AreEqual(1, (int)res0);
+
+                var res1 = await initialPrimary.ExecuteAsync(database: 0, "EXPIRE", [Key, "60"], flags: CommandFlags.NoRedirect | CommandFlags.DemandMaster).ConfigureAwait(false);
+                ClassicAssert.AreEqual(1, (int)res1);
+
+                // Migrate slot containing Vector Set
+                context.clusterTestUtils.MigrateSlots((IPEndPoint)initialPrimary.EndPoint, (IPEndPoint)finalPrimary.EndPoint, [hashSlot]);
+                context.clusterTestUtils.WaitForMigrationCleanup((IPEndPoint)initialPrimary.EndPoint, cancellation);
+
+                while (true)
+                {
+                    var countUpdated = 0;
+                    foreach (var server in connection.GetServers())
+                    {
+                        var curSlots = server.ClusterSlots();
+                        if (curSlots.Assignments.Count(c => hashSlot >= c.Slots.From && hashSlot <= c.Slots.To && c.Primary.NodeId == finalPrimaryId) == 1)
+                        {
+                            countUpdated++;
+                        }
+                    }
+
+                    if (countUpdated == connection.GetServers().Length)
+                    {
+                        break;
+                    }
+
+                    ClusterTestUtils.BackOff(cancellationToken: cancellation, msg: "Waiting for migrated slot to move to new primary");
+                }
+
+                // Check that TTL survived migration on the primary
+                var res2 = await finalPrimary.ExecuteAsync(database: 0, "TTL", [Key], flags: CommandFlags.NoRedirect | CommandFlags.DemandMaster).ConfigureAwait(false);
+                ClassicAssert.IsTrue((int)res2 > 0);
+
+                context.clusterTestUtils.WaitForReplicaAofSync(finalPrimaryIndex, finalReplicaIndex, cancellation: cancellation);
+
+                // Check that TTL made it to the replica
+                var res3 = await finalReplica.ExecuteAsync("READONLY").ConfigureAwait(false);
+                ClassicAssert.AreEqual("OK", (string)res3);
+
+                var res4 = await finalReplica.ExecuteAsync(database: 0, "TTL", [Key], flags: CommandFlags.NoRedirect | CommandFlags.DemandReplica).ConfigureAwait(false);
+                ClassicAssert.IsTrue((int)res4 > 0);
+                ClassicAssert.IsTrue((int)res4 <= (int)res2);
+            }
+        }
+
+        [Test]
+        [CancelAfter(30_000)]
+        public async Task RejectDiskLogRecordVectorSetMigrationsAsync(CancellationToken cancellation)
+        {
+            const string KeyName = "0123456789abcdef";
+
+            const int RecordTypeIndex = RecordInfo.Size + RecordDataHeader.RecordTypeOffsetInHeader;
+
+            _ = await SimpleSetupClusterAsync(DefaultMultiPrimaryShards, primaryCount: DefaultMultiPrimaryShards / 2, replicaCount: 1, useTLS: false).ConfigureAwait(false);
+
+            var slot = HashSlotUtils.HashSlot(Encoding.ASCII.GetBytes(KeyName));
+
+            var owningNodeIndex = context.clusterTestUtils.GetSourceNodeIndexFromSlot(slot, null);
+            var targetNodeIndex = owningNodeIndex == 0 ? 1 : 0;
+
+            var importingFromId = context.clusterTestUtils.GetLocalNodeId(owningNodeIndex);
+            var targetNodeId = context.clusterTestUtils.GetLocalNodeId(targetNodeIndex);
+
+            var setSlotImportingRes = context.clusterTestUtils.SetSlot(targetNodeIndex, slot, "IMPORTING", importingFromId);
+            ClassicAssert.AreEqual("OK", setSlotImportingRes);
+
+            // Preconstructed DiskLogRecord with the above key
+            var disklogPayload = Convert.FromHexString("0100000000000A0003000410000000003031323334353637383961626364656669794D53744576657159746D4E6F7A33");
+
+            // Corrupt the RecordTypeIndex
+            disklogPayload[RecordTypeIndex] = 255;
+
+            var forgingClient = context.clusterTestUtils.GetGarnetClientSession(targetNodeIndex);
+            forgingClient.SetClusterMigrateHeader(importingFromId, false, false);
+            ClassicAssert.True(forgingClient.TryWriteRecordSpan(disklogPayload, MigrationRecordSpanType.LogRecord, out var task));
+            ClassicAssert.IsNull(task);
+
+            ClassicAssert.AreEqual("OK", await forgingClient.SendAndResetIterationBuffer().ConfigureAwait(false));
+
+            var setSlotOwnedRes = context.clusterTestUtils.SetSlot(targetNodeIndex, slot, "NODE", targetNodeId);
+            ClassicAssert.AreEqual("OK", setSlotOwnedRes);
+
+            var setSlotStableRes = context.clusterTestUtils.SetSlot(targetNodeIndex, slot, "STABLE", "");
+            ClassicAssert.AreEqual("OK", setSlotStableRes);
+
+            var existsRes = await forgingClient.ExecuteAsync("EXISTS", KeyName).ConfigureAwait(false);
+
+            ClassicAssert.AreEqual("0", existsRes);
+        }
+
+        [Test]
+        public async Task ImportReplicationAsync()
+        {
+            const string ExportKey = nameof(ImportReplicationAsync) + "_Export";
+            const string ImportKey = nameof(ImportReplicationAsync) + "_Import";
+            const int NumElements = 1_000;
+            const int FanOut = 8;
+            const uint StartPointId = uint.MaxValue; // Garnet always uses this start point id, so we'll export using it
+
+            _ = await SimpleSetupClusterAsync(DefaultShards, primaryCount: DefaultShards / 2, replicaCount: 1, useTLS: false).ConfigureAwait(false);
+
+            await using var connection = await ConnectionMultiplexer.ConnectAsync(context.clusterTestUtils.GetRedisConfig(context.endpoints)).ConfigureAwait(false);
+            var db = connection.GetDatabase();
+
+            // Build a Vector Set to import
+            for (var i = 0; i < NumElements; i++)
+            {
+                ClassicAssert.IsTrue(await db.VectorSetAddAsync(ExportKey, VectorSetAddRequest.Member(i.ToString(), new float[] { i, i + 1, i + 2 }, $"{{\"id\": \"{i}\"}}")).ConfigureAwait(false));
+            }
+
+            // Export the Vector Set
+            var primaryServer = context.nodes[0];
+
+            Span<byte> stateKey = stackalloc byte[sizeof(uint)];
+            BinaryPrimitives.WriteUInt32LittleEndian(stateKey, BinaryPrimitives.ReadUInt32BigEndian("_qnt"u8));
+            var state = ReadRawVectorTerm(primaryServer, ExportKey, DiskANNService.Metadata, stateKey);
+
+            var startPointKey = BitConverter.GetBytes(0U);
+
+            var importArgs = new List<RedisValue[]>();
+
+            for (var i = 0; i < NumElements; i++)
+            {
+                var internalId = ReadRawVectorTerm(primaryServer, ExportKey, DiskANNService.InternalIdMap, Encoding.UTF8.GetBytes(i.ToString()));
+
+                var fullVector = ReadRawVectorTerm(primaryServer, ExportKey, DiskANNService.FullVector, internalId);
+                var attributes = ReadRawVectorTerm(primaryServer, ExportKey, DiskANNService.Attributes, internalId);
+                var quantVector = ReadRawVectorTerm(primaryServer, ExportKey, DiskANNService.QuantizedVector, internalId);
+                var neighbors = ReadRawVectorTerm(primaryServer, ExportKey, DiskANNService.NeighborList, internalId);
+                var externalId = ReadRawVectorTerm(primaryServer, ExportKey, DiskANNService.ExternalIdMap, internalId);
+
+                // Imports are actually stored under internal id
+                importArgs.Add(["ATTRS", internalId, attributes]);
+                importArgs.Add(["EXTMAP", internalId, externalId]);
+                importArgs.Add(["NEIGHBORS", internalId, neighbors]);
+                importArgs.Add(["VECTOR", internalId, fullVector]);
+                importArgs.Add(["QUANT", internalId, quantVector]);
+
+                // INTMAP goes in the opposite direction
+                importArgs.Add(["INTMAP", externalId, internalId]);
+            }
+
+            // Deal with the start point
+            {
+                var internalId = new byte[4];
+                BinaryPrimitives.WriteUInt32LittleEndian(internalId, StartPointId);
+
+                var fullVector = ReadRawVectorTerm(primaryServer, ExportKey, DiskANNService.FullVector, internalId);
+                var quantVector = ReadRawVectorTerm(primaryServer, ExportKey, DiskANNService.QuantizedVector, internalId);
+                var neighbors = ReadRawVectorTerm(primaryServer, ExportKey, DiskANNService.NeighborList, internalId);
+
+                // Imports are actually stored under internal id
+                importArgs.Add(["VECTOR", internalId, fullVector]);
+                importArgs.Add(["NEIGHBORS", internalId, neighbors]);
+                importArgs.Add(["QUANT", internalId, quantVector]);
+            }
+
+            var fanCons = new ConnectionMultiplexer[FanOut];
+            try
+            {
+                for (var i = 0; i < fanCons.Length; i++)
+                {
+                    fanCons[i] = await ConnectionMultiplexer.ConnectAsync(context.clusterTestUtils.GetRedisConfig(context.endpoints)).ConfigureAwait(false);
+                }
+
+                var createTask = db.ExecuteAsync("XVCREATE", [ImportKey, "DIM", 3, "M", 16, "Q8", "QUANT_STATE", state]);
+
+                var parallelImport =
+                    createTask.ContinueWith(
+                        async t =>
+                        {
+                            ClassicAssert.AreEqual("OK", (string)await t.ConfigureAwait(false));
+
+                            var parallelImports = new Task<int>[FanOut];
+                            for (var i = 0; i < parallelImports.Length; i++)
+                            {
+                                var iCopy = i;
+                                var importCon = fanCons[i];
+                                parallelImports[i] = Task.Run(
+                                    async () =>
+                                    {
+                                        var importDb = importCon.GetDatabase();
+
+                                        var imported = 0;
+
+                                        for (var j = 0; j < importArgs.Count; j++)
+                                        {
+                                            if ((j % FanOut) == iCopy)
+                                            {
+                                                ICollection<object> args = [ImportKey, .. importArgs[j]];
+                                                ClassicAssert.AreEqual("OK", (string)await importDb.ExecuteAsync("XVIMPORT", args).ConfigureAwait(false));
+                                                imported++;
+                                            }
+                                        }
+
+                                        return imported;
+                                    }
+                                );
+                            }
+
+                            return (await Task.WhenAll(parallelImports).ConfigureAwait(false)).Sum();
+                        }
+                    )
+                    .Unwrap();
+
+                var verifyImport =
+                    parallelImport.ContinueWith(
+                        async t =>
+                        {
+                            ClassicAssert.AreEqual(importArgs.Count, await t.ConfigureAwait(false));
+
+                            var parallelVerify = new Task[FanOut];
+                            for (var i = 0; i < parallelVerify.Length; i++)
+                            {
+                                var importCon = fanCons[i];
+                                parallelVerify[i] = importCon.GetDatabase().ExecuteAsync("XVIMPORT", [ImportKey, "VERIFY", i, FanOut]);
+                            }
+
+                            await Task.WhenAll(parallelVerify).ConfigureAwait(false);
+                        }
+                    )
+                    .Unwrap();
+
+                await verifyImport.ConfigureAwait(false);
+            }
+            finally
+            {
+                foreach (var con in fanCons)
+                {
+                    await con.DisposeAsync().ConfigureAwait(false);
+                }
+            }
+
+            ClassicAssert.AreEqual("OK", (string)await db.ExecuteAsync("XVIMPORT", [ImportKey, "FINISH"]).ConfigureAwait(false));
+
+            context.clusterTestUtils.WaitForReplicaAofSync(0, 1);
+
+            var replica = connection.GetServer(context.endpoints[1]);
+            ClassicAssert.AreEqual("OK", (string)await replica.ExecuteAsync("READONLY").ConfigureAwait(false));
+
+            // Validate all three relevant Vector Sets
+            for (var i = 0; i < NumElements; i++)
+            {
+                var exactMatch = new float[] { i, i + 1, i + 2 };
+                var searchReq = VectorSetSimilaritySearchRequest.ByVector(exactMatch);
+                searchReq.WithAttributes = true;
+
+                using var searchExportRes = await db.VectorSetSimilaritySearchAsync(ExportKey, searchReq).ConfigureAwait(false);
+                using var searchImportRes = await db.VectorSetSimilaritySearchAsync(ImportKey, searchReq).ConfigureAwait(false);
+                var replicaImportRes = (string[])await replica.ExecuteAsync(database: 0, "VSIM", [ImportKey, "FP32", MemoryMarshal.AsBytes(exactMatch).ToArray(), "WITHATTRIBS"]).ConfigureAwait(false);
+
+                ClassicAssert.AreEqual(searchExportRes.Length, searchImportRes.Length);
+                ClassicAssert.AreEqual(searchExportRes.Length, replicaImportRes.Length / 2);
+
+                for (var j = 0; j < searchExportRes.Length; j++)
+                {
+                    var expectedMember = (string)searchExportRes.Span[j].Member;
+                    var expectedAttr = searchExportRes.Span[j].AttributesJson;
+
+                    var importMember = (string)searchImportRes.Span[j].Member;
+                    var importAttr = searchImportRes.Span[j].AttributesJson;
+
+                    var replicaMember = replicaImportRes[j * 2];
+                    var replicaAttr = replicaImportRes[(j * 2) + 1];
+
+                    ClassicAssert.AreEqual(expectedMember, importMember);
+                    ClassicAssert.AreEqual(expectedMember, replicaMember);
+
+                    ClassicAssert.AreEqual(expectedAttr, importAttr);
+                    ClassicAssert.AreEqual(expectedAttr, replicaAttr);
+                }
+            }
+        }
+
+        [Test]
+        public async Task FailedImportMarkedFailedAsync()
+        {
+            const string ExportKey = nameof(FailedImportMarkedFailedAsync) + "_Export";
+            const string ImportKey = nameof(FailedImportMarkedFailedAsync) + "_Import";
+            const int NumElements = 10;
+            const uint StartPointId = uint.MaxValue; // Garnet always uses this start point id, so we'll export using it
+            const int SEED = 2026_11_02_00;
+
+            var rand = new Random(SEED);
+
+            _ = await SimpleSetupClusterAsync(DefaultShards, primaryCount: DefaultShards / 2, replicaCount: 1, useTLS: false).ConfigureAwait(false);
+
+            await using var connection = await ConnectionMultiplexer.ConnectAsync(context.clusterTestUtils.GetRedisConfig(context.endpoints)).ConfigureAwait(false);
+            var db = connection.GetDatabase();
+
+            // Build a Vector Set to import
+            for (var i = 0; i < NumElements; i++)
+            {
+                ClassicAssert.IsTrue(await db.VectorSetAddAsync(ExportKey, VectorSetAddRequest.Member(i.ToString(), new float[] { i, i + 1, i + 2 }, $"{{\"id\": \"{i}\"}}")).ConfigureAwait(false));
+            }
+
+            // Export the Vector Set
+            var primaryServer = context.nodes[0];
+
+            Span<byte> stateKey = stackalloc byte[sizeof(uint)];
+            BinaryPrimitives.WriteUInt32LittleEndian(stateKey, BinaryPrimitives.ReadUInt32BigEndian("_qnt"u8));
+            var state = ReadRawVectorTerm(primaryServer, ExportKey, DiskANNService.Metadata, stateKey);
+
+            var startPointKey = BitConverter.GetBytes(0U);
+
+            var importArgsList = new List<RedisValue[]>();
+
+            for (var i = 0; i < NumElements; i++)
+            {
+                var internalId = ReadRawVectorTerm(primaryServer, ExportKey, DiskANNService.InternalIdMap, Encoding.UTF8.GetBytes(i.ToString()));
+
+                var fullVector = ReadRawVectorTerm(primaryServer, ExportKey, DiskANNService.FullVector, internalId);
+                var attributes = ReadRawVectorTerm(primaryServer, ExportKey, DiskANNService.Attributes, internalId);
+                var quantVector = ReadRawVectorTerm(primaryServer, ExportKey, DiskANNService.QuantizedVector, internalId);
+                var neighbors = ReadRawVectorTerm(primaryServer, ExportKey, DiskANNService.NeighborList, internalId);
+                var externalId = ReadRawVectorTerm(primaryServer, ExportKey, DiskANNService.ExternalIdMap, internalId);
+
+                // Imports are actually stored under internal id
+                importArgsList.Add(["ATTRS", internalId, attributes]);
+                importArgsList.Add(["EXTMAP", internalId, externalId]);
+                importArgsList.Add(["NEIGHBORS", internalId, neighbors]);
+                importArgsList.Add(["VECTOR", internalId, fullVector]);
+                importArgsList.Add(["QUANT", internalId, quantVector]);
+
+                // INTMAP goes in the opposite direction
+                importArgsList.Add(["INTMAP", externalId, internalId]);
+            }
+
+            // Deal with the start point
+            {
+                var internalId = new byte[4];
+                BinaryPrimitives.WriteUInt32LittleEndian(internalId, StartPointId);
+
+                var fullVector = ReadRawVectorTerm(primaryServer, ExportKey, DiskANNService.FullVector, internalId);
+                var quantVector = ReadRawVectorTerm(primaryServer, ExportKey, DiskANNService.QuantizedVector, internalId);
+                var neighbors = ReadRawVectorTerm(primaryServer, ExportKey, DiskANNService.NeighborList, internalId);
+
+                // Imports are actually stored under internal id
+                importArgsList.Add(["VECTOR", internalId, fullVector]);
+                importArgsList.Add(["NEIGHBORS", internalId, neighbors]);
+                importArgsList.Add(["QUANT", internalId, quantVector]);
+            }
+
+            // Toss half the (repeatably) random import terms on the ground
+            var importArgs = importArgsList.ToArray();
+            rand.Shuffle(importArgs);
+            importArgs = importArgs[..(importArgs.Length / 2)];
+
+            // Run the import
+            ClassicAssert.AreEqual("OK", (string)await db.ExecuteAsync("XVCREATE", [ImportKey, "DIM", 3, "M", 16, "Q8", "QUANT_STATE", state]).ConfigureAwait(false));
+
+            foreach (var argSet in importArgs)
+            {
+                ICollection<object> args = [ImportKey, .. argSet];
+                ClassicAssert.AreEqual("OK", (string)await db.ExecuteAsync("XVIMPORT", args).ConfigureAwait(false));
+            }
+
+            // Verification should fail
+            var exc = ClassicAssert.ThrowsAsync<RedisServerException>(() => db.ExecuteAsync("XVIMPORT", [ImportKey, "VERIFY", "0", "1"]));
+            ClassicAssert.AreEqual("ERR Vector set import validation failed", exc.Message);
+
+            // Wait for replication to catch up
+            context.clusterTestUtils.WaitForReplicaAofSync(0, 1);
+
+            // Should leave vector set marked failed in both primary and replica
+
+            var primary = connection.GetServer(context.endpoints[0]);
+            var primaryInfo = (await primary.ExecuteAsync(database: 0, "VINFO", [ImportKey]).ConfigureAwait(false)).ToDictionary();
+
+            var replica = connection.GetServer(context.endpoints[1]);
+            ClassicAssert.AreEqual("OK", (string)await replica.ExecuteAsync("READONLY").ConfigureAwait(false));
+            var replicaInfo = (await replica.ExecuteAsync(database: 0, "VINFO", [ImportKey]).ConfigureAwait(false)).ToDictionary();
+
+            ClassicAssert.AreEqual("failed", (string)primaryInfo["import-state"]);
+            ClassicAssert.AreEqual("failed", (string)replicaInfo["import-state"]);
+        }
+
+        private static unsafe byte[] ReadRawVectorTerm(GarnetServer server, string key, byte termType, ReadOnlySpan<byte> termKey, int bufferSize = 8192)
+        {
+            var stub = ReadRawVectorStub(server, key);
+            VectorManager.ReadIndex(stub, out var indexContext, out _, out _, out _, out _, out _, out _, out _, out _);
+            Span<byte> namespaceBytes = stackalloc byte[sizeof(uint)];
+            VectorManager.StoreContextInNamespace(indexContext | termType, ref namespaceBytes);
+
+            var storeWrapper = server.Provider.StoreWrapper;
+            using var session = storeWrapper.DefaultDatabase.Store.NewSession<VectorElementKey, VectorInput, VectorOutput, long, VectorSessionFunctions>(new VectorSessionFunctions(storeWrapper.CreateFunctionsState()));
+            var context = session.BasicContext;
+            Span<byte> buffer = bufferSize <= 8192 ? stackalloc byte[8192] : new byte[bufferSize];
+            fixed (byte* bufferPtr = buffer)
+            fixed (byte* termKeyPtr = termKey)
+            {
+                var elementKey = new VectorElementKey(namespaceBytes, new ReadOnlySpan<byte>(termKeyPtr, termKey.Length));
+                var input = new VectorInput { ReadDesiredSize = -1 };
+                var output = new VectorOutput(bufferPtr, buffer.Length);
+                var status = context.Read(elementKey, ref input, ref output);
+                if (status.IsPending)
+                {
+                    _ = context.CompletePendingWithOutputs(out var completed, wait: true);
+                    using (completed)
+                    {
+                        ClassicAssert.IsTrue(completed.Next());
+                        status = completed.Current.Status;
+                        output = completed.Current.Output;
+                    }
+                }
+
+                ClassicAssert.IsTrue(status.Found);
+                ClassicAssert.LessOrEqual(input.ReadDesiredSize, buffer.Length);
+                return output.SpanByteAndMemory.ReadOnlySpan.ToArray();
+            }
+
+            byte[] ReadRawVectorStub(GarnetServer server, string key)
+            {
+                var storeWrapper = server.Provider.StoreWrapper;
+                var functionsState = storeWrapper.CreateFunctionsState();
+                var functions = new MainSessionFunctions(functionsState);
+                ClassicAssert.IsTrue(storeWrapper.TryGetDatabase(0, out var database));
+
+                using var session = database.Store.NewSession<FixedSpanByteKey, StringInput, StringOutput, long, MainSessionFunctions>(functions, false);
+                var context = session.BasicContext;
+
+                Span<byte> stub = stackalloc byte[VectorManager.IndexSizeBytes];
+                var input = new StringInput(RespCommand.VADD, arg1: 0);
+                var output = StringOutput.FromPinnedSpan(stub);
+                Span<byte> keySpan = stackalloc byte[Encoding.ASCII.GetByteCount(key)];
+                _ = Encoding.ASCII.GetBytes(key, keySpan);
+                var status = context.Read((FixedSpanByteKey)keySpan, ref input, ref output);
+                if (status.IsPending)
+                {
+                    _ = context.CompletePendingWithOutputs(out var completed, wait: true);
+                    using (completed)
+                    {
+                        ClassicAssert.IsTrue(completed.Next());
+                        status = completed.Current.Status;
+                        output = completed.Current.Output;
+                    }
+                }
+
+                ClassicAssert.IsTrue(status.Found, $"reading the raw stub for {key} must find the index record");
+                ClassicAssert.IsTrue(output.SpanByteAndMemory.IsSpanByte, "the stub read must stay on the pinned span");
+                ClassicAssert.AreEqual(VectorManager.IndexSizeBytes, output.SpanByteAndMemory.Length, "the stub read returned an unexpected length");
+
+                return output.SpanByteAndMemory.ReadOnlySpan.ToArray();
+            }
+        }
+
+        private async Task<(List<ShardInfo> Shards, List<ushort> Slots)> SimpleSetupClusterAsync(int shardCount, int primaryCount, int replicaCount, bool onDemandCheckpoint = false, bool useTLS = true, int replayTasks = 1, int? physicalLogs = null)
+        {
+            context.CreateInstances(shardCount, useTLS: useTLS, enableAOF: true, AofMemorySize: DefaultAOFMemorySize, OnDemandCheckpoint: onDemandCheckpoint, sublogCount: physicalLogs ?? sublogCount, threadPoolMinIOCompletionThreads: 512, replayTaskCount: replayTasks);
+            context.CreateConnection(useTLS: useTLS);
+            var ret = await context.clusterTestUtils.SimpleSetupClusterAsync(primary_count: primaryCount, replica_count: replicaCount);
+
+            foreach (var server in context.nodes)
+            {
+                var wrapper = GetStoreWrapper(server);
+
+                wrapper.DefaultDatabase.VectorManager.AllocateTestContexts(preAllocatedContexts);
+            }
+
+            return ret;
+        }
+
+        [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "replicationReplayFailure")]
+        private static extern ref ExceptionDispatchInfo GetVectorReplayFailure(VectorManager manager);
+
+        [UnsafeAccessor(UnsafeAccessorKind.Field, Name = "storeWrapper")]
+        private static extern ref StoreWrapper GetStoreWrapper(GarnetServer server);
+    }
+}

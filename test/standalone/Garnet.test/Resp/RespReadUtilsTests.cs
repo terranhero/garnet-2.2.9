@@ -1,0 +1,561 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Text;
+using Garnet.common;
+using Garnet.common.Parsing;
+using NUnit.Framework;
+using NUnit.Framework.Legacy;
+
+namespace Garnet.test.Resp
+{
+    /// <summary>
+    /// Tests for RespReadUtils parsing functions.
+    /// </summary>
+    [TestFixture]
+    unsafe class RespReadUtilsTests : TestBase
+    {
+        /// <summary>
+        /// Tests that ReadLengthHeader successfully parses valid numbers.
+        /// </summary>
+        /// <param name="text">Header length encoded as an ASCII string.</param>
+        /// <param name="expected">Expected parsed header length as int.</param>
+        [TestCase("0", 0)]
+        [TestCase("-1", -1)]
+        [TestCase("2147483647", 2147483647)]
+        public static unsafe void ReadLengthHeaderTest(string text, int expected)
+        {
+            var bytes = Encoding.ASCII.GetBytes($"${text}\r\n");
+            fixed (byte* ptr = bytes)
+            {
+                var start = ptr;
+                var end = ptr + bytes.Length;
+                var success = RespReadUtils.TryReadSignedLengthHeader(out var length, ref start, end);
+
+                ClassicAssert.IsTrue(success);
+                ClassicAssert.AreEqual(expected, length);
+                ClassicAssert.IsTrue(start == end);
+            }
+        }
+
+        /// <summary>
+        /// Tests that ReadLengthHeader throws exceptions for invalid inputs.
+        /// </summary>
+        /// <param name="text">Invalid ASCII-encoded string length header (including '$').</param>
+        [TestCase("$\r\n\r\n")]        // Empty input length
+        [TestCase("$-1\r\n")]          // NULL should be disallowed
+        [TestCase("123\r\n")]          // Missing $
+        [TestCase("$-2147483648\r\n")] // Valid Int32 value but negative (not allowed)
+        [TestCase("$-2\r\n")]          // -1 should be legal, but -2 should not be
+        [TestCase("$2147483648\r\n")]  // Should cause an overflow 
+        [TestCase("$123ab\r\n")]       // Not a number
+        [TestCase("$123ab")]           // Missing "\r\n"
+        public static unsafe void ReadLengthHeaderExceptionsTest(string text)
+        {
+            var bytes = Encoding.ASCII.GetBytes(text);
+            _ = Assert.Throws<RespParsingException>(() =>
+            {
+                fixed (byte* ptr = bytes)
+                {
+                    var start = ptr;
+                    _ = RespReadUtils.TryReadUnsignedLengthHeader(out var length, ref start, ptr + bytes.Length);
+                }
+            });
+        }
+
+        /// <summary>
+        /// Tests that ReadArrayLength successfully parses valid numbers.
+        /// </summary>
+        /// <param name="text">Header length encoded as an ASCII string.</param>
+        /// <param name="expected">Expected parsed header length as int.</param>
+        [TestCase("0", 0)]
+        [TestCase("2147483647", 2147483647)]
+        public static unsafe void ReadArrayLengthTest(string text, int expected)
+        {
+            var bytes = Encoding.ASCII.GetBytes($"*{text}\r\n");
+            fixed (byte* ptr = bytes)
+            {
+                var start = ptr;
+                var end = ptr + bytes.Length;
+                var success = RespReadUtils.TryReadUnsignedArrayLength(out var length, ref start, end);
+
+                ClassicAssert.IsTrue(success);
+                ClassicAssert.AreEqual(expected, length);
+                ClassicAssert.IsTrue(start == end);
+            }
+        }
+
+        /// <summary>
+        /// Tests that ReadArrayLength throws exceptions for invalid inputs.
+        /// </summary>
+        /// <param name="text">Invalid ASCII-encoded array length header (including '*').</param>
+        [TestCase("*\r\n\r\n")]        // Empty input length
+        [TestCase("123\r\n")]          // Missing *
+        [TestCase("*-2147483648\r\n")] // Valid Int32 value but negative (not allowed)
+        [TestCase("*-2\r\n")]          // -1 should be legal, but -2 should not be
+        [TestCase("*2147483648\r\n")]  // Should cause an overflow 
+        [TestCase("*123ab\r\n")]       // Not a number
+        [TestCase("*123ab")]           // Missing "\r\n"
+        public static unsafe void ReadArrayLengthExceptionsTest(string text)
+        {
+            var bytes = Encoding.ASCII.GetBytes(text);
+            _ = Assert.Throws<RespParsingException>(() =>
+            {
+                fixed (byte* ptr = bytes)
+                {
+                    var start = ptr;
+                    _ = RespReadUtils.TryReadUnsignedArrayLength(out var length, ref start, ptr + bytes.Length);
+                }
+            });
+        }
+
+        /// <summary>
+        /// Tests that ReadIntWithLengthHeader successfully parses valid integers.
+        /// </summary>
+        /// <param name="text">Int encoded as an ASCII string.</param>
+        /// <param name="expected">Expected parsed value.</param>
+        [TestCase("0", 0)]
+        [TestCase("-2147483648", -2147483648)]
+        [TestCase("2147483647", 2147483647)]
+        public static unsafe void ReadIntWithLengthHeaderTest(string text, int expected)
+        {
+            var bytes = Encoding.ASCII.GetBytes($"${text.Length}\r\n{text}\r\n");
+            fixed (byte* ptr = bytes)
+            {
+                var start = ptr;
+                var end = ptr + bytes.Length;
+                var success = RespReadUtils.TryReadInt32WithLengthHeader(out var length, ref start, end);
+
+                ClassicAssert.IsTrue(success);
+                ClassicAssert.AreEqual(expected, length);
+                ClassicAssert.IsTrue(start == end);
+            }
+        }
+
+        /// <summary>
+        /// Tests that ReadIntWithLengthHeader throws exceptions for invalid inputs.
+        /// </summary>
+        /// <param name="text">Invalid ASCII-encoded input number.</param>
+        [TestCase("2147483648")]  // Should cause overflow
+        [TestCase("-2147483649")] // Should cause overflow
+        [TestCase("123abc")]      // Not a number
+        [TestCase("abc121cba")]   // Not a number
+        [TestCase("-")]           // Sign without digits
+        [TestCase("+")]           // Sign without digits
+        public static unsafe void ReadIntWithLengthHeaderExceptionsTest(string text)
+        {
+            var bytes = Encoding.ASCII.GetBytes($"${text.Length}\r\n{text}\r\n");
+
+            _ = Assert.Throws<RespParsingException>(() =>
+            {
+                fixed (byte* ptr = bytes)
+                {
+                    var start = ptr;
+                    _ = RespReadUtils.TryReadInt32WithLengthHeader(out var length, ref start, ptr + bytes.Length);
+                }
+            });
+        }
+
+        /// <summary>
+        /// Tests that ReadLongWithLengthHeader successfully parses valid longs.
+        /// </summary>
+        /// <param name="text">Long int encoded as an ASCII string.</param>
+        /// <param name="expected">Expected parsed value.</param>
+        [TestCase("0", 0L)]
+        [TestCase("-9223372036854775808", -9223372036854775808L)]
+        [TestCase("9223372036854775807", 9223372036854775807L)]
+        public static unsafe void ReadLongWithLengthHeaderTest(string text, long expected)
+        {
+            var bytes = Encoding.ASCII.GetBytes($"${text.Length}\r\n{text}\r\n");
+            fixed (byte* ptr = bytes)
+            {
+                var start = ptr;
+                var end = ptr + bytes.Length;
+                var success = RespReadUtils.TryReadInt64WithLengthHeader(out var length, ref start, end);
+
+                ClassicAssert.IsTrue(success);
+                ClassicAssert.AreEqual(expected, length);
+                ClassicAssert.IsTrue(start == end);
+            }
+        }
+
+        /// <summary>
+        /// Tests that ReadLongWithLengthHeader throws exceptions for invalid inputs.
+        /// </summary>
+        /// <param name="text">Invalid ASCII-encoded input number.</param>
+        [TestCase("9223372036854775808")]  // Should cause overflow
+        [TestCase("-9223372036854775809")] // Should cause overflow
+        [TestCase("10000000000000000000")] // Should cause overflow
+        [TestCase("123abc")]               // Not a number
+        [TestCase("abc121cba")]            // Not a number
+        [TestCase("-")]                    // Sign without digits
+        [TestCase("+")]                    // Sign without digits
+        public static unsafe void ReadLongWithLengthHeaderExceptionsTest(string text)
+        {
+            var bytes = Encoding.ASCII.GetBytes($"${text.Length}\r\n{text}\r\n");
+
+            _ = Assert.Throws<RespParsingException>(() =>
+            {
+                fixed (byte* ptr = bytes)
+                {
+                    var start = ptr;
+                    _ = RespReadUtils.TryReadInt64WithLengthHeader(out var length, ref start, ptr + bytes.Length);
+                }
+            });
+        }
+
+        /// <summary>
+        /// A sign without digits is not an integer.
+        /// </summary>
+        /// <param name="text">A lone sign.</param>
+        [TestCase("-")]
+        [TestCase("+")]
+        public static unsafe void SignWithoutDigitsIsNotAnInteger(string text)
+        {
+            var bytes = ToAsciiWithCrlf(text);
+            fixed (byte* ptr = bytes)
+            {
+                var start = ptr;
+                ClassicAssert.IsFalse(RespReadUtils.TryReadInt64Safe(ref start, ptr + text.Length, out _, out _, out _, out _));
+
+                start = ptr;
+                ClassicAssert.IsFalse(RespReadUtils.TryReadInt32Safe(ref start, ptr + text.Length, out _, out _, out _, out _));
+            }
+        }
+
+        /// <summary>
+        /// When leading zeros are disallowed, 32-bit and 64-bit parsing accept only canonical integers.
+        /// Otherwise they also accept leading zeros, a '+' sign and -0.
+        /// </summary>
+        /// <param name="text">Integer encoded as an ASCII string.</param>
+        /// <param name="canonical">Whether the whole string parses when leading zeros are disallowed.</param>
+        [TestCase("0", true)]
+        [TestCase("70", true)]
+        [TestCase("-70", true)]
+        [TestCase("007", false)]
+        [TestCase("-007", false)]
+        [TestCase("+007", false)]
+        [TestCase("+70", false)]
+        [TestCase("+0", false)]
+        [TestCase("-0", false)]
+        public static unsafe void OnlyCanonicalIntegersParseWhenLeadingZerosAreDisallowed(string text, bool canonical)
+        {
+            var bytes = ToAsciiWithCrlf(text);
+            fixed (byte* ptr = bytes)
+            {
+                foreach (var (allowLeadingZeros, expected) in new[] { (false, canonical), (true, true) })
+                {
+                    var start = ptr;
+                    var success = RespReadUtils.TryReadInt64Safe(ref start, ptr + text.Length, out _, out var bytesRead, out _, out _, allowLeadingZeros)
+                        && (int)bytesRead == text.Length;
+                    ClassicAssert.AreEqual(expected, success, $"Int64, allowLeadingZeros: {allowLeadingZeros}");
+
+                    start = ptr;
+                    success = RespReadUtils.TryReadInt32Safe(ref start, ptr + text.Length, out _, out bytesRead, out _, out _, allowLeadingZeros)
+                        && (int)bytesRead == text.Length;
+                    ClassicAssert.AreEqual(expected, success, $"Int32, allowLeadingZeros: {allowLeadingZeros}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Returns <paramref name="text"/> as ASCII followed by CRLF, which stands in for the rest of the network buffer the parsers may peek at.
+        /// </summary>
+        static byte[] ToAsciiWithCrlf(string text)
+        {
+            var bytes = new byte[text.Length + 2];
+            for (var i = 0; i < text.Length; i++)
+                bytes[i] = (byte)text[i];
+            bytes[^2] = (byte)'\r';
+            bytes[^1] = (byte)'\n';
+            return bytes;
+        }
+
+        /// <summary>
+        /// Tests that ReadULongWithLengthHeader successfully parses valid ulong integers.
+        /// </summary>
+        /// <param name="text">Unsigned long int encoded as an ASCII string.</param>
+        /// <param name="expected">Expected parsed value.</param>
+        [TestCase("0", 0UL)]
+        [TestCase("18446744073709551615", 18446744073709551615UL)]
+        public static unsafe void ReadULongWithLengthHeaderTest(string text, ulong expected)
+        {
+            var bytes = Encoding.ASCII.GetBytes($"${text.Length}\r\n{text}\r\n");
+            fixed (byte* ptr = bytes)
+            {
+                var start = ptr;
+                var end = ptr + bytes.Length;
+                var success = RespReadUtils.TryReadUInt64WithLengthHeader(out var length, ref start, end);
+
+                ClassicAssert.IsTrue(success);
+                ClassicAssert.AreEqual(expected, length);
+                ClassicAssert.IsTrue(start == end);
+            }
+        }
+
+        /// <summary>
+        /// Tests that ReadULongWithLengthHeader throws exceptions for invalid inputs.
+        /// </summary>
+        /// <param name="text">Invalid ASCII-encoded input number.</param>
+        [TestCase("18446744073709551616")]  // Should cause overflow
+        [TestCase("-1")]                    // Negative numbers are not allowed
+        [TestCase("123abc")]                // Not a number
+        [TestCase("abc121cba")]             // Not a number
+        public static unsafe void ReadULongWithLengthHeaderExceptionsTest(string text)
+        {
+            var bytes = Encoding.ASCII.GetBytes($"${text.Length}\r\n{text}\r\n");
+
+            _ = Assert.Throws<RespParsingException>(() =>
+            {
+                fixed (byte* ptr = bytes)
+                {
+                    var start = ptr;
+                    _ = RespReadUtils.TryReadUInt64WithLengthHeader(out var length, ref start, ptr + bytes.Length);
+                }
+            });
+        }
+
+        /// <summary>
+        /// Tests that ReadPtrWithLengthHeader successfully parses simple strings.
+        /// </summary>
+        /// <param name="text">Input ASCII string.</param>
+        [TestCase("test")]
+        [TestCase("")]
+        public static unsafe void ReadPtrWithLengthHeaderTest(string text)
+        {
+            var bytes = Encoding.ASCII.GetBytes($"${text.Length}\r\n{text}\r\n");
+            fixed (byte* ptr = bytes)
+            {
+                byte* result = null;
+                var length = -1;
+                var start = ptr;
+                var end = ptr + bytes.Length;
+                var success = RespReadUtils.TryReadPtrWithLengthHeader(ref result, ref length, ref start, end);
+
+                ClassicAssert.IsTrue(success);
+                ClassicAssert.IsTrue(result != null);
+                ClassicAssert.IsTrue(start == end);
+                ClassicAssert.IsTrue(length == text.Length);
+            }
+        }
+
+        /// <summary>
+        /// Tests that ReadBoolWithLengthHeader successfully parses valid inputs.
+        /// </summary>
+        /// <param name="text">Int encoded as an ASCII string.</param>
+        /// <param name="expected">Expected parsed value.</param>
+        [TestCase("1", true)]
+        [TestCase("0", false)]
+        public static unsafe void ReadBoolWithLengthHeaderTest(string text, bool expected)
+        {
+            var bytes = Encoding.ASCII.GetBytes($"${text.Length}\r\n{text}\r\n");
+            fixed (byte* ptr = bytes)
+            {
+                var start = ptr;
+                var end = ptr + bytes.Length;
+                var success = RespReadUtils.TryReadBoolWithLengthHeader(out var result, ref start, end);
+
+                ClassicAssert.IsTrue(success);
+                ClassicAssert.AreEqual(expected, result);
+                ClassicAssert.IsTrue(start == end);
+            }
+        }
+
+        /// <summary>
+        /// Tests that GetSerializedRecordSpan correctly parses a valid length-prefixed record.
+        /// </summary>
+        [Test]
+        public static unsafe void GetSerializedRecordSpanValidTest()
+        {
+            // Layout: [int32 length = 5][5 bytes of data]
+            var data = new byte[sizeof(int) + 5];
+            fixed (byte* ptr = data)
+            {
+                *(int*)ptr = 5;
+                ptr[4] = 0xAA;
+                ptr[5] = 0xBB;
+                ptr[6] = 0xCC;
+                ptr[7] = 0xDD;
+                ptr[8] = 0xEE;
+
+                var start = ptr;
+                var end = ptr + data.Length;
+                var success = RespReadUtils.GetSerializedRecordSpan(out var recordSpan, ref start, end);
+
+                ClassicAssert.IsTrue(success);
+                ClassicAssert.AreEqual(5, recordSpan.Length);
+                ClassicAssert.AreEqual(0xAA, recordSpan.ReadOnlySpan[0]);
+                ClassicAssert.AreEqual(0xEE, recordSpan.ReadOnlySpan[4]);
+                ClassicAssert.IsTrue(start == end);
+            }
+        }
+
+        /// <summary>
+        /// Tests that GetSerializedRecordSpan rejects a record whose declared length exceeds the payload boundary.
+        /// </summary>
+        [Test]
+        public static unsafe void GetSerializedRecordSpanOverflowLengthTest()
+        {
+            // Layout: [int32 length = 1000][only 3 bytes of actual data]
+            var data = new byte[sizeof(int) + 3];
+            fixed (byte* ptr = data)
+            {
+                *(int*)ptr = 1000;
+                ptr[4] = 0x01;
+                ptr[5] = 0x02;
+                ptr[6] = 0x03;
+
+                var start = ptr;
+                var end = ptr + data.Length;
+                var success = RespReadUtils.GetSerializedRecordSpan(out var recordSpan, ref start, end);
+
+                ClassicAssert.IsFalse(success);
+                ClassicAssert.AreEqual(0, recordSpan.Length);
+            }
+        }
+
+        /// <summary>
+        /// Tests that GetSerializedRecordSpan rejects a negative record length.
+        /// </summary>
+        [Test]
+        public static unsafe void GetSerializedRecordSpanNegativeLengthTest()
+        {
+            var data = new byte[sizeof(int) + 10];
+            fixed (byte* ptr = data)
+            {
+                *(int*)ptr = -1;
+
+                var start = ptr;
+                var end = ptr + data.Length;
+                var success = RespReadUtils.GetSerializedRecordSpan(out var recordSpan, ref start, end);
+
+                ClassicAssert.IsFalse(success);
+                ClassicAssert.AreEqual(0, recordSpan.Length);
+            }
+        }
+
+        /// <summary>
+        /// Tests that GetSerializedRecordSpan rejects when there's not enough data for the length prefix itself.
+        /// </summary>
+        [Test]
+        public static unsafe void GetSerializedRecordSpanInsufficientHeaderTest()
+        {
+            var data = new byte[2]; // Less than sizeof(int)
+            fixed (byte* ptr = data)
+            {
+                var start = ptr;
+                var end = ptr + data.Length;
+                var success = RespReadUtils.GetSerializedRecordSpan(out var recordSpan, ref start, end);
+
+                ClassicAssert.IsFalse(success);
+                ClassicAssert.AreEqual(0, recordSpan.Length);
+            }
+        }
+
+        [Test]
+        public static unsafe void RejectOversizedLengths()
+        {
+            var bigBuffer = GC.AllocateUninitializedArray<byte>(RespLimits.MaxArgumentLengthBytes + 1, pinned: true);
+
+            var smallToCopy = Encoding.ASCII.GetBytes("$1234\r\n" + new string('a', 1234) + "\r\n");
+            var bigToCopy = "$536870913\r\n"u8;
+
+            fixed (byte* startPtr = bigBuffer)
+            {
+                var endPtr = startPtr + bigBuffer.Length;
+
+                // TryReadPtrWithSignedLengthHeader
+                {
+                    // Pass in bounds
+                    var ptr = startPtr;
+                    smallToCopy.CopyTo(new Span<byte>(startPtr, bigBuffer.Length));
+
+                    var len = 0;
+                    byte* outPtr = null;
+                    ClassicAssert.True(RespReadUtils.TryReadPtrWithSignedLengthHeader(ref outPtr, ref len, ref ptr, endPtr));
+                    ClassicAssert.True(outPtr == (startPtr + 7));
+                    ClassicAssert.AreEqual(1234, len);
+                    ClassicAssert.True(ptr == (outPtr + len + 2));
+
+                    // Fail too big
+                    ptr = startPtr;
+
+                    len = 0;
+                    outPtr = null;
+                    bigToCopy.CopyTo(new Span<byte>(startPtr, bigBuffer.Length));
+                    ClassicAssert.False(RespReadUtils.TryReadPtrWithSignedLengthHeader(ref outPtr, ref len, ref ptr, endPtr));
+                }
+
+                // TrySkipByteArrayWithLengthHeader
+                {
+                    // Pass in bounds
+                    var ptr = startPtr;
+                    smallToCopy.CopyTo(new Span<byte>(startPtr, bigBuffer.Length));
+
+                    ClassicAssert.True(RespReadUtils.TrySkipByteArrayWithLengthHeader(ref ptr, endPtr));
+                    ClassicAssert.True(ptr == (startPtr + 7 + 1234 + 2));
+
+                    // Fail too big
+                    ptr = startPtr;
+                    bigToCopy.CopyTo(new Span<byte>(startPtr, bigBuffer.Length));
+                    ClassicAssert.False(RespReadUtils.TrySkipByteArrayWithLengthHeader(ref ptr, endPtr));
+                }
+
+                // TrySliceWithLengthHeader
+                {
+                    // Pass in bounds
+                    var ptr = startPtr;
+                    smallToCopy.CopyTo(new Span<byte>(startPtr, bigBuffer.Length));
+
+                    ClassicAssert.True(RespReadUtils.TrySliceWithLengthHeader(out var slice, ref ptr, endPtr));
+                    ClassicAssert.AreEqual(1234, slice.Length);
+                    ClassicAssert.True(ptr == (startPtr + 7 + slice.Length + 2));
+
+                    // Fail too big
+                    ptr = startPtr;
+                    bigToCopy.CopyTo(new Span<byte>(startPtr, bigBuffer.Length));
+                    ClassicAssert.False(RespReadUtils.TrySliceWithLengthHeader(out slice, ref ptr, endPtr));
+                }
+
+                // TryReadSpanWithLengthHeader
+                {
+                    // Pass in bounds
+                    var ptr = startPtr;
+                    smallToCopy.CopyTo(new Span<byte>(startPtr, bigBuffer.Length));
+
+                    ClassicAssert.True(RespReadUtils.TryReadSpanWithLengthHeader(out var slice, ref ptr, endPtr));
+                    ClassicAssert.AreEqual(1234, slice.Length);
+                    ClassicAssert.True(ptr == (startPtr + 7 + slice.Length + 2));
+
+                    // Fail too big
+                    ptr = startPtr;
+                    bigToCopy.CopyTo(new Span<byte>(startPtr, bigBuffer.Length));
+                    ClassicAssert.False(RespReadUtils.TryReadSpanWithLengthHeader(out slice, ref ptr, endPtr));
+                }
+
+                // TryReadPtrWithLengthHeader
+                {
+                    // Pass in bounds
+                    var ptr = startPtr;
+                    smallToCopy.CopyTo(new Span<byte>(startPtr, bigBuffer.Length));
+
+                    var len = 0;
+                    byte* resultPtr = null;
+                    ClassicAssert.True(RespReadUtils.TryReadPtrWithLengthHeader(ref resultPtr, ref len, ref ptr, endPtr));
+                    ClassicAssert.True(resultPtr == (startPtr + 7));
+                    ClassicAssert.AreEqual(1234, len);
+                    ClassicAssert.True(ptr == (startPtr + 7 + len + 2));
+
+                    // Fail too big
+                    ptr = startPtr;
+
+                    len = 0;
+                    resultPtr = null;
+                    bigToCopy.CopyTo(new Span<byte>(startPtr, bigBuffer.Length));
+                    ClassicAssert.False(RespReadUtils.TryReadPtrWithLengthHeader(ref resultPtr, ref len, ref ptr, endPtr));
+                }
+            }
+        }
+    }
+}

@@ -1,0 +1,276 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Threading.Tasks;
+using Garnet.server;
+using NUnit.Framework;
+using NUnit.Framework.Legacy;
+using StackExchange.Redis;
+
+namespace Garnet.test.Resp.ACL
+{
+    /// <summary>
+    /// Tests for Resp ACL commands that don't have subcommands
+    /// </summary>
+    [TestFixture]
+    internal class BasicTests : AclTest
+    {
+        /// <summary>
+        /// Creates and starts the Garnet test server
+        /// </summary>
+        [SetUp]
+        public virtual void Setup()
+        {
+            server = TestUtils.CreateGarnetServer(TestUtils.MethodTestDir, useAcl: true);
+            server.Start();
+        }
+
+        /// <summary>
+        /// Tests that ACL WHOAMI shows the currently authenticated user
+        /// </summary>
+        [Test]
+        public async Task BasicWhoamiTest()
+        {
+            using var c = TestUtils.GetGarnetClientSession();
+            c.Connect();
+
+            // Check user is authenticated to default
+            var response = await c.ExecuteAsync("ACL", "WHOAMI").ConfigureAwait(false);
+            ClassicAssert.AreEqual("default", response);
+
+            // Add the testuser and password
+            response = await c.ExecuteAsync("ACL", "SETUSER", TestUserA, "on", "nopass", "+@admin", "+@slow").ConfigureAwait(false);
+            ClassicAssert.IsTrue(response.StartsWith("OK"));
+
+            // Change users and verify whoami changes
+            response = await c.ExecuteAsync("AUTH", TestUserA, "password").ConfigureAwait(false);
+            ClassicAssert.IsTrue(response.StartsWith("OK"));
+            response = await c.ExecuteAsync("ACL", "WHOAMI").ConfigureAwait(false);
+            ClassicAssert.AreEqual(TestUserA, response);
+
+            // Change users back to default and verify whoami changes
+            response = await c.ExecuteAsync("AUTH", "default", "password").ConfigureAwait(false);
+            ClassicAssert.IsTrue(response.StartsWith("OK"));
+            response = await c.ExecuteAsync("ACL", "WHOAMI").ConfigureAwait(false);
+            ClassicAssert.AreEqual("default", response);
+        }
+
+        /// <summary>
+        /// Ensures that ACL LIST adapts to changing user sets
+        /// </summary>
+        [Test]
+        public async Task BasicListTest()
+        {
+            const string ExpectedDefaultRule = "user default on nopass +@all";
+            const string ExpectedTestUserRule = $"user {TestUserA} off";
+
+            using var c = TestUtils.GetGarnetClientSession();
+            c.Connect();
+
+            // Right now only the default user should exist
+            string[] users = await c.ExecuteForArrayAsync("ACL", "LIST").ConfigureAwait(false);
+            ClassicAssert.IsTrue(1 == users.Length);
+            ClassicAssert.Contains(ExpectedDefaultRule, users);
+
+            // Add the test user and makes sure the list gets extended
+            var response = await c.ExecuteAsync("ACL", "SETUSER", TestUserA).ConfigureAwait(false);
+            ClassicAssert.AreEqual("OK", response);
+            users = await c.ExecuteForArrayAsync("ACL", "LIST").ConfigureAwait(false);
+            ClassicAssert.IsTrue(2 == users.Length);
+            ClassicAssert.Contains(ExpectedDefaultRule, users);
+            ClassicAssert.Contains(ExpectedTestUserRule, users);
+
+            // Remove the test user and make sure the list gets trimmed again
+            response = await c.ExecuteAsync("ACL", "DELUSER", TestUserA).ConfigureAwait(false);
+            ClassicAssert.AreEqual("1", response);
+            users = await c.ExecuteForArrayAsync("ACL", "LIST").ConfigureAwait(false);
+            ClassicAssert.IsTrue(1 == users.Length);
+            ClassicAssert.Contains(ExpectedDefaultRule, users);
+        }
+
+        /// <summary>
+        /// Ensure that ACL USERS results change when new users are added
+        /// </summary>
+        [Test]
+        public async Task BasicUsersTest()
+        {
+            using var c = TestUtils.GetGarnetClientSession();
+            c.Connect();
+
+            // Right now only the default user should exist
+            string[] users = await c.ExecuteForArrayAsync("ACL", "USERS").ConfigureAwait(false);
+            ClassicAssert.IsTrue(1 == users.Length);
+            ClassicAssert.Contains("default", users);
+
+            // Add a second user and makes sure the list gets longer.
+            var response = await c.ExecuteAsync("ACL", "SETUSER", TestUserA).ConfigureAwait(false);
+            ClassicAssert.AreEqual("OK", response);
+            users = await c.ExecuteForArrayAsync("ACL", "USERS").ConfigureAwait(false);
+            ClassicAssert.IsTrue(2 == users.Length);
+            ClassicAssert.Contains(TestUserA, users);
+            ClassicAssert.Contains("default", users);
+        }
+
+        [Test]
+        public async Task BasicGenPassTest()
+        {
+            using var c = TestUtils.GetGarnetClientSession();
+            c.Connect();
+
+            var response = await c.ExecuteAsync("ACL", "GENPASS").ConfigureAwait(false);
+            ClassicAssert.AreEqual(64, response.Length);
+
+            response = await c.ExecuteAsync("ACL", "GENPASS", "5").ConfigureAwait(false);
+            ClassicAssert.AreEqual(2, response.Length);
+
+            Assert.ThrowsAsync<Exception>(async () => await c.ExecuteAsync("ACL", "GENPASS", "abcd").ConfigureAwait(false),
+                                          "ERR value is not an integer or out of range.");
+
+            var error = "ERR ACL GENPASS argument must be the number of bits for the output password, a positive number up to 4096";
+
+            Assert.ThrowsAsync<Exception>(async () => await c.ExecuteAsync("ACL", "GENPASS", "4097").ConfigureAwait(false), error);
+            Assert.ThrowsAsync<Exception>(async () => await c.ExecuteAsync("ACL", "GENPASS", "0").ConfigureAwait(false), error);
+        }
+
+        /// <summary>
+        /// Tests that an error is returned when an invalid subcommand is specified
+        /// </summary>
+        [Test]
+        public void InvalidSubcommand()
+        {
+            using var lightClientRequest = TestUtils.CreateRequest();
+            var response = lightClientRequest.SendCommand("ACL subcommand");
+            ClassicAssert.IsTrue(response.AsSpan().StartsWith("-ERR"u8));
+        }
+
+        /// <summary>
+        /// Test that our check for "has subcommands" matches reality.
+        /// </summary>
+        [Test]
+        public void NoAuthValidation()
+        {
+            foreach (var cmd in Enum.GetValues<RespCommand>())
+            {
+                if (cmd == RespCommand.NONE || cmd == RespCommand.INVALID)
+                {
+                    continue;
+                }
+
+                if (RespCommandsInfo.TryGetRespCommandInfo(cmd, out var info))
+                {
+                    var infoIsNoAuth = info.Flags.HasFlag(RespCommandFlags.NoAuth);
+                    var cmdIsNoAuth = cmd.IsNoAuth();
+
+                    ClassicAssert.AreEqual(infoIsNoAuth, cmdIsNoAuth, $"Mismatch for command {cmd}");
+                }
+            }
+        }
+
+        /// <summary>
+        /// An authenticated user denied a command must be told NOPERM.
+        /// </summary>
+        [Test]
+        public async Task DeniedCommandReturnsNoPermAsync()
+        {
+            await CreateLimitedUserAsync("+@all", "-type").ConfigureAwait(false);
+
+            using var redis = ConnectionMultiplexer.Connect(GetLimitedUserConfig());
+            var db = redis.GetDatabase(0);
+
+            var exc = Assert.Throws<RedisServerException>(() => db.Execute("TYPE", "some-key"));
+            ClassicAssert.IsTrue(exc.Message.StartsWith("NOPERM"), $"Expected NOPERM for an ACL-denied command, got: {exc.Message}");
+        }
+
+        /// <summary>
+        /// A permitted command must still work for the same user.
+        /// </summary>
+        [Test]
+        public async Task PermittedCommandStillWorksAsync()
+        {
+            await CreateLimitedUserAsync("+@all", "-type").ConfigureAwait(false);
+
+            using var redis = ConnectionMultiplexer.Connect(GetLimitedUserConfig());
+            var db = redis.GetDatabase(0);
+
+            ClassicAssert.IsTrue(db.StringSet("some-key", "some-value"));
+            ClassicAssert.AreEqual("some-value", (string)db.StringGet("some-key"));
+        }
+
+        /// <summary>
+        /// A denied CLIENT SETINFO must return NOPERM without breaking connection setup.
+        /// </summary>
+        [Test]
+        public async Task ClientSetInfoDeniedReturnsNoPermAsync()
+        {
+            await CreateLimitedUserAsync("+@all", "-client|setinfo").ConfigureAwait(false);
+
+            using var redis = ConnectionMultiplexer.Connect(GetLimitedUserConfig());
+            var db = redis.GetDatabase(0);
+
+            ClassicAssert.IsTrue(db.StringSet("some-key", "some-value"));
+            ClassicAssert.AreEqual("some-value", (string)db.StringGet("some-key"));
+
+            var exc = Assert.Throws<RedisServerException>(() => db.Execute("CLIENT", "SETINFO", "LIB-NAME", "foo"));
+            ClassicAssert.IsTrue(exc.Message.StartsWith("NOPERM"), $"Expected NOPERM for denied CLIENT SETINFO, got: {exc.Message}");
+        }
+
+        [Test]
+        public void ClientSetInfoRejectsInvalidAttributeValue()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true));
+            var db = redis.GetDatabase(0);
+
+            var exc = Assert.Throws<RedisServerException>(() => db.Execute("CLIENT", "SETINFO", "LIB-NAME", "foo\nbar"));
+            ClassicAssert.IsTrue(exc.Message.StartsWith("ERR LIB-NAME cannot contain spaces"), $"Expected invalid client attribute error, got: {exc.Message}");
+
+            exc = Assert.Throws<RedisServerException>(() => db.Execute("CLIENT", "SETINFO", "LIB-VER", "1.0 2.0"));
+            ClassicAssert.IsTrue(exc.Message.StartsWith("ERR LIB-VER cannot contain spaces"), $"Expected invalid client attribute error, got: {exc.Message}");
+
+            exc = Assert.Throws<RedisServerException>(() => db.Execute("CLIENT", "SETINFO", "CRLF-INJ\r\n-ERR injected", "a b"));
+            ClassicAssert.IsTrue(exc.Message.StartsWith("ERR syntax error"), $"Expected syntax error for unknown attribute, got: {exc.Message}");
+
+            exc = Assert.Throws<RedisServerException>(() => db.Execute("CLIENT", "SETINFO", "LIB-VER", "\u007f"));
+            ClassicAssert.IsTrue(exc.Message.StartsWith("ERR LIB-VER cannot contain spaces"), $"Expected DEL to be rejected, got: {exc.Message}");
+
+            db.Execute("CLIENT", "SETINFO", "LIB-NAME", "a!~b");
+            var clientInfo = (string)db.Execute("CLIENT", "INFO");
+            ClassicAssert.IsTrue(clientInfo.Contains("lib-name=a!~b"), $"Expected boundary bytes 33-126 to be accepted, CLIENT INFO: {clientInfo}");
+
+            db.Execute("CLIENT", "SETINFO", "LIB-NAME", "my-lib");
+            db.Execute("CLIENT", "SETINFO", "LIB-VER", "1.2.3");
+            clientInfo = (string)db.Execute("CLIENT", "INFO");
+            ClassicAssert.IsTrue(clientInfo.Contains("lib-name=my-lib"), $"Expected lib-name=my-lib in CLIENT INFO, got: {clientInfo}");
+            ClassicAssert.IsTrue(clientInfo.Contains("lib-ver=1.2.3"), $"Expected lib-ver=1.2.3 in CLIENT INFO, got: {clientInfo}");
+
+            db.Execute("CLIENT", "SETINFO", "lib-ver", "9.9.9");
+            clientInfo = (string)db.Execute("CLIENT", "INFO");
+            ClassicAssert.IsTrue(clientInfo.Contains("lib-ver=9.9.9"), $"Expected case-insensitive attribute matching, CLIENT INFO: {clientInfo}");
+
+            exc = Assert.Throws<RedisServerException>(() => db.Execute("CLIENT", "SETINFO", "LIB-NAME", "bad\nvalue"));
+            ClassicAssert.IsTrue(exc.Message.StartsWith("ERR LIB-NAME cannot contain spaces"), $"Expected invalid client attribute error, got: {exc.Message}");
+            clientInfo = (string)db.Execute("CLIENT", "INFO");
+            ClassicAssert.IsTrue(clientInfo.Contains("lib-name=my-lib"), $"Failed SETINFO must not overwrite the stored value, CLIENT INFO: {clientInfo}");
+
+            db.Execute("CLIENT", "SETINFO", "LIB-NAME", "");
+            clientInfo = (string)db.Execute("CLIENT", "INFO");
+            ClassicAssert.IsTrue(clientInfo.Contains(" lib-name= "), $"Expected empty lib-name to clear the attribute, CLIENT INFO: {clientInfo}");
+
+            var clientList = (string)db.Execute("CLIENT", "LIST");
+            ClassicAssert.IsFalse(clientList.Contains("\r"), $"CLIENT LIST must stay line-clean, got: {clientList}");
+        }
+
+        private static ConfigurationOptions GetLimitedUserConfig()
+            => TestUtils.GetConfig(disablePubSub: true, authUsername: TestUserA, authPassword: DummyPassword);
+
+        private static async Task CreateLimitedUserAsync(params string[] permissions)
+        {
+            using var c = TestUtils.GetGarnetClientSession();
+            c.Connect();
+
+            string[] args = ["ACL", "SETUSER", TestUserA, "on", $">{DummyPassword}", "~*", .. permissions];
+            var resp = await c.ExecuteAsync(args).ConfigureAwait(false);
+            ClassicAssert.AreEqual("OK", resp);
+        }
+    }
+}

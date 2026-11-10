@@ -1,0 +1,859 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using Garnet.server;
+using NUnit.Framework;
+using NUnit.Framework.Legacy;
+using StackExchange.Redis;
+
+namespace Garnet.test
+{
+    [TestFixture]
+    public class RespScanCommandsTests : TestBase
+    {
+        GarnetServer server;
+        private IReadOnlyDictionary<string, RespCommandsInfo> respCustomCommandsInfo;
+
+        [SetUp]
+        public void Setup()
+        {
+            TestUtils.DeleteDirectory(TestUtils.MethodTestDir, wait: true);
+            ClassicAssert.IsTrue(TestUtils.TryGetCustomCommandsInfo(out respCustomCommandsInfo));
+            ClassicAssert.IsNotNull(respCustomCommandsInfo);
+            server = TestUtils.CreateGarnetServer(TestUtils.MethodTestDir);
+            server.Start();
+        }
+
+        [TearDown]
+        public void TearDown()
+        {
+            server.Dispose();
+            TestUtils.OnTearDown();
+        }
+
+        [Test]
+        public void SeDbsizeTest()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+            db.StringSet(new RedisKey("keyOne"), new RedisValue("valueone"));
+            db.StringSet(new RedisKey("keyTwo"), new RedisValue("valuetwo"));
+            db.SortedSetAdd("keyThree", new RedisValue("valuethree"), 1, CommandFlags.None);
+            var actualResponse = db.Execute("DBSIZE");
+            ClassicAssert.AreEqual(3, ((ulong)actualResponse));
+        }
+
+        [Test]
+        public void SeKeysTest()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true));
+            var db = redis.GetDatabase(0);
+
+            // add keys in main store
+            db.StringSet(new RedisKey("keyOne"), new RedisValue("valueone"));
+            db.StringSet(new RedisKey("keyTwo"), new RedisValue("valuetwo"));
+            db.StringSet(new RedisKey("Another"), new RedisValue("valueanother"));
+
+            // one key object at object store
+            db.SortedSetAdd("keyThree", new RedisValue("OneKey"), 1, CommandFlags.None);
+
+            var actualResponse = db.Execute("KEYS", ["key*"]);
+            ClassicAssert.AreEqual(3, ((RedisResult[])actualResponse).Length);
+            var listKeys = new List<string>((string[])actualResponse);
+            ClassicAssert.IsTrue(listKeys.Contains("keyOne"));
+            ClassicAssert.IsTrue(listKeys.Contains("keyTwo"));
+            ClassicAssert.IsTrue(listKeys.Contains("keyThree"));
+
+            actualResponse = db.Execute("KEYS", ["*other*"]);
+            ClassicAssert.AreEqual(1, ((RedisResult[])actualResponse).Length);
+
+            listKeys = new List<string>((string[])actualResponse);
+            ClassicAssert.IsTrue(listKeys.Contains("Another"));
+
+            actualResponse = db.Execute("KEYS", ["*simple*"]);
+            ClassicAssert.AreEqual(0, ((RedisResult[])actualResponse).Length);
+
+            actualResponse = db.Execute("KEYS", ["key??"]);
+            ClassicAssert.AreEqual(0, ((RedisResult[])actualResponse).Length);
+
+            actualResponse = db.Execute("KEYS", ["*"]);
+            ClassicAssert.AreEqual(4, ((RedisResult[])actualResponse).Length);
+        }
+
+        [Test]
+        public void SeKeysCursorTest()
+        {
+            // Test a large number of keys
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true));
+            var db = redis.GetDatabase(0);
+
+            // set 10_000 strings
+            const int KeyCount = 10_000;
+            for (int i = 0; i < KeyCount; i++)
+                db.StringSet($"try:{i}", i);
+
+            // get and count keys using SE Redis, using the default pageSizeStr of 250
+            var server = redis.GetServers()[db.Database];
+            var keyCount1 = server.Keys().ToArray().Length;
+            ClassicAssert.AreEqual(KeyCount, keyCount1, "IServer.Keys()");
+
+            // get and count keys using KEYS
+            var res = db.Execute("KEYS", "*");
+            var keyCount2 = ((RedisValue[])res!).Length;
+            ClassicAssert.AreEqual(KeyCount, keyCount2, "KEYS *");
+        }
+
+        /// <summary>
+        /// Regression test for the lookup-based KEYS conversion (Task 2 of the "tempKv elimination"
+        /// change). Validates rule S2: KEYS uses IterateLookup with maxAddress = untilAddress so that
+        /// each live key is emitted exactly once even under concurrent RCUs (in-place updates) that
+        /// might otherwise either suppress an in-range record or surface duplicates.
+        /// </summary>
+        [Test]
+        public void SeKeysNoDuplicatesUnderRcu()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true));
+            var db = redis.GetDatabase(0);
+
+            const int KeyCount = 2_000;
+            for (int i = 0; i < KeyCount; i++)
+                db.StringSet($"rcu:{i}", "v0");
+
+            using var stop = new System.Threading.CancellationTokenSource();
+
+            // Background writer continuously SETs keys to new values, generating RCU traffic.
+            var writer = System.Threading.Tasks.Task.Run(() =>
+            {
+                using var rmwRedis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+                var rmwDb = rmwRedis.GetDatabase(0);
+                var rng = new Random(42);
+                long iter = 0;
+                while (!stop.Token.IsCancellationRequested)
+                {
+                    var idx = rng.Next(KeyCount);
+                    rmwDb.StringSet($"rcu:{idx}", $"v{iter++}");
+                }
+            });
+
+            try
+            {
+                // Issue several KEYS calls concurrent with the writer. Each call must return
+                // exactly KeyCount entries with no duplicates.
+                for (int round = 0; round < 5; round++)
+                {
+                    var res = (RedisValue[])db.Execute("KEYS", "rcu:*");
+                    ClassicAssert.IsNotNull(res);
+                    ClassicAssert.AreEqual(KeyCount, res.Length, $"KEYS round {round}: expected {KeyCount} entries, got {res.Length}");
+
+                    var unique = new HashSet<string>();
+                    foreach (var k in res)
+                        ClassicAssert.IsTrue(unique.Add(k.ToString()), $"KEYS round {round}: duplicate key returned: {k}");
+                }
+            }
+            finally
+            {
+                stop.Cancel();
+                // Ensure the background writer stops within a bounded window so it cannot leak
+                // a connection into subsequent tests, and surface any exception it threw so it
+                // doesn't get silently swallowed.
+                var stopped = writer.Wait(TimeSpan.FromSeconds(30));
+                ClassicAssert.IsTrue(stopped, "Background writer did not stop within 30s after cancellation");
+                if (writer.IsFaulted)
+                    throw writer.Exception!.Flatten();
+            }
+        }
+
+        /// <summary>
+        /// KEYS must not list a key that has been deleted. A key whose newest record was produced by an
+        /// RCU (for example by EXPIRE, which rewrites the record to add the expiration field) leaves the
+        /// superseded record in the log marked Invalid. Deleting the key removes the newest record from
+        /// the hash chain, so the cursor scan's "is there a newer version?" lookup finds nothing; if the
+        /// scan pushed Invalid records, the stale pre-RCU record would be resurrected and reported by KEYS
+        /// while GET, EXISTS, DBSIZE and SCAN all correctly report the key as absent.
+        /// </summary>
+        [Test]
+        [TestCase(true, Description = "Key expires naturally before being deleted")]
+        [TestCase(false, Description = "Key is still live when deleted")]
+        public void SeKeysDoesNotListDeletedKeyWithSupersededRecord(bool expireBeforeDelete)
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true));
+            var db = redis.GetDatabase(0);
+
+            var key = new RedisKey("del:superseded");
+            ClassicAssert.IsTrue(db.StringSet(key, "v0"));
+
+            // EXPIRE rewrites the record (RCU) to add the expiration field, so the original record
+            // becomes a superseded, Invalid record that is still physically present in the log.
+            var ttl = expireBeforeDelete ? TimeSpan.FromMilliseconds(50) : TimeSpan.FromSeconds(1000);
+            ClassicAssert.IsTrue(db.KeyExpire(key, ttl));
+
+            if (expireBeforeDelete)
+            {
+                // Wait for the key to lapse so the delete is applied to an already-expired record.
+                var deadline = DateTime.UtcNow.AddSeconds(10);
+                while (db.KeyExists(key) && DateTime.UtcNow < deadline)
+                    Thread.Sleep(10);
+                ClassicAssert.IsFalse(db.KeyExists(key), "Key did not expire within 10s");
+            }
+
+            _ = db.KeyDelete(key);
+
+            var keys = (RedisValue[])db.Execute("KEYS", "del:*");
+            ClassicAssert.IsNotNull(keys);
+
+            // Every keyspace view must agree that the key is gone. Assert.Multiple so a failure in one
+            // view does not mask the state of the others.
+            Assert.Multiple(() =>
+            {
+                CollectionAssert.IsEmpty(keys, "KEYS must not list a deleted key");
+                CollectionAssert.IsEmpty(ScanAll(db), "SCAN must not return a deleted key");
+                ClassicAssert.AreEqual(0, (long)db.Execute("DBSIZE"), "DBSIZE must not count the deleted key");
+                ClassicAssert.IsFalse(db.KeyExists(key), "EXISTS must report the key as absent");
+                ClassicAssert.IsTrue(db.StringGet(key).IsNull, "GET must report the key as absent");
+            });
+        }
+
+        /// <summary>
+        /// Drains a full SCAN cursor loop and returns every key returned across all batches.
+        /// </summary>
+        private static List<string> ScanAll(IDatabase db)
+        {
+            var found = new List<string>();
+            var cursor = "0";
+            do
+            {
+                var batch = (RedisResult[])db.Execute("SCAN", cursor);
+                cursor = (string)batch[0];
+                foreach (var k in (RedisValue[])batch[1])
+                    found.Add(k.ToString());
+            }
+            while (cursor != "0");
+            return found;
+        }
+
+        /// <summary>
+        /// The same resurrection must not occur for object-store keys, whose records are also rewritten
+        /// by EXPIRE.
+        /// </summary>
+        [Test]
+        public void SeKeysDoesNotListDeletedObjectKeyWithSupersededRecord()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true));
+            var db = redis.GetDatabase(0);
+
+            var key = new RedisKey("del:objsuperseded");
+            _ = db.ListRightPush(key, "a");
+            ClassicAssert.IsTrue(db.KeyExpire(key, TimeSpan.FromSeconds(1000)));
+            _ = db.KeyDelete(key);
+
+            var keys = (RedisValue[])db.Execute("KEYS", "del:*");
+            ClassicAssert.IsNotNull(keys);
+            Assert.Multiple(() =>
+            {
+                CollectionAssert.IsEmpty(keys, "KEYS must not list a deleted object key");
+                CollectionAssert.IsEmpty(ScanAll(db), "SCAN must not return a deleted object key");
+                ClassicAssert.AreEqual(0, (long)db.Execute("DBSIZE"), "DBSIZE must not count the deleted key");
+                ClassicAssert.IsFalse(db.KeyExists(key), "EXISTS must report the key as absent");
+            });
+        }
+
+        [Test]
+        public void CanDoMemoryUsage()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+
+            // add keys in both stores
+            db.StringSet(new RedisKey("keyOne"), new RedisValue("valueone"));
+            db.SortedSetAdd(new RedisKey("myss"), [new SortedSetEntry("a", 1)]);
+            db.ListLeftPush(new RedisKey("mylist"), [new RedisValue("1")]);
+            db.SetAdd(new RedisKey("myset"), new RedisValue("elementone"));
+            db.HashSet(new RedisKey("myhash"), [new HashEntry("a", "1")]);
+
+            string[] data = ["a", "b", "c", "d", "e", "f"];
+            string key = "hllKey";
+            for (int i = 0; i < data.Length; i++)
+            {
+                db.HyperLogLogAdd(key, data[i]);
+            }
+
+            var r = db.Execute("MEMORY", ["USAGE", "keyOne"]);
+            ClassicAssert.AreEqual("32", r.ToString());
+
+            r = db.Execute("MEMORY", ["USAGE", "myss"]);
+            ClassicAssert.AreEqual("376", r.ToString());
+
+            r = db.Execute("MEMORY", ["USAGE", "mylist"]);
+            ClassicAssert.AreEqual("216", r.ToString());
+
+            r = db.Execute("MEMORY", ["USAGE", "myset"]);
+            ClassicAssert.AreEqual("240", r.ToString());
+
+            r = db.Execute("MEMORY", ["USAGE", "myhash"]);
+            ClassicAssert.AreEqual("304", r.ToString());
+
+            r = db.Execute("MEMORY", ["USAGE", "foo"]);
+            ClassicAssert.IsTrue(r.IsNull);
+
+            r = db.Execute("MEMORY", ["USAGE", "hllKey"]);
+            ClassicAssert.AreEqual("296", r.ToString());
+        }
+
+
+        [Test]
+        public void CanGetKeyType()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+
+            // add keys in both stores
+            db.StringSet(new RedisKey("keyOne"), new RedisValue("valueone"));
+            db.SortedSetAdd(new RedisKey("myss"), [new SortedSetEntry("a", 1)]);
+            db.ListLeftPush(new RedisKey("mylist"), [new RedisValue("1")]);
+            db.SetAdd(new RedisKey("myset"), new RedisValue("elementone"));
+            db.HashSet(new RedisKey("myhash"), [new HashEntry("a", "1")]);
+
+            var r = db.Execute("TYPE", ["keyOne"]);
+            ClassicAssert.IsTrue(r.ToString() == "string");
+
+            r = db.Execute("TYPE", ["myss"]);
+            ClassicAssert.IsTrue(r.ToString() == "zset");
+
+            r = db.Execute("TYPE", ["mylist"]);
+            ClassicAssert.IsTrue(r.ToString() == "list");
+
+            r = db.Execute("TYPE", ["myset"]);
+            ClassicAssert.IsTrue(r.ToString() == "set");
+
+            r = db.Execute("TYPE", ["myhash"]);
+            ClassicAssert.IsTrue(r.ToString() == "hash");
+        }
+
+        [Test]
+        public void CanUsePatternsInKeysTest()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true));
+            var db = redis.GetDatabase(0);
+
+            //h?llo matches hello, hallo and hxllo
+            //h*llo matches hllo and heeeello
+            //h[ae]llo matches hello and hallo, but not hillo
+            //h[^e]llo matches hallo, hbllo, ... but not hello
+            //h[a-b]llo matches hallo and hbllo
+            db.StringSet(new RedisKey("hello"), new RedisValue("uno"));
+            db.StringSet(new RedisKey("hallo"), new RedisValue("dos"));
+            db.StringSet(new RedisKey("hxllo"), new RedisValue("tres"));
+            db.StringSet(new RedisKey("hllo"), new RedisValue("four"));
+
+
+            var actualResponse = db.Execute("KEYS", ["h?llo"]);
+            ClassicAssert.AreEqual(3, ((RedisResult[])actualResponse).Length);
+            var listKeys = new List<string>((string[])actualResponse);
+            ClassicAssert.IsTrue(listKeys.Contains("hello"));
+            ClassicAssert.IsTrue(listKeys.Contains("hallo"));
+            ClassicAssert.IsTrue(listKeys.Contains("hxllo"));
+
+
+            actualResponse = db.Execute("KEYS", ["h*llo"]);
+            ClassicAssert.AreEqual(4, ((RedisResult[])actualResponse).Length);
+            listKeys = new List<string>((string[])actualResponse);
+            ClassicAssert.IsTrue(listKeys.Contains("hllo"));
+            ClassicAssert.IsTrue(listKeys.Contains("hallo"));
+            ClassicAssert.IsTrue(listKeys.Contains("hxllo"));
+            ClassicAssert.IsTrue(listKeys.Contains("hello"));
+
+            actualResponse = db.Execute("KEYS", ["h[ae]llo"]);
+            ClassicAssert.AreEqual(2, ((RedisResult[])actualResponse).Length);
+            listKeys = new List<string>((string[])actualResponse);
+            ClassicAssert.IsTrue(listKeys.Contains("hallo"));
+            ClassicAssert.IsTrue(listKeys.Contains("hello"));
+
+            actualResponse = db.Execute("KEYS", ["h[^e]llo"]);
+            ClassicAssert.AreEqual(2, ((RedisResult[])actualResponse).Length);
+            listKeys = new List<string>((string[])actualResponse);
+            ClassicAssert.IsTrue(listKeys.Contains("hallo"));
+            ClassicAssert.IsTrue(listKeys.Contains("hxllo"));
+
+            actualResponse = db.Execute("KEYS", ["h[a-b]llo"]);
+            ClassicAssert.AreEqual(1, ((RedisResult[])actualResponse).Length);
+            listKeys = new List<string>((string[])actualResponse);
+            ClassicAssert.IsTrue(listKeys.Contains("hallo"));
+
+        }
+
+        [Test]
+        public void SeKeysPatternTest()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true));
+            var db = redis.GetDatabase(0);
+            db.StringSet(new RedisKey("keyone"), new RedisValue("valueone"));
+            db.StringSet(new RedisKey("keytwo"), new RedisValue("valuetwo"));
+            db.StringSet(new RedisKey("keythree"), new RedisValue("valuethree"));
+            var actualResponse = db.Execute("KEYS", ["*"]);
+            ClassicAssert.AreEqual(3, ((RedisResult[])actualResponse).Length);
+        }
+
+
+        [Test]
+        public void SeKeysPatternMatchingTest()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true));
+            var db = redis.GetDatabase(0);
+            db.StringSet(new RedisKey("he**"), new RedisValue("keyvalueone"));
+            db.StringSet(new RedisKey(@"he\*\*"), new RedisValue("keyvaluetwo"));
+            db.StringSet(new RedisKey(@"he\*\*foo"), new RedisValue("keyvaluethree"));
+            db.StringSet(new RedisKey(@"he**foo"), new RedisValue("keyvaluefour"));
+
+            var actualResponse = db.Execute("KEYS", [@"he\*\*"]);
+            ClassicAssert.AreEqual(1, ((RedisResult[])actualResponse).Length);
+            ClassicAssert.IsTrue(String.Equals(@"he**", (((RedisResult[])actualResponse)[0]).ToString()));
+
+            actualResponse = db.Execute("KEYS", [@"he\\*\\*"]);
+            ClassicAssert.AreEqual(2, ((RedisResult[])actualResponse).Length);
+            ClassicAssert.IsTrue(String.Equals(@"he\*\*", (((RedisResult[])actualResponse)[0]).ToString()));
+            ClassicAssert.IsTrue(String.Equals(@"he\*\*foo", (((RedisResult[])actualResponse)[1]).ToString()));
+
+            actualResponse = db.Execute("KEYS", [@"he**"]);
+            ClassicAssert.AreEqual(4, ((RedisResult[])actualResponse).Length);
+        }
+
+        [Test]
+        public void SeKeysPatternMatchingTestVerbatim()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true));
+            var db = redis.GetDatabase(0);
+            db.StringSet(new RedisKey("he**"), new RedisValue("keyvalueone"));
+            db.StringSet(new RedisKey(@"he**foo"), new RedisValue("keyvaluetwo"));
+
+            var actualResponse = db.Execute("KEYS", [@"he\*\*"]);
+            ClassicAssert.AreEqual(1, ((RedisResult[])actualResponse).Length);
+            ClassicAssert.IsTrue(String.Equals(@"he**", (((RedisResult[])actualResponse)[0]).ToString()));
+
+            actualResponse = db.Execute("KEYS", [@"he\\*\\*"]);
+            ClassicAssert.AreEqual(0, ((RedisResult[])actualResponse).Length);
+
+            db.StringSet(new RedisKey(@"\\bar"), new RedisValue("secondvalue"));
+            actualResponse = db.Execute("KEYS", [@"\\bar"]);
+            ClassicAssert.AreEqual(0, ((RedisResult[])actualResponse).Length);
+
+            actualResponse = db.Execute("KEYS", [@"\\\bar"]);
+            ClassicAssert.AreEqual(0, ((RedisResult[])actualResponse).Length);
+
+            actualResponse = db.Execute("KEYS", [@"\\\\bar"]);
+            ClassicAssert.AreEqual(1, ((RedisResult[])actualResponse).Length);
+            ClassicAssert.IsTrue(String.Equals(@"\\bar", (((RedisResult[])actualResponse)[0]).ToString()));
+        }
+
+        [TestCase("KEYS")]
+        [TestCase("SCAN")]
+        [TestCase("HSCAN")]
+        [TestCase("SSCAN")]
+        [TestCase("ZSCAN")]
+        public void ScanCommandsSupportDeepWildcardPatterns(string command)
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true));
+            var db = redis.GetDatabase(0);
+            var member = new string('a', 8192);
+            var pattern = string.Concat(Enumerable.Repeat("*a", member.Length));
+            switch (command)
+            {
+                case "KEYS":
+                case "SCAN":
+                    db.StringSet(member, "value");
+                    break;
+                case "HSCAN":
+                    db.HashSet("collection", member, "value");
+                    break;
+                case "SSCAN":
+                    db.SetAdd("collection", member);
+                    break;
+                case "ZSCAN":
+                    db.SortedSetAdd("collection", member, 1);
+                    break;
+            }
+
+            foreach (var matches in new[] { true, false })
+            {
+                var matchPattern = matches ? pattern : pattern + "b";
+                var result = command switch
+                {
+                    "KEYS" => db.Execute(command, matchPattern),
+                    "SCAN" => db.Execute(command, "0", "MATCH", matchPattern, "COUNT", "100"),
+                    _ => db.Execute(command, "collection", "0", "MATCH", matchPattern, "COUNT", "100")
+                };
+                var entries = (RedisResult[])(command == "KEYS" ? result : result[1]);
+                ClassicAssert.AreEqual(matches ? (command is "HSCAN" or "ZSCAN" ? 2 : 1) : 0, entries.Length);
+                if (matches)
+                    ClassicAssert.AreEqual(member, (string)entries[0]);
+            }
+
+            ClassicAssert.AreEqual("PONG", (string)db.Execute("PING"));
+            using var other = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            ClassicAssert.AreEqual("PONG", (string)other.GetDatabase(0).Execute("PING"));
+        }
+
+
+        [Test]
+        public void CanUseScanWithEmptyStore()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+            var result = db.Execute("SCAN", "0");
+            ClassicAssert.AreEqual(ResultType.BulkString, result[0].Resp2Type);
+            _ = int.TryParse((string)((RedisValue[])((RedisResult[])result!)[0])[0], out var cursor);
+            RedisValue[] keysMatch = ((RedisValue[])((RedisResult[])result!)[1]);
+            ClassicAssert.IsTrue(cursor == 0);
+            ClassicAssert.IsTrue(keysMatch.Length == 0);
+        }
+
+
+        [Test]
+        public void CanUseScanWithMatch()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+            db.StringSet(new RedisKey("hello"), new RedisValue("keyvalueone"));
+            db.StringSet(new RedisKey("foo"), new RedisValue("keyvaluetwo"));
+            var result = db.Execute("SCAN", "0", "MATCH", "*o*", "COUNT", "1000");
+            ClassicAssert.AreEqual(ResultType.BulkString, result[0].Resp2Type);
+            RedisValue[] keysMatch = (RedisValue[])((RedisResult[])result!)[1];
+            ClassicAssert.True(keysMatch.Contains("foo") && keysMatch.Contains("hello"));
+        }
+
+        [Test]
+        public void CanUseScanAllKeys()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+            var nKeys = 200;
+            for (int i = 0; i < nKeys; i++)
+            {
+                db.StringSet(new RedisKey($"key:{i}"), new RedisValue($"keyvalue-{i}"));
+            }
+
+            int cursor = 0;
+            var recordsReturned = 0;
+
+            do
+            {
+                var result = db.Execute("SCAN", cursor.ToString());
+                ClassicAssert.AreEqual(ResultType.BulkString, result[0].Resp2Type);
+                _ = int.TryParse((string)((RedisValue[])((RedisResult[])result!)[0])[0], out cursor);
+                RedisValue[] keysMatch = ((RedisValue[])((RedisResult[])result!)[1]);
+                recordsReturned += keysMatch.Length;
+            } while (cursor != 0);
+
+            ClassicAssert.AreEqual(nKeys, recordsReturned);
+        }
+
+        [Test]
+        public void CanUseScanKeysWithCount()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+            var nKeys = 200;
+            var rnd = new Random();
+
+            for (int i = 0; i < nKeys; i++)
+            {
+                db.StringSet(new RedisKey($"key:{i}"), new RedisValue($"keyvalue-{i}"));
+            }
+
+            int cursor = 0;
+            var recordsReturned = 0;
+            var count = rnd.Next(1, 20);
+
+            do
+            {
+                var result = db.Execute("SCAN", cursor.ToString(), "COUNT", count);
+                _ = int.TryParse((string)((RedisValue[])((RedisResult[])result!)[0])[0], out cursor);
+                RedisValue[] keysMatch = ((RedisValue[])((RedisResult[])result!)[1]);
+                recordsReturned += keysMatch.Length;
+                count = rnd.Next(1, 20);
+            } while (recordsReturned < nKeys);
+
+            ClassicAssert.IsTrue(recordsReturned == nKeys);
+        }
+
+        [Test]
+        public void CanUseScanKeysWithMatchAndCount()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+            var nKeys = 200;
+
+            for (int i = 0; i < nKeys; i++)
+            {
+                db.StringSet(new RedisKey($"key:{i}"), new RedisValue($"keyvalue-{i}"));
+            }
+
+            int cursor = 0;
+            var result = db.Execute("SCAN", cursor.ToString(), "MATCH", "*11*", "COUNT", 1000);
+            _ = int.TryParse((string)((RedisValue[])((RedisResult[])result!)[0])[0], out cursor);
+            RedisValue[] keysMatch = ((RedisValue[])((RedisResult[])result!)[1]);
+            ClassicAssert.IsTrue(cursor == 0);
+            ClassicAssert.IsTrue(keysMatch.Length == 11);
+        }
+
+        [Test]
+        public void CanUseScanKeysCountAndStringType()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+            var nKeys = 100;
+
+            for (int i = 0; i < nKeys; i++)
+            {
+                db.StringSet(new RedisKey($"key:{i}"), new RedisValue($"keyvalue-{i}"));
+            }
+
+            int cursor = 0;
+            var result = db.Execute("SCAN", cursor.ToString(), "TYPE", "string", "COUNT", "100");
+            _ = int.TryParse((string)((RedisValue[])((RedisResult[])result!)[0])[0], out cursor);
+            RedisValue[] keysMatch = ((RedisValue[])((RedisResult[])result!)[1]);
+            ClassicAssert.IsTrue(cursor == 0);
+            ClassicAssert.IsTrue(keysMatch.Length == 100);
+        }
+
+        [Test]
+        public void CanUseScanKeysCountAndTypeWithObjects()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+            var nKeys = 100;
+
+            for (int i = 0; i < nKeys; i++)
+            {
+                db.StringSet(new RedisKey($"key:{i}"), new RedisValue($"keyvalue-{i}"));
+            }
+
+            for (int i = 0; i < 10; i++)
+            {
+                db.HashSet(new RedisKey($"hskey:{i}"), [new HashEntry("field1", "1")]);
+            }
+
+            for (int i = 0; i < 10; i++)
+            {
+                db.SortedSetAdd(new RedisKey($"sskey:{i}"), "a", i);
+            }
+
+            for (int i = 0; i < 10; i++)
+            {
+                db.ListLeftPush(new RedisKey($"lkey:{i}"), new RedisValue("lvalue"));
+            }
+
+            int cursor = 0;
+            var result = db.Execute("SCAN", cursor.ToString(), "TYPE", "string", "COUNT", "100");
+            _ = int.TryParse((string)((RedisValue[])((RedisResult[])result!)[0])[0], out cursor);
+            RedisValue[] keysMatch = ((RedisValue[])((RedisResult[])result!)[1]);
+            ClassicAssert.IsTrue(cursor == 0);
+            ClassicAssert.IsTrue(keysMatch.Length == 100);
+
+            cursor = 0;
+            result = db.Execute("SCAN", cursor.ToString(), "TYPE", "zset");
+            _ = int.TryParse((string)((RedisValue[])((RedisResult[])result!)[0])[0], out cursor);
+            keysMatch = ((RedisValue[])((RedisResult[])result!)[1]);
+            ClassicAssert.IsTrue(cursor == 0);
+            ClassicAssert.IsTrue(keysMatch.Length == 10);
+            ClassicAssert.IsTrue(keysMatch[0].ToString().Equals("sskey:0", StringComparison.OrdinalIgnoreCase));
+
+            cursor = 0;
+            result = db.Execute("SCAN", cursor.ToString(), "TYPE", "LIST");
+            _ = int.TryParse((string)((RedisValue[])((RedisResult[])result!)[0])[0], out cursor);
+            keysMatch = ((RedisValue[])((RedisResult[])result!)[1]);
+            ClassicAssert.IsTrue(cursor == 0);
+            ClassicAssert.IsTrue(keysMatch.Length == 10);
+            ClassicAssert.IsTrue(keysMatch[0].ToString().Equals("lkey:0", StringComparison.OrdinalIgnoreCase));
+        }
+
+
+        [Test]
+        public void CanUseScanKeysAndObjects()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+            var nKeys = 100;
+
+            for (int i = 0; i < nKeys; i++)
+            {
+                _ = db.StringSet(new RedisKey($"key:{i}"), new RedisValue($"keyvalue-{i}"));
+            }
+
+            for (int i = 0; i < nKeys; i++)
+            {
+                db.HashSet(new RedisKey($"hskey:{i}"), [new HashEntry("field1", "1")]);
+            }
+
+            for (int i = 0; i < nKeys; i++)
+            {
+                _ = db.SortedSetAdd(new RedisKey($"sskey:{i}"), [new SortedSetEntry("a", 1)]);
+            }
+
+            long cursor = 0;
+            int recordsReturned = 0;
+
+            do
+            {
+                var result = db.Execute("SCAN", cursor.ToString());
+                _ = long.TryParse((string)((RedisValue[])((RedisResult[])result!)[0])[0], out cursor);
+                RedisValue[] keysMatch = ((RedisValue[])((RedisResult[])result!)[1]);
+                recordsReturned += keysMatch.Length;
+            } while (cursor != 0);
+
+            ClassicAssert.AreEqual(nKeys * 3, recordsReturned, "records returned");
+        }
+
+
+        [Test]
+        public void CanUseScanKeysTypeAndMatch()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+            var nKeys = 100;
+
+            for (int i = 0; i < nKeys; i++)
+            {
+                _ = db.StringSet(new RedisKey($"key:{i}"), new RedisValue($"keyvalue-{i}"));
+            }
+
+            for (int i = 0; i < nKeys; i++)
+            {
+                db.HashSet(new RedisKey($"hskey:{i}"), [new HashEntry("field1", "1")]);
+            }
+
+            int cursor = 0;
+            int recordsReturned = 0;
+
+            do
+            {
+                var result = db.Execute("SCAN", cursor.ToString(), "TYPE", "HASH", "MATCH", "hs*");
+                _ = int.TryParse((string)((RedisValue[])((RedisResult[])result!)[0])[0], out cursor);
+                RedisValue[] keysMatch = ((RedisValue[])((RedisResult[])result!)[1]);
+                recordsReturned += keysMatch.Length;
+            } while (cursor != 0);
+
+            ClassicAssert.IsTrue(recordsReturned == nKeys);
+
+            // Lower casing
+            recordsReturned = 0;
+            do
+            {
+                var result = db.Execute("SCAN", cursor.ToString(), "type", "hash", "match", "hs*");
+                _ = int.TryParse((string)((RedisValue[])((RedisResult[])result!)[0])[0], out cursor);
+                RedisValue[] keysMatch = ((RedisValue[])((RedisResult[])result!)[1]);
+                recordsReturned += keysMatch.Length;
+            } while (cursor != 0);
+
+            ClassicAssert.IsTrue(recordsReturned == nKeys);
+
+        }
+
+        [Test]
+        public void CustomObjectScanCommandTest()
+        {
+            // create a custom object
+            var factory = new MyDictFactory();
+
+            server.Register.NewCommand("MYDICTSET", CommandType.ReadModifyWrite, factory, new MyDictSet(), respCustomCommandsInfo["MYDICTSET"]);
+            server.Register.NewCommand("MYDICTGET", CommandType.Read, factory, new MyDictGet(), respCustomCommandsInfo["MYDICTGET"]);
+
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+
+            string keyName = "ccKey";
+
+            for (int i = 0; i < 10; i++)
+            {
+                db.Execute("MYDICTSET", keyName, $"fookey-{i}", $"foovalue-{i}");
+            }
+
+            var items = db.Execute("CUSTOMOBJECTSCAN", keyName, 0, "COUNT", 5);
+            ClassicAssert.IsTrue(((RedisResult[])items).Length == 2);
+            // Assert Cursor value
+            ClassicAssert.IsTrue(((RedisResult[])items)[0].ToString() == "5");
+
+            // Usage with pattern and count
+            items = db.Execute("CUSTOMOBJECTSCAN", keyName, 0, "MATCH", "foo*", "COUNT", 10);
+            ClassicAssert.IsTrue(((RedisResult[])items).Length == 2);
+            var resultAsDictionary = items.ToDictionary();
+
+            // First element in the resulting dictionary is the cursor value
+            resultAsDictionary.TryGetValue("0", out var elements);
+
+            // Review the elements are correct based on the pattern
+            for (int i = 0; i < ((RedisResult[])elements).Length / 2; i++)
+            {
+                ClassicAssert.IsTrue(((RedisResult[])elements)[i * 2].ToString() == $"fookey-{i}");
+            }
+        }
+
+        [Test]
+        [TestCase("SCAN", new[] { "0", "MATCH" })]
+        [TestCase("SCAN", new[] { "0", "COUNT" })]
+        [TestCase("SCAN", new[] { "0", "TYPE" })]
+        [TestCase("SCAN", new[] { "0", "TYPE", "string", "COUNT", "5", "MATCH" })]
+        [TestCase("SCAN", new[] { "0", "MATCH", "*", "COUNT", "10", "TYPE" })]
+        [TestCase("HSCAN", new[] { "myhash", "0", "MATCH" })]
+        [TestCase("HSCAN", new[] { "myhash", "0", "COUNT" })]
+        [TestCase("HSCAN", new[] { "myhash", "0", "NOVALUES", "MATCH" })]
+        [TestCase("SSCAN", new[] { "myset", "0", "MATCH" })]
+        [TestCase("ZSCAN", new[] { "myzset", "0", "MATCH" })]
+        public void ScanOptionKeywordAsLastTokenReturnsSyntaxError(string command, string[] args)
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+
+            // HSCAN / SSCAN / ZSCAN only reach the option parser when the key exists
+            db.Execute("HSET", "myhash", "myfield", "myvalue");
+            db.Execute("SADD", "myset", "mymember");
+            db.Execute("ZADD", "myzset", "1", "mymember");
+
+            // MATCH, COUNT and TYPE in final position have no value left to read
+            var exc = ClassicAssert.Throws<RedisServerException>(() => db.Execute(command, args.Cast<object>().ToArray()));
+            ClassicAssert.AreEqual("ERR syntax error", exc.Message);
+        }
+
+        [Test]
+        [TestCase("SCAN", new[] { "0" })]
+        [TestCase("SCAN", new[] { "0", "MATCH", "*" })]
+        [TestCase("SCAN", new[] { "0", "COUNT", "5" })]
+        [TestCase("SCAN", new[] { "0", "TYPE", "string" })]
+        [TestCase("SCAN", new[] { "0", "FOO" })]
+        [TestCase("HSCAN", new[] { "myhash", "0", "MATCH", "*" })]
+        [TestCase("HSCAN", new[] { "myhash", "0", "NOVALUES" })]
+        public void ScanWithCompleteOptionsReturnsCursorAndItems(string command, string[] args)
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+
+            db.StringSet("mykey", "myvalue");
+            db.Execute("HSET", "myhash", "myfield", "myvalue");
+
+            // "FOO" is an unrecognized token, which Garnet ignores instead of rejecting
+            var result = db.Execute(command, args.Cast<object>().ToArray());
+            ClassicAssert.AreEqual(2, ((RedisResult[])result).Length);
+        }
+
+        #region LigthClientTests
+
+        [Test]
+        public void CanUsePatternsInKeysTestLC()
+        {
+            using var lightClientRequest = TestUtils.CreateRequest();
+            lightClientRequest.SendCommand("SET keyone valueone");
+            lightClientRequest.SendCommand("SET keytwo valuetwo");
+            lightClientRequest.SendCommand("SET keythree valuethree");
+
+            var expectedResponse = "*3\r\n$6\r\nkeyone\r\n$6\r\nkeytwo\r\n$8\r\nkeythree\r\n+PONG\r\n";
+            var response = lightClientRequest.SendCommands("KEYS *", "PING", 4);
+            TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+        }
+
+        #endregion
+
+    }
+}

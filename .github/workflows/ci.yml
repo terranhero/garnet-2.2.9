@@ -1,0 +1,455 @@
+name: Garnet .NET CI
+on:
+  workflow_dispatch:
+  push:
+    branches:
+      - main
+      - dev
+  pull_request:
+    branches:
+      - main
+      - dev
+  
+env:
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 1
+  DOTNET_NOLOGO: true
+
+permissions:
+  contents: read
+
+jobs:
+  changes:
+    name: Check for changes
+    runs-on: ubuntu-latest # don't need matrix to test where the changes were made in code
+    permissions:
+      pull-requests: read
+      contents: read
+    outputs:
+      tsavorite: ${{ steps.filter.outputs.tsavorite }}
+      website: ${{ steps.filter.outputs.website }}
+      garnet: ${{ steps.filter.outputs.garnet }}
+    steps:
+    - name: Check out code
+      uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+    - name: Apply filter
+      uses: dorny/paths-filter@ceb8a2b8f2d89434be7ff52d3de7ec3738c5cc9d # v4.0.3
+      id: filter
+      with:
+        filters: |
+          tsavorite:
+            - 'libs/storage/Tsavorite/**'
+          website:
+            - 'website/**'
+          garnet:
+            - '!((*.md)|(website/**))'
+  
+  format-garnet:
+    name: Format Garnet
+    needs: changes
+    runs-on: ubuntu-latest
+    if: needs.changes.outputs.garnet == 'true'
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', 'Directory.Packages.props') }}
+          restore-keys: nuget-${{ runner.os }}-
+      - name: Install dependencies
+        run: dotnet restore Garnet.slnx
+      - name: Check style format
+        run: dotnet format Garnet.slnx --no-restore --verify-no-changes --verbosity diagnostic
+
+  format-tsavorite:
+    name: Format Tsavorite
+    needs: changes
+    runs-on: ubuntu-latest
+    if: needs.changes.outputs.tsavorite == 'true'
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', 'Directory.Packages.props') }}
+          restore-keys: nuget-${{ runner.os }}-
+      - name: Install dependencies
+        run: dotnet restore libs/storage/Tsavorite/cs/Tsavorite.slnx
+      - name: Check style format
+        run: dotnet format libs/storage/Tsavorite/cs/Tsavorite.slnx --no-restore --verify-no-changes --verbosity diagnostic
+  
+  # Job to build Garnet code (once per os/configuration)
+  build-garnet:
+    name: Build Garnet
+    needs: [changes]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
+        configuration: [ 'Debug', 'Release' ]
+    if: needs.changes.outputs.garnet == 'true'
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', 'Directory.Packages.props') }}
+          restore-keys: nuget-${{ runner.os }}-
+      - name: Install dependencies
+        run: dotnet restore
+      - name: Build Garnet
+        run: dotnet build --configuration ${{ matrix.configuration }} --no-restore
+
+  # Job to test Garnet standalone code
+  test-garnet-standalone:
+    name: Garnet Standalone
+    needs: [changes, build-garnet]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
+        framework: [ 'net10.0' ]
+        configuration: [ 'Debug', 'Release' ]
+        test: [ 'Garnet.test', 'Garnet.test.collections', 'Garnet.test.acl', 'Garnet.test.scripting', 'Garnet.test.complexstring', 'Garnet.test.vectorset', 'Garnet.test.rangeindex', 'Garnet.test.extensions', 'BfTreeInterop.test' ]
+    if: needs.changes.outputs.garnet == 'true'
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', 'Directory.Packages.props') }}
+          restore-keys: nuget-${{ runner.os }}-
+      - name: Install dependencies
+        run: dotnet restore
+      - name: Run tests ${{ matrix.test }}
+        run: dotnet test test/standalone/${{ matrix.test }} -f ${{ matrix.framework }} --configuration ${{ matrix.configuration }} --logger "console;verbosity=detailed" --logger "trx;LogFileName=${{ matrix.os }}-${{ matrix.framework }}-${{ matrix.configuration }}-${{ matrix.test }}.trx" --results-directory "GarnetTestResults-${{ matrix.os }}-${{ matrix.framework }}-${{ matrix.configuration }}-${{ matrix.test }}" -- NUnit.DisplayName=FullName
+        timeout-minutes: 45 
+      - name: Upload test results
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dotnet-standalone-results-${{ matrix.os }}-${{ matrix.framework }}-${{ matrix.configuration }}-${{ matrix.test }}
+          path: GarnetTestResults-${{ matrix.os }}-${{ matrix.framework }}-${{ matrix.configuration }}-${{ matrix.test }}
+        if: ${{ always() }}
+
+  # Job to test Garnet cluster code
+  test-garnet-cluster:
+    name: Garnet Cluster
+    needs: [changes, build-garnet]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
+        framework: [ 'net10.0' ]
+        configuration: [ 'Debug', 'Release' ]
+        test: [ 'Garnet.test.cluster', 'Garnet.test.cluster.migrate', 'Garnet.test.cluster.migrate.rangeindex', 'Garnet.test.cluster.replication', 'Garnet.test.cluster.replication.tls', 'Garnet.test.cluster.replication.disklesssync', 'Garnet.test.cluster.replication.rangeindex', 'Garnet.test.cluster.replication.vectorsets', 'Garnet.test.cluster.vectorsets', 'Garnet.test.cluster.multilog' ]
+    if: needs.changes.outputs.garnet == 'true'
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: nuget-${{ runner.os }}-${{ hashFiles('**/*.csproj', 'Directory.Packages.props') }}
+          restore-keys: nuget-${{ runner.os }}-
+      - name: Install dependencies
+        run: dotnet restore
+      - name: Run tests ${{ matrix.test }}
+        run: dotnet test test/cluster/${{ matrix.test }} -f ${{ matrix.framework }} --configuration ${{ matrix.configuration }} --logger "console;verbosity=detailed" --logger "trx;LogFileName=${{ matrix.os }}-${{ matrix.framework }}-${{ matrix.configuration }}-${{ matrix.test }}.trx" --blame-crash --blame-crash-dump-type full --blame-hang-timeout 30m --blame-hang-dump-type full --results-directory "GarnetTestResults-${{ matrix.os }}-${{ matrix.framework }}-${{ matrix.configuration }}-${{ matrix.test }}" -- NUnit.DisplayName=FullName
+        timeout-minutes: 45 
+      - name: Upload test results
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dotnet-cluster-results-${{ matrix.os }}-${{ matrix.framework }}-${{ matrix.configuration }}-${{ matrix.test }}
+          path: GarnetTestResults-${{ matrix.os }}-${{ matrix.framework }}-${{ matrix.configuration }}-${{ matrix.test }}
+        if: ${{ always() }}
+
+  # Job to build Tsavorite code (once per os/configuration)
+  build-tsavorite:
+    name: Build Tsavorite
+    needs: [changes]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
+        configuration: [ 'Debug', 'Release' ]
+    if: needs.changes.outputs.tsavorite == 'true'
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: nuget-tsavorite-${{ runner.os }}-${{ hashFiles('libs/storage/Tsavorite/**/*.csproj', 'Directory.Packages.props') }}
+          restore-keys: nuget-tsavorite-${{ runner.os }}-
+      - name: Install dependencies
+        run: dotnet restore libs/storage/Tsavorite/cs/Tsavorite.slnx
+      - name: Build Tsavorite
+        run: dotnet build libs/storage/Tsavorite/cs/Tsavorite.slnx --configuration ${{ matrix.configuration }} --no-restore
+
+  # Job to test Tsavorite code
+  test-tsavorite:
+    name: Tsavorite
+    needs: [changes, build-tsavorite]
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ ubuntu-latest, windows-latest ]
+        framework: [ 'net10.0' ]
+        configuration: [ 'Debug', 'Release' ]
+        test: [ 'Tsavorite.test', 'Tsavorite.test.recordops', 'Tsavorite.test.session', 'Tsavorite.test.session.context', 'Tsavorite.test.hlog', 'Tsavorite.test.recovery', 'Tsavorite.test.epoch' ]
+    if: needs.changes.outputs.tsavorite == 'true'
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set environment variable for Linux
+        run: echo "RunAzureTests=yes" >> $GITHUB_ENV
+        if: ${{ matrix.os == 'ubuntu-latest' && matrix.test != 'Tsavorite.test.recordops' && matrix.test != 'Tsavorite.test.session' && matrix.test != 'Tsavorite.test.session.context' && matrix.test != 'Tsavorite.test.recovery' && matrix.test != 'Tsavorite.test.epoch' }}
+      - name: Set environment variable for Windows
+        run: echo ("RunAzureTests=yes") >> $env:GITHUB_ENV
+        if: ${{ matrix.os == 'windows-latest' && matrix.test != 'Tsavorite.test.recordops' && matrix.test != 'Tsavorite.test.session' && matrix.test != 'Tsavorite.test.session.context' && matrix.test != 'Tsavorite.test.recovery' && matrix.test != 'Tsavorite.test.epoch' }}
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+      - name: Setup Node.js for Azurite
+        if: ${{ matrix.test != 'Tsavorite.test.recordops' && matrix.test != 'Tsavorite.test.session' && matrix.test != 'Tsavorite.test.session.context' && matrix.test != 'Tsavorite.test.recovery' && matrix.test != 'Tsavorite.test.epoch' }}
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+      - name: Cache Azurite
+        if: ${{ matrix.test != 'Tsavorite.test.recordops' && matrix.test != 'Tsavorite.test.session' && matrix.test != 'Tsavorite.test.session.context' && matrix.test != 'Tsavorite.test.recovery' && matrix.test != 'Tsavorite.test.epoch' }}
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.os == 'Windows' && '%APPDATA%\npm-cache' || '~/.npm' }}
+          key: azurite-${{ runner.os }}
+      - name: Install and Run Azurite
+        if: ${{ matrix.test != 'Tsavorite.test.recordops' && matrix.test != 'Tsavorite.test.session' && matrix.test != 'Tsavorite.test.session.context' && matrix.test != 'Tsavorite.test.recovery' && matrix.test != 'Tsavorite.test.epoch' }}
+        shell: bash
+        run: |
+          npm install -g azurite
+          azurite --skipApiVersionCheck &
+      - name: Cache NuGet packages
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ~/.nuget/packages
+          key: nuget-tsavorite-${{ runner.os }}-${{ hashFiles('libs/storage/Tsavorite/**/*.csproj', 'Directory.Packages.props') }}
+          restore-keys: nuget-tsavorite-${{ runner.os }}-
+      - name: Install dependencies
+        run: dotnet restore libs/storage/Tsavorite/cs/Tsavorite.slnx
+
+      - name: Resolve Tsavorite test directory
+        shell: pwsh
+        run: |
+          $tsavoriteDirMap = @{
+            'Tsavorite.test' = 'libs/storage/Tsavorite/cs/test'
+            'Tsavorite.test.recordops' = 'libs/storage/Tsavorite/cs/test/test.recordops'
+            'Tsavorite.test.session' = 'libs/storage/Tsavorite/cs/test/test.session'
+            'Tsavorite.test.session.context' = 'libs/storage/Tsavorite/cs/test/test.session.context'
+            'Tsavorite.test.hlog' = 'libs/storage/Tsavorite/cs/test/test.hlog'
+            'Tsavorite.test.recovery' = 'libs/storage/Tsavorite/cs/test/test.recovery'
+            'Tsavorite.test.epoch' = 'libs/storage/Tsavorite/cs/test/test.epoch'
+          }
+          $dir = $tsavoriteDirMap['${{ matrix.test }}']
+          echo "TSAVORITE_TEST_DIR=$dir" >> $env:GITHUB_ENV
+
+      - name: Run tests ${{ matrix.test }}
+        run: dotnet test ${{ env.TSAVORITE_TEST_DIR }} -f ${{ matrix.framework }} --configuration ${{ matrix.configuration }} --logger "console;verbosity=detailed" --logger "trx;LogFileName=${{ matrix.os }}-${{ matrix.framework }}-${{ matrix.configuration }}-${{ matrix.test }}.trx" --results-directory "TsavoriteTestResults-${{ matrix.os }}-${{ matrix.framework }}-${{ matrix.configuration }}-${{ matrix.test }}" -- NUnit.DisplayName=FullName
+        timeout-minutes: 45
+      - name: Upload test results
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: dotnet-tsavorite-results-${{ matrix.os }}-${{ matrix.framework }}-${{ matrix.configuration }}-${{ matrix.test }}
+          path: TsavoriteTestResults-${{ matrix.os }}-${{ matrix.framework }}-${{ matrix.configuration }}-${{ matrix.test }}
+        if: ${{ always() }}
+
+  build-website:
+    name: Build Website
+    needs: changes    
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: website
+    if: needs.changes.outputs.website == 'true'   
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: 22
+          cache: yarn
+          cache-dependency-path: ./website/yarn.lock
+      - name: Install dependencies
+        run: yarn install --frozen-lockfile
+      - name: Build website
+        run: yarn build
+
+  # Job to generate combined test summaries per category
+  test-summary:
+    name: Test Summary
+    runs-on: ubuntu-latest
+    needs: [changes, test-garnet-standalone, test-garnet-cluster, test-tsavorite]
+    if: always() && (needs.test-garnet-standalone.result != 'skipped' || needs.test-garnet-cluster.result != 'skipped' || needs.test-tsavorite.result != 'skipped')
+    steps:
+      - name: Download standalone test results
+        if: needs.test-garnet-standalone.result != 'skipped'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dotnet-standalone-results-*
+          path: results/standalone
+          merge-multiple: true
+      - name: Download cluster test results
+        if: needs.test-garnet-cluster.result != 'skipped'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dotnet-cluster-results-*
+          path: results/cluster
+          merge-multiple: true
+      - name: Download Tsavorite test results
+        if: needs.test-tsavorite.result != 'skipped'
+        uses: actions/download-artifact@9000827ccba6bdab643e8b6fd33ac0654aef8333 # v8.0.2
+        with:
+          pattern: dotnet-tsavorite-results-*
+          path: results/tsavorite
+          merge-multiple: true
+      - name: Generate summaries
+        shell: pwsh
+        run: |
+          function Write-CategorySummary($category, $dir) {
+            $trxFiles = Get-ChildItem -Path $dir -Filter "*.trx" -Recurse -ErrorAction SilentlyContinue
+            if (-not $trxFiles -or $trxFiles.Count -eq 0) { return }
+            $totalTests = 0; $passed = 0; $failed = 0; $skipped = 0
+            $durations = @()
+            $failedTests = @()
+            foreach ($trx in $trxFiles) {
+              $xml = [System.Xml.XmlDocument]::new()
+              try { $xml.Load($trx.FullName) }
+              catch {
+                Write-Warning "Skipping malformed TRX file: $($trx.FullName) - $_"
+                continue
+              }
+              $ns = @{ t = "http://microsoft.com/schemas/VisualStudio/TeamTest/2010" }
+              $results = Select-Xml -Xml $xml -XPath "//t:UnitTestResult" -Namespace $ns
+              foreach ($r in $results) {
+                $totalTests++
+                $outcome = $r.Node.outcome
+                if ($outcome -eq "Passed") { $passed++ }
+                elseif ($outcome -eq "Failed") {
+                  $failed++
+                  $dur = $r.Node.duration
+                  $durSec = 0
+                  if ($dur) { try { $durSec = [TimeSpan]::Parse($dur).TotalSeconds } catch { } }
+                  $failedTests += @{ Name = $r.Node.testName; Seconds = $durSec }
+                }
+                else { $skipped++ }
+                $dur = $r.Node.duration
+                if ($dur) {
+                  try { $ts = [TimeSpan]::Parse($dur); $durations += @{ Name = $r.Node.testName; Seconds = $ts.TotalSeconds } }
+                  catch { }
+                }
+              }
+            }
+            # Compute total duration as sum of all individual test durations
+            $totalSec = ($durations | ForEach-Object { $_.Seconds } | Measure-Object -Sum).Sum
+            if ($totalSec -gt 0) {
+              $totalDurStr = "{0}m {1:D2}s" -f [int][math]::Floor($totalSec / 60), [int]($totalSec % 60)
+            } else { $totalDurStr = "N/A" }
+            $buckets = @(
+              @{ Label = "< 1s";      Min = 0;   Max = 1 },
+              @{ Label = "1s - 5s";   Min = 1;   Max = 5 },
+              @{ Label = "5s - 15s";  Min = 5;   Max = 15 },
+              @{ Label = "15s - 30s"; Min = 15;  Max = 30 },
+              @{ Label = "30s - 60s"; Min = 30;  Max = 60 },
+              @{ Label = "> 60s";     Min = 60;  Max = [double]::MaxValue }
+            )
+            $counts = @(0,0,0,0,0,0)
+            foreach ($d in $durations) {
+              for ($i = 0; $i -lt $buckets.Count; $i++) {
+                if ($d.Seconds -ge $buckets[$i].Min -and $d.Seconds -lt $buckets[$i].Max) { $counts[$i]++; break }
+              }
+            }
+            $maxCount = ($counts | Measure-Object -Maximum).Maximum
+            if ($maxCount -eq 0) { $maxCount = 1 }
+            $sb = [System.Text.StringBuilder]::new()
+            [void]$sb.AppendLine("## 🧪 $category")
+            [void]$sb.AppendLine("")
+            [void]$sb.AppendLine("⏱️ **Total: $totalDurStr** · $totalTests tests (✅ $passed · ❌ $failed · ⏭️ $skipped)")
+            [void]$sb.AppendLine("")
+            # Failed tests section (only if there are failures)
+            if ($failedTests.Count -gt 0) {
+              [void]$sb.AppendLine("### ❌ Failed Tests")
+              [void]$sb.AppendLine("")
+              [void]$sb.AppendLine("| Test | Duration |")
+              [void]$sb.AppendLine("|------|----------|")
+              foreach ($t in $failedTests) {
+                $durStr = "{0:F1}s" -f $t.Seconds
+                [void]$sb.AppendLine("| $($t.Name) | $durStr |")
+              }
+              [void]$sb.AppendLine("")
+            }
+            [void]$sb.AppendLine("### Distribution")
+            [void]$sb.AppendLine("")
+            [void]$sb.AppendLine("| Duration | Count | |")
+            [void]$sb.AppendLine("|----------|------:|--|")
+            for ($i = 0; $i -lt $buckets.Count; $i++) {
+              $barLen = [int][math]::Round(($counts[$i] / $maxCount) * 20)
+              if ($barLen -eq 0 -and $counts[$i] -gt 0) { $barLen = 1 }
+              $bar = "█" * $barLen
+              [void]$sb.AppendLine("| $($buckets[$i].Label) | $($counts[$i]) | $bar |")
+            }
+            $top10 = $durations | Sort-Object { $_.Seconds } -Descending | Select-Object -First 10
+            if ($top10.Count -gt 0) {
+              [void]$sb.AppendLine("")
+              [void]$sb.AppendLine("### 🐢 Top 10 Slowest")
+              [void]$sb.AppendLine("")
+              [void]$sb.AppendLine("| Test | Duration |")
+              [void]$sb.AppendLine("|------|----------|")
+              foreach ($t in $top10) {
+                $durStr = "{0:F1}s" -f $t.Seconds
+                [void]$sb.AppendLine("| $($t.Name) | $durStr |")
+              }
+            }
+            [void]$sb.AppendLine("")
+            $sb.ToString() >> $env:GITHUB_STEP_SUMMARY
+          }
+
+          # Generate per-category summaries
+          if (Test-Path "results/standalone") {
+            Write-CategorySummary "Garnet Standalone" "results/standalone"
+          }
+          if (Test-Path "results/cluster") {
+            Write-CategorySummary "Garnet Cluster" "results/cluster"
+          }
+          if (Test-Path "results/tsavorite") {
+            Write-CategorySummary "Tsavorite" "results/tsavorite"
+          }
+
+  pipeline-success:
+    name: Garnet CI (Complete)
+    runs-on: ubuntu-latest
+    needs: [changes, format-garnet, format-tsavorite, build-garnet, test-garnet-standalone, test-garnet-cluster, build-tsavorite, test-tsavorite, build-website ]
+    steps:
+    - run: echo Done!
+    if: ${{ !(failure() || cancelled()) }}

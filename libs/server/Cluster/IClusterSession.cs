@@ -1,0 +1,160 @@
+﻿// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using Garnet.common;
+using Garnet.server.ACL;
+using Tsavorite.core;
+
+namespace Garnet.server
+{
+    /// <summary>
+    /// Cluster RESP session
+    /// </summary>
+    public interface IClusterSession
+    {
+        /// <summary>
+        /// If the current session is being used by a remote cluster node, the id that was last presented during a GOSSIP message.
+        /// </summary>
+        string RemoteNodeId { get; }
+
+        /// <summary>
+        /// Whether this connection may serve read-only commands from a replica
+        /// </summary>
+        bool ReadOnlySession { get; }
+
+        /// <summary>
+        /// Whether this internal session may apply writes while replaying the AOF
+        /// </summary>
+        bool IsInternalWriteSession { get; }
+
+        /// <summary>
+        /// Whether local application writes are paused for failover, including during demotion.
+        /// </summary>
+        bool IsWritePaused { get; }
+
+        /// <summary>
+        /// Waits outside the session epoch for an active primary failover pause to end.
+        /// Internal replay and requests already routed to a replica do not wait.
+        /// Callers must revalidate configuration-dependent admission after this wait.
+        /// </summary>
+        void WaitForWritesToResume();
+
+        /// <summary>
+        /// If the current session is part of an active replication stream (set on first APPENDLOG, including the init handshake).
+        /// </summary>
+        bool IsReplicating { get; }
+
+        /// <summary>
+        /// If set, commands can use this to enumerate details about the server or other sessions.
+        ///
+        /// It is not guaranteed to be set.
+        /// </summary>
+        IGarnetServer Server { get; set; }
+
+        /// <summary>
+        /// Allow this connection to serve read-only commands from a replica
+        /// </summary>
+        void SetReadOnlySession();
+
+        /// <summary>
+        /// Restore the default behavior of redirecting commands from a replica
+        /// </summary>
+        void SetReadWriteSession();
+
+        /// <summary>
+        /// Allow the internal AOF replay session to apply writes on a replica
+        /// </summary>
+        void SetInternalWriteSession();
+
+        /// <summary>
+        /// Local current epoch
+        /// </summary>
+        long LocalCurrentEpoch { get; }
+
+        /// <summary>
+        /// Acquire epoch
+        /// </summary>
+        void AcquireCurrentEpoch();
+
+        /// <summary>
+        /// Release epoch
+        /// </summary>
+        void ReleaseCurrentEpoch();
+
+        /// <summary>
+        /// Process cluster commands
+        /// </summary>
+        unsafe void ProcessClusterCommands(RespCommand command, VectorManager vectorManager, ref SessionParseState parseState, ref byte* dcurr, ref byte* dend);
+
+        /// <summary>
+        /// Reset cached slot verification result
+        /// </summary>
+        void ResetCachedSlotVerificationResult();
+
+        /// <summary>
+        /// Verification method that works iteratively by caching the verification result between calls.
+        /// NOTE: Caller must call ResetCachedSlotVerificationResult appropriately
+        /// </summary>
+        /// <param name="keySlice"></param>
+        /// <param name="readOnly"></param>
+        /// <param name="SessionAsking"></param>
+        /// <param name="waitForStableSlot"></param>
+        /// <returns></returns>
+        bool NetworkIterativeSlotVerify(PinnedSpanByte keySlice, bool readOnly, byte SessionAsking, bool waitForStableSlot);
+
+        /// <summary>
+        /// Write cached slot verification message to output
+        /// </summary>
+        /// <param name="output"></param>
+        public void WriteCachedSlotVerificationMessage(ref MemoryResult<byte> output);
+
+        /// <summary>
+        /// Array slot verify (write result to network)
+        /// </summary>
+        /// <param name="parseState"></param>
+        /// <param name="csvi"></param>
+        /// <param name="dcurr"></param>
+        /// <param name="dend"></param>
+        /// <param name="isTxn"></param>
+        /// <returns></returns>
+        unsafe bool NetworkMultiKeySlotVerify(ref SessionParseState parseState, ref ClusterSlotVerificationInput csvi, ref byte* dcurr, ref byte* dend, bool isTxn = false);
+
+        /// <summary>
+        /// Array slot verify with no response
+        /// </summary>
+        /// <param name="parseState"></param>
+        /// <param name="csvi"></param>
+        /// <param name="dcurr"></param>
+        /// <param name="dend"></param>
+        /// <param name="isTxn"></param>
+        /// <returns></returns>
+        unsafe bool NetworkMultiKeySlotVerifyNoResponse(ref SessionParseState parseState, ref ClusterSlotVerificationInput csvi, ref byte* dcurr, ref byte* dend, bool isTxn = false);
+
+        /// <summary>
+        /// Sets the <see cref="UserHandle"/> currently authenticated in this session (used for permission checks)
+        /// </summary>
+        void SetUserHandle(UserHandle userHandle);
+
+        /// <summary>
+        /// NOTE: Unsafe! DO NOT USE, other than benchmarking
+        /// </summary>
+        /// <param name="replicaOf"></param>
+        void UnsafeSetConfig(string replicaOf);
+
+        /// <summary>
+        /// Dispose
+        /// </summary>
+        void Dispose();
+
+        /// <summary>
+        /// NOTE: Used for micro-benchmark
+        /// </summary>
+        /// <param name="physicalSublogIdx"></param>
+        /// <param name="record"></param>
+        /// <param name="recordLength"></param>
+        /// <param name="previousAddress"></param>
+        /// <param name="currentAddress"></param>
+        /// <param name="nextAddress"></param>
+        unsafe void ProcessPrimaryStream(int physicalSublogIdx, byte* record, int recordLength, long previousAddress, long currentAddress, long nextAddress);
+    }
+}

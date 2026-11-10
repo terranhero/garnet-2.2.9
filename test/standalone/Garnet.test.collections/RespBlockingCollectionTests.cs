@@ -1,0 +1,1862 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Threading;
+using System.Threading.Tasks;
+using Garnet.server;
+using NUnit.Framework;
+using NUnit.Framework.Legacy;
+using StackExchange.Redis;
+
+namespace Garnet.test
+{
+    [TestFixture]
+    public class RespBlockingCollectionTests : TestBase
+    {
+        GarnetServer server;
+        private static readonly Random random = Random.Shared;
+
+        [SetUp]
+        public void Setup()
+        {
+            TestUtils.DeleteDirectory(TestUtils.MethodTestDir, wait: true);
+            server = TestUtils.CreateGarnetServer(TestUtils.MethodTestDir, lowMemory: true);
+            server.Start();
+        }
+
+        [TearDown]
+        public void TearDown()
+        {
+            server.Dispose();
+            TestUtils.OnTearDown();
+        }
+
+        [Test]
+        [TestCase("BRPOP")]
+        [TestCase("BLPOP")]
+        public void BasicListBlockingPopTest(string blockingCmd)
+        {
+            var key = "mykey";
+            var value = "myval";
+            var key2 = "mykey2";
+            var value2 = "myval2";
+
+            using var lightClientRequest = TestUtils.CreateRequest();
+            var response = lightClientRequest.SendCommand($"LPUSH {key} {value}");
+            var expectedResponse = ":1\r\n";
+            TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+
+            response = lightClientRequest.SendCommand($"{blockingCmd} {key} 10", 3);
+            expectedResponse = $"*2\r\n${key.Length}\r\n{key}\r\n${value.Length}\r\n{value}\r\n";
+            TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+
+            var blockingTask = Task.Run(() =>
+            {
+                using var lcr = TestUtils.CreateRequest();
+                var btResponse = lcr.SendCommand($"{blockingCmd} {key2} 30", 3);
+                var btExpectedResponse = $"*2\r\n${key2.Length}\r\n{key2}\r\n${value2.Length}\r\n{value2}\r\n";
+                TestUtils.AssertEqualUpToExpectedLength(btExpectedResponse, btResponse);
+            });
+
+            var releasingTask = Task.Run(() =>
+            {
+                using var lcr = TestUtils.CreateRequest();
+                Task.Delay(TimeSpan.FromSeconds(2)).Wait();
+                return lcr.SendCommand($"LPUSH {key2} {value2}");
+            });
+
+            var timeout = TimeSpan.FromSeconds(5);
+            try
+            {
+                Task.WaitAll([blockingTask, releasingTask], timeout);
+            }
+            catch (AggregateException)
+            {
+                Assert.Fail();
+            }
+
+            ClassicAssert.IsTrue(blockingTask.IsCompletedSuccessfully);
+            ClassicAssert.IsTrue(releasingTask.IsCompletedSuccessfully);
+        }
+
+        [Test]
+        [TestCase("BLPOP")]
+        [TestCase("BRPOP")]
+        [TestCase("BZPOPMIN")]
+        [TestCase("BZPOPMAX")]
+        public void BlockingPopRejectsNaNTimeout(string blockingCmd)
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+
+            var ex = Assert.Throws<RedisServerException>(() => db.Execute(blockingCmd, "mykey", "nan"));
+            ClassicAssert.AreEqual(Encoding.ASCII.GetString(CmdStrings.RESP_ERR_TIMEOUT_NOT_VALID_FLOAT), ex.Message);
+
+            // The session survives the rejected command
+            ClassicAssert.AreEqual("PONG", (string)db.Execute("PING"));
+        }
+        [TestCase("BRPOP", "LPUSH", 10)]
+        [TestCase("BLPOP", "RPUSH", 0)]
+        [TestCase("BLPOP", "RPUSH", 10)]
+        public void MultiListBlockingPopTest(string blockingCmd, string pushCmd, double timeout)
+        {
+            var key = "mykey";
+
+            var keyCount = 64;
+
+            using var lightClientRequest = TestUtils.CreateRequest();
+
+            var cts = new CancellationTokenSource(TimeSpan.FromSeconds(60));
+
+            var blockingTask = Task.Run(async () =>
+            {
+                for (var i = 0; i < keyCount; i++)
+                {
+                    using var lcr = TestUtils.CreateRequest();
+                    var btResponse = lcr.SendCommand($"{blockingCmd} {key} {timeout}", 3);
+                    var value = $"value{i}";
+                    var btExpectedResponse = $"*2\r\n${key.Length}\r\n{key}\r\n${value.Length}\r\n{value}\r\n";
+                    TestUtils.AssertEqualUpToExpectedLength(btExpectedResponse, btResponse);
+                    await Task.Delay(TimeSpan.FromMilliseconds(random.NextInt64(20, 100)), cts.Token).ConfigureAwait(false);
+                }
+            }, cts.Token);
+
+            var releasingTask = Task.Run(async () =>
+            {
+                for (var i = 0; i < keyCount; i++)
+                {
+                    using var lcr = TestUtils.CreateRequest();
+                    var value = $"value{i}";
+                    lcr.SendCommand($"{pushCmd} {key} {value}");
+                    await Task.Delay(TimeSpan.FromMilliseconds(random.NextInt64(20, 100)), cts.Token).ConfigureAwait(false);
+                }
+            }, cts.Token);
+
+            // Wait for all tasks to finish
+            if (!Task.WhenAll(blockingTask, releasingTask).Wait(TimeSpan.FromSeconds(60), cts.Token))
+                Assert.Fail("Items not retrieved in allotted time.");
+        }
+
+        [Test]
+        public void BasicBlockingListMoveTest()
+        {
+            var srcKey1 = "mykey_src";
+            var dstKey1 = "mykey_dst";
+            var value1 = "myval";
+            var srcKey2 = "mykey2_src";
+            var dstKey2 = "mykey2_dst";
+            var value2 = "myval2";
+
+            using var lightClientRequest = TestUtils.CreateRequest();
+
+            var response = lightClientRequest.SendCommand($"LPUSH {srcKey1} {value1}");
+            var expectedResponse = ":1\r\n";
+            TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+
+            response = lightClientRequest.SendCommand($"BLMOVE {srcKey1} {dstKey1} {OperationDirection.Right} {OperationDirection.Left} 10");
+            expectedResponse = $"${value1.Length}\r\n{value1}\r\n";
+            TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+
+            response = lightClientRequest.SendCommand($"LRANGE {srcKey1} 0 -1");
+            expectedResponse = $"*0\r\n";
+            TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+
+            response = lightClientRequest.SendCommand($"LRANGE {dstKey1} 0 -1", 2);
+            expectedResponse = $"*1\r\n${value1.Length}\r\n{value1}\r\n";
+            TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+
+            var blockingTask = Task.Run(() =>
+            {
+                using var lcr = TestUtils.CreateRequest();
+                var btResponse = lcr.SendCommand($"BLMOVE {srcKey2} {dstKey2} {OperationDirection.Left} {OperationDirection.Right} 0");
+                var btExpectedResponse = $"${value2.Length}\r\n{value2}\r\n";
+                TestUtils.AssertEqualUpToExpectedLength(btExpectedResponse, btResponse);
+            });
+
+            var releasingTask = Task.Run(() =>
+            {
+                using var lcr = TestUtils.CreateRequest();
+                Task.Delay(TimeSpan.FromSeconds(2)).Wait();
+                return lcr.SendCommand($"LPUSH {srcKey2} {value2}");
+            });
+
+            var timeout = TimeSpan.FromSeconds(5);
+            try
+            {
+                Task.WaitAll([blockingTask, releasingTask], timeout);
+            }
+            catch (AggregateException)
+            {
+                Assert.Fail();
+            }
+
+            ClassicAssert.IsTrue(blockingTask.IsCompletedSuccessfully);
+            ClassicAssert.IsTrue(releasingTask.IsCompletedSuccessfully);
+
+            response = lightClientRequest.SendCommand($"LRANGE {srcKey2} 0 -1");
+            expectedResponse = $"*0\r\n";
+            TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+
+            response = lightClientRequest.SendCommand($"LRANGE {dstKey2} 0 -1", 2);
+            expectedResponse = $"*1\r\n${value2.Length}\r\n{value2}\r\n";
+            TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+        }
+
+        [Test]
+        [TestCase("BRPOP")]
+        [TestCase("BLPOP")]
+        public void ListBlockingPopOrderTest(string blockingCmd)
+        {
+            var keys = new[] { "key1", "key2", "key3", "key4", "key5" };
+            var values = new[] { "value1", "value2", "value3", "value4", "value5" };
+
+            byte[] response;
+            string expectedResponse;
+
+            using var lightClientRequest = TestUtils.CreateRequest();
+            for (var i = 0; i < keys.Length; i++)
+            {
+                response = lightClientRequest.SendCommand($"LPUSH {keys[i]} {values[i]}");
+                expectedResponse = ":1\r\n";
+                TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+            }
+
+            for (var i = 0; i < keys.Length; i++)
+            {
+                response = lightClientRequest.SendCommand($"{blockingCmd} {string.Join(' ', keys)} 10", 3);
+                expectedResponse = $"*2\r\n${keys[i].Length}\r\n{keys[i]}\r\n${values[i].Length}\r\n{values[i]}\r\n";
+                TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+            }
+        }
+
+        [Test]
+        [TestCase("BRPOP", GarnetObjectType.Set)]
+        [TestCase("BRPOP", GarnetObjectType.SortedSet)]
+        [TestCase("BLPOP", GarnetObjectType.Set)]
+        [TestCase("BLPOP", GarnetObjectType.SortedSet)]
+        public void BlockingListPopWrongTypeTests(string blockingCmd, GarnetObjectType wrongObjectType)
+        {
+            var keys = new[] { "key1", "key2", "key3" };
+            var values = new[]
+            {
+                [new RedisValue("key1:v1")],
+                [new RedisValue("key2:v1")],
+                new[] { new RedisValue("key3:v1") }
+            };
+
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+
+            // First key right type, second key wrong type - succeed
+            var result = db.ListLeftPush(keys[0], values[0]);
+            ClassicAssert.AreEqual(values[0].Length, result);
+
+            result = wrongObjectType switch
+            {
+                GarnetObjectType.Set => db.SetAdd(keys[1], values[1]),
+                GarnetObjectType.SortedSet => db.SortedSetAdd(keys[1],
+                    values[1].Select(v => new SortedSetEntry(v, 1)).ToArray()),
+                _ => -1,
+            };
+            ClassicAssert.AreEqual(values[1].Length, result);
+
+            var popResult = db.Execute(blockingCmd, keys[0], keys[1], keys[2], 0);
+            ClassicAssert.AreEqual(2, popResult.Length);
+            ClassicAssert.AreEqual(keys[0], popResult[0].ToString());
+            ClassicAssert.AreEqual(values[0][0], popResult[1].ToString());
+
+            // First key empty, second key wrong type - fail immediately.
+            // Popping the last element already removed the key, matching the non-blocking commands.
+            ClassicAssert.IsFalse(db.KeyExists(keys[0]));
+            ClassicAssert.IsFalse(db.KeyDelete(keys[0]));
+
+            var ex = Assert.Throws<RedisServerException>(() => db.Execute(blockingCmd, keys[0], keys[1], keys[2], 0));
+            var expectedMessage = Encoding.ASCII.GetString(CmdStrings.RESP_ERR_WRONG_TYPE);
+            ClassicAssert.IsNotNull(ex);
+            ClassicAssert.AreEqual(expectedMessage, ex.Message);
+
+            // All keys empty, second key gets wrong type then right type - succeed
+            var delResult = db.KeyDelete(keys[1]);
+            ClassicAssert.IsTrue(delResult);
+
+            var blockingTask = Task.Run(() =>
+            {
+                using var lcr = TestUtils.CreateRequest();
+                var btResponse = lcr.SendCommand($"{blockingCmd} {keys[0]} {keys[1]} {keys[2]} 0", 3);
+                var btExpectedResponse = $"*2\r\n${keys[2].Length}\r\n{keys[2]}\r\n${values[2][0].ToString().Length}\r\n{values[2][0]}\r\n";
+                TestUtils.AssertEqualUpToExpectedLength(btExpectedResponse, btResponse);
+            });
+
+            var releasingTask = Task.Run(() =>
+            {
+                Task.Delay(TimeSpan.FromSeconds(2)).Wait();
+                result = wrongObjectType switch
+                {
+                    GarnetObjectType.Set => db.SetAdd(keys[2], values[2]),
+                    GarnetObjectType.SortedSet => db.SortedSetAdd(keys[2],
+                        values[2].Select(v => new SortedSetEntry(v, 1)).ToArray()),
+                    _ => -1,
+                };
+                ClassicAssert.AreEqual(values[2].Length, result);
+
+                var setPopCount = wrongObjectType switch
+                {
+                    GarnetObjectType.Set => db.SetPop(keys[2], 2).Length,
+                    GarnetObjectType.SortedSet => db.SortedSetPop(keys[2], 2).Length,
+                    _ => -1,
+                };
+                ClassicAssert.AreEqual(values[2].Length, setPopCount);
+
+                result = db.ListLeftPush(keys[2], values[2]);
+                ClassicAssert.AreEqual(values[2].Length, result);
+            });
+
+            var timeout = TimeSpan.FromSeconds(5);
+            try
+            {
+                Task.WaitAll([blockingTask, releasingTask], timeout);
+            }
+            catch (AggregateException)
+            {
+                Assert.Fail();
+            }
+
+            ClassicAssert.IsTrue(blockingTask.IsCompletedSuccessfully);
+            ClassicAssert.IsTrue(releasingTask.IsCompletedSuccessfully);
+        }
+
+        [Test]
+        [TestCase("BZPOPMIN", GarnetObjectType.Set)]
+        [TestCase("BZPOPMIN", GarnetObjectType.List)]
+        [TestCase("BZPOPMAX", GarnetObjectType.Set)]
+        [TestCase("BZPOPMAX", GarnetObjectType.List)]
+        public void BlockingSortedSetPopWrongTypeTests(string blockingCmd, GarnetObjectType wrongObjectType)
+        {
+            var keys = new[] { "key1", "key2", "key3" };
+            var values = new[]
+            {
+                [new SortedSetEntry("key1:v1", 1)],
+                [new SortedSetEntry("key2:v1", 2)],
+                new[] { new SortedSetEntry("key3:v1", 3) }
+            };
+
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+
+            // First key right type, second key wrong type - succeed
+            var result = db.SortedSetAdd(keys[0], values[0]);
+            ClassicAssert.AreEqual(values[0].Length, result);
+
+            result = wrongObjectType switch
+            {
+                GarnetObjectType.Set => db.SetAdd(keys[1], values[1].Select(v => v.Element).ToArray()),
+                GarnetObjectType.List => db.ListLeftPush(keys[1], values[1].Select(v => v.Element).ToArray()),
+                _ => -1,
+            };
+            ClassicAssert.AreEqual(values[1].Length, result);
+
+            var popResult = db.Execute(blockingCmd, keys[0], keys[1], keys[2], 0);
+            ClassicAssert.AreEqual(3, popResult.Length);
+            ClassicAssert.AreEqual(keys[0], popResult[0].ToString());
+            ClassicAssert.AreEqual(values[0][0].Element, popResult[1].ToString());
+            ClassicAssert.AreEqual(values[0][0].Score.ToString(), popResult[2].ToString());
+
+            // First key empty, second key wrong type - fail immediately.
+            // Popping the last element already removed the key, matching the non-blocking commands.
+            ClassicAssert.IsFalse(db.KeyExists(keys[0]));
+            ClassicAssert.IsFalse(db.KeyDelete(keys[0]));
+
+            var ex = Assert.Throws<RedisServerException>(() => db.Execute(blockingCmd, keys[0], keys[1], keys[2], 0));
+            var expectedMessage = Encoding.ASCII.GetString(CmdStrings.RESP_ERR_WRONG_TYPE);
+            ClassicAssert.IsNotNull(ex);
+            ClassicAssert.AreEqual(expectedMessage, ex.Message);
+
+            // All keys empty, second key gets wrong type then right type - succeed
+            var delResult = db.KeyDelete(keys[1]);
+            ClassicAssert.IsTrue(delResult);
+
+            var blockingTask = Task.Run(() =>
+            {
+                using var lcr = TestUtils.CreateRequest();
+                var btResponse = lcr.SendCommand($"{blockingCmd} {keys[0]} {keys[1]} {keys[2]} 0", 4);
+                var btExpectedResponse = $"*3\r\n${keys[2].Length}\r\n{keys[2]}\r\n${values[2][0].Element.ToString().Length}\r\n{values[2][0].Element}\r\n${values[2][0].Score.ToString().Length}\r\n{values[2][0].Score}\r\n";
+                TestUtils.AssertEqualUpToExpectedLength(btExpectedResponse, btResponse);
+            });
+
+            var releasingTask = Task.Run(() =>
+            {
+                Task.Delay(TimeSpan.FromSeconds(2)).Wait();
+                result = wrongObjectType switch
+                {
+                    GarnetObjectType.Set => db.SetAdd(keys[2], values[2].Select(v => v.Element).ToArray()),
+                    GarnetObjectType.List => db.ListLeftPush(keys[2], values[2].Select(v => v.Element).ToArray()),
+                    _ => -1,
+                };
+                ClassicAssert.AreEqual(values[2].Length, result);
+
+                var setPopCount = wrongObjectType switch
+                {
+                    GarnetObjectType.Set => db.SetPop(keys[2], 2).Length,
+                    GarnetObjectType.List => db.ListLeftPop(keys[2], 2).Length,
+                    _ => -1,
+                };
+                ClassicAssert.AreEqual(values[2].Length, setPopCount);
+
+                result = db.SortedSetAdd(keys[2], values[2]);
+                ClassicAssert.AreEqual(values[2].Length, result);
+            });
+
+            var timeout = TimeSpan.FromSeconds(5);
+            try
+            {
+                Task.WaitAll([blockingTask, releasingTask], timeout);
+            }
+            catch (AggregateException)
+            {
+                Assert.Fail();
+            }
+
+            ClassicAssert.IsTrue(blockingTask.IsCompletedSuccessfully);
+            ClassicAssert.IsTrue(releasingTask.IsCompletedSuccessfully);
+        }
+
+        [Test]
+        [TestCase(GarnetObjectType.Set)]
+        [TestCase(GarnetObjectType.SortedSet)]
+        public void BlockingListMultiPopWrongTypeTest(GarnetObjectType wrongObjectType)
+        {
+            var keys = new[] { "key1", "key2", "key3" };
+            var values = new[]
+            {
+                [new RedisValue("key1:v1")],
+                [new RedisValue("key2:v1"), new RedisValue("key2:v2")],
+                new[] { new RedisValue("key3:v1"), new RedisValue("key3:v2") }
+            };
+
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+
+            // First key right type, second key wrong type - succeed
+            var result = db.ListLeftPush(keys[0], values[0]);
+            ClassicAssert.AreEqual(values[0].Length, result);
+
+            result = wrongObjectType switch
+            {
+                GarnetObjectType.Set => db.SetAdd(keys[1], values[1]),
+                GarnetObjectType.SortedSet => db.SortedSetAdd(keys[1],
+                    values[1].Select(v => new SortedSetEntry(v, 1)).ToArray()),
+                _ => -1,
+            };
+            ClassicAssert.AreEqual(values[1].Length, result);
+
+            var popResult = db.Execute("BLMPOP", 0, 3, keys[0], keys[1], keys[2], "RIGHT", "COUNT", 2);
+            ClassicAssert.AreEqual(2, popResult.Length);
+            ClassicAssert.AreEqual(keys[0], popResult[0].ToString());
+            ClassicAssert.AreEqual(1, popResult[1].Length);
+            ClassicAssert.AreEqual(values[0][0], popResult[1][0].ToString());
+
+            // First key empty, second key wrong type - fail immediately.
+            // Popping the last element already removed the key, matching the non-blocking commands.
+            ClassicAssert.IsFalse(db.KeyExists(keys[0]));
+            ClassicAssert.IsFalse(db.KeyDelete(keys[0]));
+
+            var ex = Assert.Throws<RedisServerException>(() => db.Execute("BLMPOP", 0, 3, keys[0], keys[1], keys[2], "RIGHT", "COUNT", 2));
+            var expectedMessage = Encoding.ASCII.GetString(CmdStrings.RESP_ERR_WRONG_TYPE);
+            ClassicAssert.IsNotNull(ex);
+            ClassicAssert.AreEqual(expectedMessage, ex.Message);
+
+            // All keys empty, second key gets wrong type then right type - succeed
+            var delResult = db.KeyDelete(keys[1]);
+            ClassicAssert.IsTrue(delResult);
+
+            var blockingTask = Task.Run(() =>
+            {
+                using var lcr = TestUtils.CreateRequest();
+                var btResponse = lcr.SendCommand($"BLMPOP 0 3 {keys[0]} {keys[1]} {keys[2]} RIGHT COUNT 2", 3);
+                var btExpectedResponse = $"*2\r\n${keys[2].Length}\r\n{keys[2]}\r\n*2\r\n${values[2][0].ToString().Length}\r\n{values[2][0]}\r\n${values[2][1].ToString().Length}\r\n{values[2][1]}\r\n";
+                TestUtils.AssertEqualUpToExpectedLength(btExpectedResponse, btResponse);
+            });
+
+            var releasingTask = Task.Run(() =>
+            {
+                Task.Delay(TimeSpan.FromSeconds(2)).Wait();
+                result = wrongObjectType switch
+                {
+                    GarnetObjectType.Set => db.SetAdd(keys[2], values[2]),
+                    GarnetObjectType.SortedSet => db.SortedSetAdd(keys[2],
+                        values[2].Select(v => new SortedSetEntry(v, 1)).ToArray()),
+                    _ => -1,
+                };
+                ClassicAssert.AreEqual(values[2].Length, result);
+
+                var setPopCount = wrongObjectType switch
+                {
+                    GarnetObjectType.Set => db.SetPop(keys[2], 2).Length,
+                    GarnetObjectType.SortedSet => db.SortedSetPop(keys[2], 2).Length,
+                    _ => -1,
+                };
+                ClassicAssert.AreEqual(values[2].Length, setPopCount);
+
+                result = db.ListLeftPush(keys[2], values[2]);
+                ClassicAssert.AreEqual(values[2].Length, result);
+            });
+
+            var timeout = TimeSpan.FromSeconds(5);
+            try
+            {
+                Task.WaitAll([blockingTask, releasingTask], timeout);
+            }
+            catch (AggregateException)
+            {
+                Assert.Fail();
+            }
+
+            ClassicAssert.IsTrue(blockingTask.IsCompletedSuccessfully);
+            ClassicAssert.IsTrue(releasingTask.IsCompletedSuccessfully);
+        }
+
+        [Test]
+        [TestCase(GarnetObjectType.Set)]
+        [TestCase(GarnetObjectType.List)]
+        public void BlockingSortedSetMultiPopWrongTypeTest(GarnetObjectType wrongObjectType)
+        {
+            var keys = new[] { "key1", "key2", "key3" };
+            var values = new[]
+            {
+                [new SortedSetEntry("key1:v1", 1)],
+                [new SortedSetEntry("key2:v1", 2)],
+                new[] { new SortedSetEntry("key3:v1", 3) }
+            };
+
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+
+            // First key right type, second key wrong type - succeed
+            var result = db.SortedSetAdd(keys[0], values[0]);
+            ClassicAssert.AreEqual(values[0].Length, result);
+
+            result = wrongObjectType switch
+            {
+                GarnetObjectType.Set => db.SetAdd(keys[1], values[1].Select(v => v.Element).ToArray()),
+                GarnetObjectType.List => db.ListLeftPush(keys[1], values[1].Select(v => v.Element).ToArray()),
+                _ => -1,
+            };
+            ClassicAssert.AreEqual(values[1].Length, result);
+
+            var popResult = db.Execute("BZMPOP", 0, 3, keys[0], keys[1], keys[2], "MAX", "COUNT", 2);
+            ClassicAssert.AreEqual(2, popResult.Length);
+            ClassicAssert.AreEqual(keys[0], popResult[0].ToString());
+            ClassicAssert.AreEqual(1, popResult[1].Length);
+            ClassicAssert.AreEqual(2, popResult[1][0].Length);
+            ClassicAssert.AreEqual(values[0][0].Element, popResult[1][0][0].ToString());
+            ClassicAssert.AreEqual(values[0][0].Score.ToString(), popResult[1][0][1].ToString());
+
+            // First key empty, second key wrong type - fail immediately.
+            // Popping the last element already removed the key, matching the non-blocking commands.
+            ClassicAssert.IsFalse(db.KeyExists(keys[0]));
+            ClassicAssert.IsFalse(db.KeyDelete(keys[0]));
+
+            var ex = Assert.Throws<RedisServerException>(() => db.Execute("BZMPOP", 0, 3, keys[0], keys[1], keys[2], "MAX", "COUNT", 2));
+            var expectedMessage = Encoding.ASCII.GetString(CmdStrings.RESP_ERR_WRONG_TYPE);
+            ClassicAssert.IsNotNull(ex);
+            ClassicAssert.AreEqual(expectedMessage, ex.Message);
+
+            // All keys empty, second key gets wrong type then right type - succeed
+            var delResult = db.KeyDelete(keys[1]);
+            ClassicAssert.IsTrue(delResult);
+
+            var blockingTask = Task.Run(() =>
+            {
+                using var lcr = TestUtils.CreateRequest();
+                var btResponse = lcr.SendCommand($"BZMPOP 0 3 {keys[0]} {keys[1]} {keys[2]} MAX COUNT 2", 2);
+                var btExpectedResponse = $"*2\r\n${keys[2].Length}\r\n{keys[2]}\r\n*1\r\n*2\r\n${values[2][0].Element.ToString().Length}\r\n{values[2][0].Element}\r\n${values[2][0].Score.ToString().Length}\r\n{values[2][0].Score}\r\n";
+                TestUtils.AssertEqualUpToExpectedLength(btExpectedResponse, btResponse);
+            });
+
+            var releasingTask = Task.Run(() =>
+            {
+                Task.Delay(TimeSpan.FromSeconds(2)).Wait();
+                result = wrongObjectType switch
+                {
+                    GarnetObjectType.Set => db.SetAdd(keys[2], values[2].Select(v => v.Element).ToArray()),
+                    GarnetObjectType.List => db.ListLeftPush(keys[2], values[2].Select(v => v.Element).ToArray()),
+                    _ => -1,
+                };
+                ClassicAssert.AreEqual(values[2].Length, result);
+
+                var setPopCount = wrongObjectType switch
+                {
+                    GarnetObjectType.Set => db.SetPop(keys[2], 2).Length,
+                    GarnetObjectType.List => db.ListLeftPop(keys[2], 2).Length,
+                    _ => -1,
+                };
+                ClassicAssert.AreEqual(values[2].Length, setPopCount);
+
+                result = db.SortedSetAdd(keys[2], values[2]);
+                ClassicAssert.AreEqual(values[2].Length, result);
+            });
+
+            var timeout = TimeSpan.FromSeconds(5);
+            try
+            {
+                Task.WaitAll([blockingTask, releasingTask], timeout);
+            }
+            catch (AggregateException)
+            {
+                Assert.Fail();
+            }
+
+            ClassicAssert.IsTrue(blockingTask.IsCompletedSuccessfully);
+            ClassicAssert.IsTrue(releasingTask.IsCompletedSuccessfully);
+        }
+
+        [Test]
+        [TestCase(GarnetObjectType.Set)]
+        [TestCase(GarnetObjectType.SortedSet)]
+        public void BlockingListMoveWrongTypeTest(GarnetObjectType wrongObjectType)
+        {
+            var srcKey = "srcKey";
+            var dstKey = "dstKey";
+            var srcValues = new[] { new RedisValue("srcKey:v1"), new RedisValue("srcKey:v2") };
+            var dstValues = new[] { new RedisValue("dstKey:v1") };
+
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+
+            // Source key right type, dest key wrong type - fail immediately
+            var result = db.ListLeftPush(srcKey, srcValues);
+            ClassicAssert.AreEqual(srcValues.Length, result);
+
+            result = wrongObjectType switch
+            {
+                GarnetObjectType.Set => db.SetAdd(dstKey, dstValues),
+                GarnetObjectType.SortedSet => db.SortedSetAdd(dstKey,
+                    dstValues.Select(v => new SortedSetEntry(v, 1)).ToArray()),
+                _ => -1,
+            };
+            ClassicAssert.AreEqual(dstValues.Length, result);
+
+            var ex = Assert.Throws<RedisServerException>(() => db.Execute("BLMOVE", srcKey, dstKey, "RIGHT", "LEFT", 0));
+            var expectedMessage = Encoding.ASCII.GetString(CmdStrings.RESP_ERR_WRONG_TYPE);
+            ClassicAssert.IsNotNull(ex);
+            ClassicAssert.AreEqual(expectedMessage, ex.Message);
+
+            // Source key empty, dest key empty - dest gets wrong type, fail once source gets an item
+            var delResult = db.KeyDelete(srcKey);
+            ClassicAssert.IsTrue(delResult);
+            delResult = db.KeyDelete(dstKey);
+            ClassicAssert.IsTrue(delResult);
+
+            var blockingTask = Task.Run(() =>
+            {
+                using var lcr = TestUtils.CreateRequest();
+                var btResponse = lcr.SendCommand($"BLMOVE {srcKey} {dstKey} RIGHT LEFT 0");
+                var btExpectedResponse = $"-{Encoding.ASCII.GetString(CmdStrings.RESP_ERR_WRONG_TYPE)}\r\n";
+                TestUtils.AssertEqualUpToExpectedLength(btExpectedResponse, btResponse);
+            });
+
+            var releasingTask = Task.Run(() =>
+            {
+                Task.Delay(TimeSpan.FromSeconds(2)).Wait();
+                result = wrongObjectType switch
+                {
+                    GarnetObjectType.Set => db.SetAdd(dstKey, dstValues),
+                    GarnetObjectType.SortedSet => db.SortedSetAdd(dstKey,
+                        dstValues.Select(v => new SortedSetEntry(v, 1)).ToArray()),
+                    _ => -1,
+                };
+                ClassicAssert.AreEqual(dstValues.Length, result);
+
+                result = db.ListLeftPush(srcKey, srcValues);
+                ClassicAssert.AreEqual(srcValues.Length, result);
+            });
+
+            var timeout = TimeSpan.FromSeconds(5);
+            try
+            {
+                Task.WaitAll([blockingTask, releasingTask], timeout);
+            }
+            catch (AggregateException)
+            {
+                Assert.Fail();
+            }
+
+            ClassicAssert.IsTrue(blockingTask.IsCompletedSuccessfully);
+            ClassicAssert.IsTrue(releasingTask.IsCompletedSuccessfully);
+
+            // Source key empty, dst key right type, src key gets wrong type then right type - succeed
+            delResult = db.KeyDelete(srcKey);
+            ClassicAssert.IsTrue(delResult);
+            delResult = db.KeyDelete(dstKey);
+            ClassicAssert.IsTrue(delResult);
+
+            result = db.ListLeftPush(dstKey, dstValues);
+            ClassicAssert.AreEqual(dstValues.Length, result);
+
+            blockingTask = Task.Run(() =>
+            {
+                using var lcr = TestUtils.CreateRequest();
+                var btResponse = lcr.SendCommand($"BLMOVE {srcKey} {dstKey} RIGHT LEFT 0");
+                var btExpectedResponse = $"${srcValues[0].ToString().Length}\r\n{srcValues[0]}\r\n";
+                TestUtils.AssertEqualUpToExpectedLength(btExpectedResponse, btResponse);
+            });
+
+            releasingTask = Task.Run(() =>
+            {
+                Task.Delay(TimeSpan.FromSeconds(2)).Wait();
+                result = wrongObjectType switch
+                {
+                    GarnetObjectType.Set => db.SetAdd(srcKey, srcValues),
+                    GarnetObjectType.SortedSet => db.SortedSetAdd(srcKey,
+                        srcValues.Select(v => new SortedSetEntry(v, 1)).ToArray()),
+                    _ => -1,
+                };
+                ClassicAssert.AreEqual(srcValues.Length, result);
+
+                var setPopCount = wrongObjectType switch
+                {
+                    GarnetObjectType.Set => db.SetPop(srcKey, 2).Length,
+                    GarnetObjectType.SortedSet => db.SortedSetPop(srcKey, 2).Length,
+                    _ => -1,
+                };
+                ClassicAssert.AreEqual(srcValues.Length, setPopCount);
+
+                result = db.ListLeftPush(srcKey, srcValues);
+                ClassicAssert.AreEqual(srcValues.Length, result);
+            });
+
+            try
+            {
+                Task.WaitAll([blockingTask, releasingTask], timeout);
+            }
+            catch (AggregateException)
+            {
+                Assert.Fail();
+            }
+
+            ClassicAssert.IsTrue(blockingTask.IsCompletedSuccessfully);
+            ClassicAssert.IsTrue(releasingTask.IsCompletedSuccessfully);
+        }
+
+        [Test]
+        [TestCase("BRPOP")]
+        [TestCase("BLPOP")]
+        public void BlockingClientEventsTests(string blockingCmd)
+        {
+            var key = "mykey";
+            var value1 = "myval";
+            var value2 = "myval2";
+
+            var blockingTask = Task.Run(() =>
+            {
+                using var lcr = TestUtils.CreateRequest();
+                var response = lcr.SendCommands($"{blockingCmd} {key} 30", $"LPUSH {key} {value1}", 3, 1);
+                var expectedResponse = $"*2\r\n${key.Length}\r\n{key}\r\n${value2.Length}\r\n{value2}\r\n:1\r\n";
+                TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+
+                response = lcr.SendCommand($"LLEN {key}");
+                expectedResponse = ":1\r\n";
+                TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+
+                response = lcr.SendCommand($"LPOP {key}");
+                expectedResponse = $"${value1.Length}\r\n{value1}\r\n";
+                TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+            });
+
+            var releasingTask = Task.Run(() =>
+            {
+                using var lcr = TestUtils.CreateRequest();
+                Task.Delay(TimeSpan.FromSeconds(2)).Wait();
+                return lcr.SendCommand($"LPUSH {key} {value2}");
+            });
+
+            var timeout = TimeSpan.FromSeconds(5);
+            try
+            {
+                Task.WaitAll([blockingTask, releasingTask], timeout);
+            }
+            catch (AggregateException)
+            {
+                Assert.Fail();
+            }
+
+            ClassicAssert.IsTrue(blockingTask.IsCompletedSuccessfully);
+            ClassicAssert.IsTrue(releasingTask.IsCompletedSuccessfully);
+        }
+
+        [Test]
+        public void BasicBlockingListPopPushTest()
+        {
+            var srcKey1 = "mykey_src";
+            var dstKey1 = "mykey_dst";
+            var value1 = "myval";
+            var srcKey2 = "mykey2_src";
+            var dstKey2 = "mykey2_dst";
+            var value2 = "myval2";
+
+            using var lightClientRequest = TestUtils.CreateRequest();
+
+            var response = lightClientRequest.SendCommand($"LPUSH {srcKey1} {value1}");
+            var expectedResponse = ":1\r\n";
+            TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+
+            response = lightClientRequest.SendCommand($"BRPOPLPUSH {srcKey1} {dstKey1} 10");
+            expectedResponse = $"${value1.Length}\r\n{value1}\r\n";
+            TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+
+            response = lightClientRequest.SendCommand($"LRANGE {srcKey1} 0 -1");
+            expectedResponse = $"*0\r\n";
+            TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+
+            response = lightClientRequest.SendCommand($"LRANGE {dstKey1} 0 -1", 2);
+            expectedResponse = $"*1\r\n${value1.Length}\r\n{value1}\r\n";
+            TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+
+            var blockingTask = Task.Run(() =>
+            {
+                using var lcr = TestUtils.CreateRequest();
+                var btResponse = lcr.SendCommand($"BRPOPLPUSH {srcKey2} {dstKey2} 0");
+                var btExpectedResponse = $"${value2.Length}\r\n{value2}\r\n";
+                TestUtils.AssertEqualUpToExpectedLength(btExpectedResponse, btResponse);
+            });
+
+            var releasingTask = Task.Run(() =>
+            {
+                using var lcr = TestUtils.CreateRequest();
+                Task.Delay(TimeSpan.FromSeconds(2)).Wait();
+                return lcr.SendCommand($"LPUSH {srcKey2} {value2}");
+            });
+
+            var timeout = TimeSpan.FromSeconds(5);
+            try
+            {
+                Task.WaitAll([blockingTask, releasingTask], timeout);
+            }
+            catch (AggregateException)
+            {
+                Assert.Fail();
+            }
+
+            ClassicAssert.IsTrue(blockingTask.IsCompletedSuccessfully);
+            ClassicAssert.IsTrue(releasingTask.IsCompletedSuccessfully);
+
+            response = lightClientRequest.SendCommand($"LRANGE {srcKey2} 0 -1");
+            expectedResponse = $"*0\r\n";
+            TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+
+            response = lightClientRequest.SendCommand($"LRANGE {dstKey2} 0 -1", 2);
+            expectedResponse = $"*1\r\n${value2.Length}\r\n{value2}\r\n";
+            TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+        }
+
+        [Test]
+        [TestCase(OperationDirection.Left, "value1", Description = "Pop from left")]
+        [TestCase(OperationDirection.Right, "value3", Description = "Pop from right")]
+        public void BasicBlmpopTest(OperationDirection direction, string expectedValue)
+        {
+            var key = "mykey";
+            using var lightClientRequest = TestUtils.CreateRequest();
+
+            lightClientRequest.SendCommand($"RPUSH {key} value1 value2 value3");
+            var response = lightClientRequest.SendCommand($"BLMPOP 1 1 {key} {direction}");
+            var expectedResponse = $"*2\r\n${key.Length}\r\n{key}\r\n*1\r\n${expectedValue.Length}\r\n{expectedValue}\r\n";
+            TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+        }
+
+        [Test]
+        [TestCase(1, "key1", "value1", Description = "First key has value")]
+        [TestCase(2, "key2", "value2", Description = "Second key has value")]
+        public void BlmpopMultipleKeysTest(int valueKeyIndex, string expectedKey, string expectedValue)
+        {
+            var keys = new[] { "key1", "key2", "key3" };
+            using var lightClientRequest = TestUtils.CreateRequest();
+
+            lightClientRequest.SendCommand($"RPUSH {keys[valueKeyIndex - 1]} {expectedValue}");
+            var response = lightClientRequest.SendCommand($"BLMPOP 1 {keys.Length} {string.Join(" ", keys)} LEFT");
+            var expectedResponse = $"*2\r\n${expectedKey.Length}\r\n{expectedKey}\r\n*1\r\n${expectedValue.Length}\r\n{expectedValue}\r\n";
+            TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+        }
+
+        [Test]
+        public void BlmpopTimeoutTest()
+        {
+            using var lightClientRequest = TestUtils.CreateRequest();
+            var response = lightClientRequest.SendCommand("BLMPOP 1 1 nonexistentkey LEFT");
+            var expectedResponse = "$-1\r\n";
+            TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+        }
+
+        [Test]
+        public void BlmpopBlockingBehaviorTest()
+        {
+            var key = "blockingkey";
+            var value = "testvalue";
+
+            var blockingTask = Task.Run(() =>
+            {
+                using var lcr = TestUtils.CreateRequest();
+                var response = lcr.SendCommand($"BLMPOP 30 1 {key} LEFT");
+                var expectedResponse = $"*2\r\n${key.Length}\r\n{key}\r\n*1\r\n${value.Length}\r\n{value}\r\n";
+                TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+            });
+
+            var pushingTask = Task.Run(() =>
+            {
+                using var lcr = TestUtils.CreateRequest();
+                Task.Delay(TimeSpan.FromSeconds(2)).Wait();
+                return lcr.SendCommand($"LPUSH {key} {value}");
+            });
+
+            Task.WaitAll([blockingTask, pushingTask], TimeSpan.FromSeconds(5));
+            ClassicAssert.IsTrue(blockingTask.IsCompletedSuccessfully);
+            ClassicAssert.IsTrue(pushingTask.IsCompletedSuccessfully);
+        }
+
+        [Test]
+        public void BlmpopBlockingWithCountTest()
+        {
+            var key = "countkey";
+            var values = new[] { "value1", "value2", "value3", "value4" };
+
+            var blockingTask = Task.Run(() =>
+            {
+                using var lcr = TestUtils.CreateRequest();
+                var response = lcr.SendCommand($"BLMPOP 30 1 {key} LEFT COUNT 3");
+                var expectedResponse = $"*2\r\n${key.Length}\r\n{key}\r\n*3\r\n$6\r\nvalue1\r\n$6\r\nvalue2\r\n$6\r\nvalue3\r\n";
+                TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+            });
+
+            var pushingTask = Task.Run(() =>
+            {
+                using var lcr = TestUtils.CreateRequest();
+                Task.Delay(TimeSpan.FromSeconds(2)).Wait();
+                return lcr.SendCommand($"RPUSH {key} {string.Join(" ", values)}");
+            });
+
+            Task.WaitAll([blockingTask, pushingTask], TimeSpan.FromSeconds(10));
+            ClassicAssert.IsTrue(blockingTask.IsCompletedSuccessfully);
+            ClassicAssert.IsTrue(pushingTask.IsCompletedSuccessfully);
+
+            // Pop the remaining item and verify that key does not exist after
+            using var lcr = TestUtils.CreateRequest();
+            var response = lcr.SendCommand($"BLMPOP 30 1 {key} LEFT COUNT 1");
+            var expectedResponse = $"*2\r\n${key.Length}\r\n{key}\r\n*1\r\n$6\r\nvalue4\r\n";
+            TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+
+            using var lightClientRequest = TestUtils.CreateRequest();
+            response = lightClientRequest.SendCommand($"EXISTS {key}");
+            expectedResponse = ":0\r\n";
+            TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+        }
+
+        [Test]
+        [TestCase("MIN", "value1", 1.5, Description = "Pop minimum score")]
+        [TestCase("MAX", "value3", 3.5, Description = "Pop maximum score")]
+        public void BasicBzmpopTest(string mode, string expectedValue, double expectedScore)
+        {
+            var key = "mykey";
+            using var lightClientRequest = TestUtils.CreateRequest();
+
+            lightClientRequest.SendCommand($"ZADD {key} 1.5 value1 2.5 value2 3.5 value3");
+            var response = lightClientRequest.SendCommand($"BZMPOP 1 1 {key} {mode}");
+            var expectedResponse = $"*2\r\n${key.Length}\r\n{key}\r\n*1\r\n*2\r\n${expectedValue.Length}\r\n{expectedValue}\r\n${expectedScore.ToString().Length}\r\n{expectedScore}\r\n";
+            TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+        }
+
+        [Test]
+        [TestCase("MIN", Description = "Pop minimum score with expired items")]
+        [TestCase("MAX", Description = "Pop maximum score with expired items")]
+        public async Task BasicBzmpopWithExpireItemsTest(string mode)
+        {
+            var key = "mykey";
+            using var lightClientRequest = TestUtils.CreateRequest();
+
+            lightClientRequest.SendCommand($"ZADD {key} 1.5 value1 2.5 value2 3.5 value3");
+            lightClientRequest.SendCommand($"ZPEXPIRE {key} 200 MEMBERS 3 value1 value2 value3");
+            await Task.Delay(300).ConfigureAwait(false);
+            using var lcr = TestUtils.CreateRequest();
+            var response = lcr.SendCommand($"BZMPOP 1 1 {key} {mode}");
+            var expectedResponse = "$-1\r\n";
+            var actualValue = Encoding.ASCII.GetString(response).Substring(0, expectedResponse.Length);
+            ClassicAssert.AreEqual(expectedResponse, actualValue);
+        }
+
+        [Test]
+        public void BzmpopReturnTest()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+
+            var res = db.SortedSetAdd("a", [new SortedSetEntry("one", 1)]);
+            ClassicAssert.AreEqual(1, res);
+            res = db.SortedSetAdd("a", [new SortedSetEntry("two", 2)]);
+            ClassicAssert.AreEqual(1, res);
+            res = db.SortedSetAdd("b", [new SortedSetEntry("three", 3)]);
+            ClassicAssert.AreEqual(1, res);
+            var pop = db.Execute("BZMPOP", "10", "2", "a", "b", "MIN", "COUNT", "2");
+            ClassicAssert.AreEqual(2, pop.Length);
+            ClassicAssert.AreEqual("a", pop[0].ToString());
+            ClassicAssert.AreEqual(2, pop[1].Length);
+            ClassicAssert.AreEqual(2, pop[1][0].Length);
+            ClassicAssert.AreEqual("one", pop[1][0][0].ToString());
+            ClassicAssert.AreEqual(1, (int)(RedisValue)pop[1][0][1]);
+            ClassicAssert.AreEqual(2, pop[1][1].Length);
+            ClassicAssert.AreEqual("two", pop[1][1][0].ToString());
+            ClassicAssert.AreEqual(2, (int)(RedisValue)pop[1][1][1]);
+        }
+
+        [Test]
+        [TestCase(1, "key1", "value1", 1.5, Description = "First key has minimum value")]
+        [TestCase(2, "key2", "value2", 2.5, Description = "Second key has minimum value")]
+        public void BzmpopMultipleKeysTest(int valueKeyIndex, string expectedKey, string expectedValue, double expectedScore)
+        {
+            var keys = new[] { "key1", "key2", "key3" };
+            using var lightClientRequest = TestUtils.CreateRequest();
+
+            lightClientRequest.SendCommand($"ZADD {keys[valueKeyIndex - 1]} {expectedScore} {expectedValue}");
+            var response = lightClientRequest.SendCommand($"BZMPOP 1 {keys.Length} {string.Join(" ", keys)} MIN");
+            var expectedResponse = $"*2\r\n${expectedKey.Length}\r\n{expectedKey}\r\n*1\r\n*2\r\n${expectedValue.Length}\r\n{expectedValue}\r\n${expectedScore.ToString().Length}\r\n{expectedScore}\r\n";
+            TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+        }
+
+        [Test]
+        public void BzmpopTimeoutTest()
+        {
+            using var lightClientRequest = TestUtils.CreateRequest();
+            var response = lightClientRequest.SendCommand("BZMPOP 1 1 nonexistentkey MIN");
+            var expectedResponse = "$-1\r\n";
+            TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+        }
+
+        [Test]
+        public void BzmpopBlockingBehaviorTest()
+        {
+            var key = "blockingzset";
+            var values = new[] { "value1", "value2", "value3" };
+            var scores = new[] { "0.5", "1.5", "2.5" };
+
+            var blockingTask = Task.Run(() =>
+            {
+                using var lcr = TestUtils.CreateRequest();
+                var response = lcr.SendCommand($"BZMPOP 30 1 {key} MIN COUNT 2", 2);
+                var expectedResponse = $"*2\r\n${key.Length}\r\n{key}\r\n*2\r\n{string.Join("\r\n", values.Take(2).Zip(scores.Take(2), (v, s) => $"*2\r\n${v.Length}\r\n{v}\r\n${s.Length}\r\n{s}"))}\r\n";
+                TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+            });
+
+            var pushingTask = Task.Run(() =>
+            {
+                using var lcr = TestUtils.CreateRequest();
+                Task.Delay(TimeSpan.FromSeconds(2)).Wait();
+                var result = lcr.SendCommand($"ZADD {key} {string.Join(' ', scores.Zip(values, (s, v) => $"{s} {v}"))}");
+                return result;
+            });
+
+            Task.WaitAll([blockingTask, pushingTask], TimeSpan.FromSeconds(10));
+            ClassicAssert.IsTrue(blockingTask.IsCompletedSuccessfully);
+            ClassicAssert.IsTrue(pushingTask.IsCompletedSuccessfully);
+
+            // Pop the remaining item and verify that key does not exist after
+            using var lcr = TestUtils.CreateRequest();
+            var response = lcr.SendCommand($"BZMPOP 30 1 {key} MIN COUNT 2");
+            var expectedResponse = $"*2\r\n${key.Length}\r\n{key}\r\n*1\r\n*2\r\n${values[2].Length}\r\n{values[2]}\r\n${scores[2].Length}\r\n{scores[2]}\r\n";
+            TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+
+            using var lightClientRequest = TestUtils.CreateRequest();
+            response = lightClientRequest.SendCommand($"EXISTS {key}");
+            expectedResponse = ":0\r\n";
+            TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+        }
+
+        [Test]
+        [TestCase("BZPOPMIN", "value1", 1.5, Description = "Pop minimum score")]
+        [TestCase("BZPOPMAX", "value3", 3.5, Description = "Pop maximum score")]
+        public void BasicBzpopMinMaxTest(string command, string expectedValue, double expectedScore)
+        {
+            var key = "zsettestkey";
+            using var lightClientRequest = TestUtils.CreateRequest();
+
+            lightClientRequest.SendCommand($"ZADD {key} 1.5 value1 2.5 value2 3.5 value3");
+            var response = lightClientRequest.SendCommand($"{command} {key} 1");
+            var expectedResponse = $"*3\r\n${key.Length}\r\n{key}\r\n${expectedValue.Length}\r\n{expectedValue}\r\n${expectedScore.ToString().Length}\r\n{expectedScore}\r\n";
+            TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+        }
+
+        [Test]
+        [TestCase("BZPOPMIN", Description = "Pop minimum score with expired items")]
+        [TestCase("BZPOPMAX", Description = "Pop maximum score with expired items")]
+        public async Task BasicBzpopMinMaxWithExpireItemsTest(string command)
+        {
+            var key = "zsettestkey";
+            using var lightClientRequest = TestUtils.CreateRequest();
+
+            lightClientRequest.SendCommand($"ZADD {key} 1.5 value1 2.5 value2 3.5 value3");
+            lightClientRequest.SendCommand($"ZPEXPIRE {key} 200 MEMBERS 3 value1 value2 value3");
+            await Task.Delay(300).ConfigureAwait(false);
+            using var lcr = TestUtils.CreateRequest();
+            var response = lcr.SendCommand($"{command} {key} 1");
+            var expectedResponse = "$-1\r\n";
+            var actualValue = Encoding.ASCII.GetString(response).Substring(0, expectedResponse.Length);
+            ClassicAssert.AreEqual(expectedResponse, actualValue);
+        }
+
+        [Test]
+        [TestCase("BZPOPMIN", 1, "key1", "value1", 1.5, Description = "First key has minimum")]
+        [TestCase("BZPOPMAX", 2, "key2", "value2", 3.5, Description = "Second key has maximum")]
+        public void BzpopMinMaxMultipleKeysTest(string command, int valueKeyIndex, string expectedKey, string expectedValue, double expectedScore)
+        {
+            var keys = new[] { "key1", "key2", "key3" };
+            using var lightClientRequest = TestUtils.CreateRequest();
+
+            lightClientRequest.SendCommand($"ZADD {keys[valueKeyIndex - 1]} {expectedScore} {expectedValue}");
+            var response = lightClientRequest.SendCommand($"{command} {string.Join(" ", keys)} 1");
+            var expectedResponse = $"*3\r\n${expectedKey.Length}\r\n{expectedKey}\r\n${expectedValue.Length}\r\n{expectedValue}\r\n${expectedScore.ToString().Length}\r\n{expectedScore}\r\n";
+            TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+        }
+
+        [Test]
+        [TestCase("BZPOPMIN", Description = "Blocking pop minimum")]
+        [TestCase("BZPOPMAX", Description = "Blocking pop maximum")]
+        public void BzpopMinMaxBlockingTest(string command)
+        {
+            var key = "blockingzset2";
+            var value = "testvalue";
+            var score = 2.5;
+
+            var blockingTask = Task.Run(() =>
+            {
+                using var lcr = TestUtils.CreateRequest();
+                var response = lcr.SendCommand($"{command} {key} 30");
+                var expectedResponse = $"*3\r\n${key.Length}\r\n{key}\r\n${value.Length}\r\n{value}\r\n${score.ToString().Length}\r\n{score}\r\n";
+                TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+            });
+
+            var pushingTask = Task.Run(() =>
+            {
+                using var lcr = TestUtils.CreateRequest();
+                Task.Delay(TimeSpan.FromSeconds(2)).Wait();
+                return lcr.SendCommand($"ZADD {key} {score} {value}");
+            });
+
+            Task.WaitAll([blockingTask, pushingTask], TimeSpan.FromSeconds(5));
+            ClassicAssert.IsTrue(blockingTask.IsCompletedSuccessfully);
+            ClassicAssert.IsTrue(pushingTask.IsCompletedSuccessfully);
+        }
+
+        [Test]
+        [TestCase("BZPOPMIN", Description = "Timeout on minimum")]
+        [TestCase("BZPOPMAX", Description = "Timeout on maximum")]
+        public void BzpopMinMaxTimeoutTest(string command)
+        {
+            using var lightClientRequest = TestUtils.CreateRequest();
+            var response = lightClientRequest.SendCommand($"{command} nonexistentkey 1");
+            var expectedResponse = "$-1\r\n";
+            TestUtils.AssertEqualUpToExpectedLength(expectedResponse, response);
+        }
+
+        /// <summary>
+        /// BLMOVE pushes to its destination, so a client blocked on that destination must be woken,
+        /// exactly as it is for the non-blocking LMOVE.
+        /// </summary>
+        [Test]
+        public void BlockingListMoveWakesDestinationObserver()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+
+            const string srcKey = "bwsrc";
+            const string dstKey = "bwdst";
+
+            _ = db.ListRightPush(srcKey, "v1");
+
+            byte[] waiterResponse = null;
+            var waiter = Task.Run(() =>
+            {
+                using var lcr = TestUtils.CreateRequest();
+                waiterResponse = (byte[])lcr.SendCommand($"BLPOP {dstKey} 10", 3).Clone();
+            });
+
+            Thread.Sleep(1000);
+
+            var moved = db.Execute("BLMOVE", srcKey, dstKey, "LEFT", "RIGHT", 5);
+            ClassicAssert.AreEqual("v1", moved.ToString());
+
+            ClassicAssert.IsTrue(waiter.Wait(TimeSpan.FromSeconds(10)),
+                "BLPOP on the BLMOVE destination was never woken.");
+            TestUtils.AssertEqualUpToExpectedLength($"*2\r\n${dstKey.Length}\r\n{dstKey}\r\n$2\r\nv1\r\n", waiterResponse);
+            ClassicAssert.IsFalse(db.KeyExists(dstKey));
+
+            // Now with a BLMOVE that blocks first and is itself woken by a push to its source.
+            const string chainSrc = "bcsrc";
+            const string chainDst = "bcdst";
+
+            byte[] chainWaiterResponse = null;
+            var chainWaiter = Task.Run(() =>
+            {
+                using var lcr = TestUtils.CreateRequest();
+                chainWaiterResponse = (byte[])lcr.SendCommand($"BLPOP {chainDst} 10", 3).Clone();
+            });
+
+            Thread.Sleep(500);
+
+            byte[] moverResponse = null;
+            var mover = Task.Run(() =>
+            {
+                using var lcr = TestUtils.CreateRequest();
+                moverResponse = (byte[])lcr.SendCommand($"BLMOVE {chainSrc} {chainDst} LEFT RIGHT 10", 1).Clone();
+            });
+
+            Thread.Sleep(500);
+
+            _ = db.ListRightPush(chainSrc, "v2");
+
+            ClassicAssert.IsTrue(mover.Wait(TimeSpan.FromSeconds(10)), "Blocked BLMOVE was never woken.");
+            TestUtils.AssertEqualUpToExpectedLength("$2\r\nv2\r\n", moverResponse);
+
+            ClassicAssert.IsTrue(chainWaiter.Wait(TimeSpan.FromSeconds(10)),
+                "BLPOP on the BLMOVE destination was never woken.");
+            TestUtils.AssertEqualUpToExpectedLength($"*2\r\n${chainDst.Length}\r\n{chainDst}\r\n$2\r\nv2\r\n", chainWaiterResponse);
+        }
+
+        /// <summary>
+        /// A BLMOVE that is served from the broker must not drop the key TTL. Rotating a single-element list onto
+        /// itself is a no-op and must not empty and recreate the record, which would discard its expiration.
+        /// </summary>
+        [Test]
+        [TestCase("LEFT", "LEFT")]
+        [TestCase("LEFT", "RIGHT")]
+        [TestCase("RIGHT", "LEFT")]
+        [TestCase("RIGHT", "RIGHT")]
+        public void BlockingListMovePreservesKeyExpiration(string srcDirection, string dstDirection)
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+
+            var key = $"blmove:ttl:{srcDirection}:{dstDirection}";
+            _ = db.KeyDelete(key);
+
+            byte[] moverResponse = null;
+            var mover = Task.Run(() =>
+            {
+                using var lcr = TestUtils.CreateRequest();
+                moverResponse = (byte[])lcr.SendCommand($"BLMOVE {key} {key} {srcDirection} {dstDirection} 0").Clone();
+            });
+
+            Thread.Sleep(500);
+
+            // Create the key with a TTL while the BLMOVE is blocked, so the broker serves the move. The push and the
+            // expiration are applied in one transaction so the TTL is already set when the broker observes the key.
+            var tran = db.CreateTransaction();
+            _ = tran.ListRightPushAsync(key, "only");
+            _ = tran.KeyExpireAsync(key, TimeSpan.FromMinutes(10));
+            ClassicAssert.IsTrue(tran.Execute());
+
+            ClassicAssert.IsTrue(mover.Wait(TimeSpan.FromSeconds(10)), "Blocked BLMOVE was never woken.");
+            TestUtils.AssertEqualUpToExpectedLength("$4\r\nonly\r\n", moverResponse);
+
+            ClassicAssert.AreEqual(1, db.ListLength(key));
+            ClassicAssert.IsNotNull(db.KeyTimeToLive(key),
+                $"BLMOVE {srcDirection}->{dstDirection} on a single-element list dropped the key TTL.");
+        }
+
+        /// <summary>
+        /// A single collection update can make several items available. Every waiter that the collection can serve
+        /// must be woken by that update, not just the first one in the queue.
+        /// </summary>
+        [Test]
+        [TestCase("BLPOP")]
+        [TestCase("BRPOP")]
+        public void BlockingPopServesAllWaitersFromSingleMultiItemPush(string blockingCmd)
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+
+            var key = $"blocking:multiwaiter:{blockingCmd}";
+            _ = db.KeyDelete(key);
+
+            const int waiterCount = 3;
+            var responses = new byte[waiterCount][];
+            var ready = new CountdownEvent(waiterCount);
+
+            var waiters = new Task[waiterCount];
+            for (var i = 0; i < waiterCount; i++)
+            {
+                var idx = i;
+                waiters[idx] = Task.Run(() =>
+                {
+                    using var lcr = TestUtils.CreateRequest();
+                    ready.Signal();
+                    responses[idx] = (byte[])lcr.SendCommand($"{blockingCmd} {key} 30", 3).Clone();
+                });
+            }
+
+            ClassicAssert.IsTrue(ready.Wait(TimeSpan.FromSeconds(10)));
+            Thread.Sleep(1000);
+
+            // One command, one broker event, three items. All three waiters must be served by it.
+            RedisValue[] pushed = ["a", "b", "c"];
+            ClassicAssert.AreEqual(waiterCount, db.ListLeftPush(key, pushed));
+
+            ClassicAssert.IsTrue(Task.WaitAll(waiters, TimeSpan.FromSeconds(15)),
+                $"A single push of {waiterCount} items did not wake all {waiterCount} blocked {blockingCmd} clients.");
+
+            // Each reply is *2\r\n$<keyLen>\r\n<key>\r\n$<valLen>\r\n<value>\r\n
+            var received = responses
+                .Select(r => Encoding.ASCII.GetString(r).TrimEnd('\0').Split("\r\n")[4])
+                .ToArray();
+
+            CollectionAssert.AreEquivalent(new[] { "a", "b", "c" }, received);
+            ClassicAssert.AreEqual(0, db.ListLength(key));
+        }
+
+        /// <summary>
+        /// A same-key BLMOVE that leaves the list unchanged still leaves the item available to the remaining waiters,
+        /// so a single push must serve all of them.
+        /// </summary>
+        [Test]
+        public void BlockingListMoveSameKeyServesAllWaiters()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+
+            var key = "blocking:selfmove:multiwaiter";
+            _ = db.KeyDelete(key);
+
+            const int waiterCount = 3;
+            var responses = new byte[waiterCount][];
+            var ready = new CountdownEvent(waiterCount);
+
+            var waiters = new Task[waiterCount];
+            for (var i = 0; i < waiterCount; i++)
+            {
+                var idx = i;
+                waiters[idx] = Task.Run(() =>
+                {
+                    using var lcr = TestUtils.CreateRequest();
+                    ready.Signal();
+                    responses[idx] = (byte[])lcr.SendCommand($"BLMOVE {key} {key} LEFT LEFT 30", 1).Clone();
+                });
+            }
+
+            ClassicAssert.IsTrue(ready.Wait(TimeSpan.FromSeconds(10)));
+            Thread.Sleep(1000);
+
+            ClassicAssert.AreEqual(1, db.ListLeftPush(key, "only"));
+
+            ClassicAssert.IsTrue(Task.WaitAll(waiters, TimeSpan.FromSeconds(15)),
+                $"A no-op BLMOVE served only some of the {waiterCount} blocked clients, though the item stayed available.");
+
+            foreach (var response in responses)
+                TestUtils.AssertEqualUpToExpectedLength("$4\r\nonly\r\n", response);
+
+            // The move is a no-op, so the element must still be there exactly once.
+            ClassicAssert.AreEqual(1, db.ListLength(key));
+            ClassicAssert.AreEqual("only", db.ListGetByIndex(key, 0).ToString());
+        }
+
+        /// <summary>
+        /// Blocking pops must persist their update through the store. When the record is no longer in the mutable
+        /// region, mutating the retrieved object in place silently loses the pop.
+        /// </summary>
+        [Test]
+        public void BlockingPopOnImmutableRecord()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+
+            const string listKey = "blocking:list";
+            const string moveKey = "blocking:move";
+            const string mpopKey = "blocking:mpop";
+            const string zsetKey = "blocking:zset";
+            const string zmpopKey = "blocking:zmpop";
+            const int elementCount = 16;
+
+            for (var i = 0; i < elementCount; i++)
+            {
+                _ = db.ListRightPush(listKey, $"element-{i}");
+                _ = db.ListRightPush(moveKey, $"element-{i}");
+                _ = db.ListRightPush(mpopKey, $"element-{i}");
+                _ = db.SortedSetAdd(zsetKey, $"element-{i}", i);
+                _ = db.SortedSetAdd(zmpopKey, $"element-{i}", i);
+            }
+
+            // Push the records out of the mutable region by writing a large amount of unrelated data.
+            var filler = new string('x', 512);
+            for (var i = 0; i < 2000; i++)
+                _ = db.StringSet($"filler:{i}", filler);
+
+            // BLPOP must remove the element from the list.
+            for (var i = 0; i < elementCount; i++)
+            {
+                var popped = (RedisResult[])db.Execute("BLPOP", listKey, 1);
+                ClassicAssert.IsNotNull(popped, $"BLPOP returned nothing on iteration {i}");
+                ClassicAssert.AreEqual($"element-{i}", popped[1].ToString());
+                ClassicAssert.AreEqual(elementCount - i - 1, db.ListLength(listKey),
+                    $"List length is wrong after {i + 1} BLPOPs; the pop was not persisted.");
+            }
+            ClassicAssert.IsFalse(db.KeyExists(listKey));
+
+            // BLMOVE must remove from the source and add to the destination.
+            for (var i = 0; i < elementCount; i++)
+            {
+                var moved = db.Execute("BLMOVE", moveKey, "blocking:move:dst", "LEFT", "RIGHT", 1);
+                ClassicAssert.AreEqual($"element-{i}", moved.ToString());
+                ClassicAssert.AreEqual(elementCount - i - 1, db.ListLength(moveKey),
+                    $"Source length is wrong after {i + 1} BLMOVEs; the pop was not persisted.");
+                ClassicAssert.AreEqual(i + 1, db.ListLength("blocking:move:dst"));
+            }
+            ClassicAssert.IsFalse(db.KeyExists(moveKey));
+
+            // BLMPOP must remove all popped elements.
+            var mpopped = (RedisResult[])db.Execute("BLMPOP", 1, 1, mpopKey, "LEFT", "COUNT", 4);
+            ClassicAssert.AreEqual(4, ((RedisResult[])mpopped[1]).Length);
+            ClassicAssert.AreEqual(elementCount - 4, db.ListLength(mpopKey),
+                "List length is wrong after BLMPOP; the pops were not persisted.");
+
+            // BZPOPMIN must remove the element from the sorted set.
+            for (var i = 0; i < elementCount; i++)
+            {
+                var zpopped = (RedisResult[])db.Execute("BZPOPMIN", zsetKey, 1);
+                ClassicAssert.IsNotNull(zpopped, $"BZPOPMIN returned nothing on iteration {i}");
+                ClassicAssert.AreEqual($"element-{i}", zpopped[1].ToString());
+                ClassicAssert.AreEqual(i, (double)zpopped[2], $"BZPOPMIN returned the wrong score on iteration {i}");
+                ClassicAssert.AreEqual(elementCount - i - 1, db.SortedSetLength(zsetKey),
+                    $"Sorted set length is wrong after {i + 1} BZPOPMINs; the pop was not persisted.");
+            }
+            ClassicAssert.IsFalse(db.KeyExists(zsetKey));
+
+            // BZMPOP must remove all popped elements.
+            var zmpopped = (RedisResult[])db.Execute("BZMPOP", 1, 1, zmpopKey, "MIN", "COUNT", 4);
+            ClassicAssert.AreEqual(4, ((RedisResult[])zmpopped[1]).Length);
+            ClassicAssert.AreEqual(elementCount - 4, db.SortedSetLength(zmpopKey),
+                "Sorted set length is wrong after BZMPOP; the pops were not persisted.");
+        }
+
+        /// <summary>
+        /// Blocking sorted set pops build their output as RESP2 internally regardless of the client protocol.
+        /// A RESP3 client must still receive correct members and scores.
+        /// </summary>
+        [Test]
+        [TestCase("BZPOPMIN")]
+        [TestCase("BZPOPMAX")]
+        [TestCase("BZMPOP")]
+        public void BlockingSortedSetPopOverResp3(string command)
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(protocol: RedisProtocol.Resp3));
+            var db = redis.GetDatabase(0);
+
+            var key = $"bzpop:resp3:{command}";
+            _ = db.KeyDelete(key);
+            _ = db.SortedSetAdd(key, "low", 1.5);
+            _ = db.SortedSetAdd(key, "high", 9.25);
+
+            var result = command switch
+            {
+                "BZMPOP" => db.Execute("BZMPOP", "0", "1", key, "MIN"),
+                _ => db.Execute(command, key, "0"),
+            };
+
+            ClassicAssert.IsFalse(result.IsNull, $"{command} returned nil over RESP3.");
+
+            var flat = string.Join(",", ((RedisResult[])result).SelectMany(Flatten));
+            var expectedMember = command == "BZPOPMAX" ? "high" : "low";
+            var expectedScore = command == "BZPOPMAX" ? "9.25" : "1.5";
+
+            StringAssert.Contains(expectedMember, flat, $"{command} over RESP3 returned {flat}");
+            StringAssert.Contains(expectedScore, flat, $"{command} over RESP3 returned {flat}");
+
+            ClassicAssert.AreEqual(1, db.SortedSetLength(key));
+        }
+
+        private static IEnumerable<string> Flatten(RedisResult result)
+        {
+            if (result.Resp2Type != ResultType.Array)
+                return [result.ToString()];
+
+            return ((RedisResult[])result).SelectMany(Flatten);
+        }
+
+        /// <summary>
+        /// Blocking sorted set pops round-trip their scores through the RESP representation, so extreme and
+        /// non-finite scores must come back exactly as they were stored.
+        /// </summary>
+        [Test]
+        public void BlockingSortedSetPopPreservesExactScores()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+
+            // Ascending order. Exercises infinities, subnormals, full 17-digit precision and exponent notation.
+            string[] scores =
+            [
+                "-inf", "-1.7976931348623157E+308", "-0.1", "0", "5E-324", "0.1",
+                "0.3333333333333333", "3.141592653589793", "123456789.12345679",
+                "1.7976931348623157E+308", "inf"
+            ];
+
+            const string minKey = "bz:scores:min";
+            const string maxKey = "bz:scores:max";
+
+            for (var i = 0; i < scores.Length; i++)
+            {
+                _ = db.Execute("ZADD", minKey, scores[i], $"m{i}");
+                _ = db.Execute("ZADD", maxKey, scores[i], $"m{i}");
+            }
+
+            // Push the records out of the mutable region by writing a large amount of unrelated data.
+            var filler = new string('x', 512);
+            for (var i = 0; i < 2000; i++)
+                _ = db.StringSet($"filler:{i}", filler);
+
+            // BZPOPMIN yields ascending scores.
+            for (var i = 0; i < scores.Length; i++)
+            {
+                var popped = (RedisResult[])db.Execute("BZPOPMIN", minKey, 1);
+                ClassicAssert.IsNotNull(popped, $"BZPOPMIN returned nothing on iteration {i}");
+                ClassicAssert.AreEqual(minKey, popped[0].ToString());
+                ClassicAssert.AreEqual($"m{i}", popped[1].ToString());
+                ClassicAssert.AreEqual(scores[i], popped[2].ToString(),
+                    $"BZPOPMIN did not round-trip the score for m{i} exactly.");
+            }
+            ClassicAssert.IsFalse(db.KeyExists(minKey));
+
+            // BZPOPMAX yields descending scores.
+            for (var i = scores.Length - 1; i >= 0; i--)
+            {
+                var popped = (RedisResult[])db.Execute("BZPOPMAX", maxKey, 1);
+                ClassicAssert.IsNotNull(popped, $"BZPOPMAX returned nothing for score index {i}");
+                ClassicAssert.AreEqual($"m{i}", popped[1].ToString());
+                ClassicAssert.AreEqual(scores[i], popped[2].ToString(),
+                    $"BZPOPMAX did not round-trip the score for m{i} exactly.");
+            }
+            ClassicAssert.IsFalse(db.KeyExists(maxKey));
+        }
+
+        /// <summary>
+        /// A BLMOVE whose destination holds a non-list must fail without removing the element from the source.
+        /// </summary>
+        [Test]
+        public void BlockingListMoveWrongTypeDestinationDoesNotLoseElement()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+
+            const string srcKey = "blmove:wt:src";
+            const string dstKey = "blmove:wt:dst";
+
+            string[] initial = ["a", "b", "c"];
+            foreach (var value in initial)
+                _ = db.ListRightPush(srcKey, value);
+            _ = db.StringSet(dstKey, "not-a-list");
+
+            var filler = new string('x', 512);
+            for (var i = 0; i < 2000; i++)
+                _ = db.StringSet($"filler:{i}", filler);
+
+            var ex = Assert.Throws<RedisServerException>(() =>
+                db.Execute("BLMOVE", srcKey, dstKey, "LEFT", "RIGHT", 1));
+            ClassicAssert.IsTrue(ex.Message.StartsWith("WRONGTYPE"), $"Unexpected error: {ex.Message}");
+
+            ClassicAssert.AreEqual(3, db.ListLength(srcKey));
+            CollectionAssert.AreEqual(initial, db.ListRange(srcKey, 0, -1).Select(x => x.ToString()).ToArray());
+            ClassicAssert.AreEqual("not-a-list", db.StringGet(dstKey).ToString());
+        }
+
+        private static readonly TimeSpan NonBlockingReplyTimeout = TimeSpan.FromSeconds(10);
+
+        private static readonly string[] BlockingCommands =
+            ["BLPOP", "BRPOP", "BLMOVE", "BRPOPLPUSH", "BLMPOP", "BZPOPMIN", "BZPOPMAX", "BZMPOP"];
+
+        private static bool IsSortedSetCommand(string command) => command.StartsWith("BZ", StringComparison.Ordinal);
+
+        private static object[] BlockingCommandArgs(string command, string key, string destination, string timeout)
+            => command switch
+            {
+                "BLPOP" or "BRPOP" or "BZPOPMIN" or "BZPOPMAX" => [key, timeout],
+                "BLMOVE" => [key, destination, "LEFT", "RIGHT", timeout],
+                "BRPOPLPUSH" => [key, destination, timeout],
+                "BLMPOP" => [timeout, "1", key, "LEFT"],
+                "BZMPOP" => [timeout, "1", key, "MIN"],
+                _ => throw new ArgumentOutOfRangeException(nameof(command), command, null),
+            };
+
+        /// <summary>
+        /// Writes an item to <paramref name="key"/> from a fresh connection, failing if the write never replies.
+        /// </summary>
+        private static async Task AssertKeyIsWritableAsync(string command, string key)
+        {
+            await using var redis = await ConnectionMultiplexer.ConnectAsync(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+
+            var written = IsSortedSetCommand(command)
+                ? await db.ExecuteAsync("ZADD", key, "1", "written").WaitAsync(NonBlockingReplyTimeout)
+                : await db.ExecuteAsync("LPUSH", key, "written").WaitAsync(NonBlockingReplyTimeout);
+
+            ClassicAssert.AreEqual(1, (long)written, $"Unexpected reply to a write to {key} after {command}.");
+        }
+
+        /// <summary>
+        /// A blocking command run by EXEC behaves as if its timeout had already expired: the transaction holds the
+        /// locks of its keys, so no other client could deliver an item while it waited. On an empty key it must reply
+        /// nil at once, even with a zero (infinite) timeout, and leave both its connection and its key usable.
+        /// </summary>
+        [Test]
+        [TestCase("BLPOP", "0")]
+        [TestCase("BLPOP", "30")]
+        [TestCase("BRPOP", "0")]
+        [TestCase("BRPOP", "30")]
+        [TestCase("BLMOVE", "0")]
+        [TestCase("BLMOVE", "30")]
+        [TestCase("BRPOPLPUSH", "0")]
+        [TestCase("BRPOPLPUSH", "30")]
+        [TestCase("BLMPOP", "0")]
+        [TestCase("BLMPOP", "30")]
+        [TestCase("BZPOPMIN", "0")]
+        [TestCase("BZPOPMIN", "30")]
+        [TestCase("BZPOPMAX", "0")]
+        [TestCase("BZPOPMAX", "30")]
+        [TestCase("BZMPOP", "0")]
+        [TestCase("BZMPOP", "30")]
+        public async Task BlockingCommandInTransactionOnEmptyKeyDoesNotBlock(string command, string timeout)
+        {
+            await using var redis = await ConnectionMultiplexer.ConnectAsync(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+
+            var key = $"txn:empty:{command}";
+            var destination = $"{key}:dst";
+
+            var tran = db.CreateTransaction();
+            var reply = tran.ExecuteAsync(command, BlockingCommandArgs(command, key, destination, timeout));
+
+            ClassicAssert.IsTrue(await tran.ExecuteAsync().WaitAsync(NonBlockingReplyTimeout));
+            var result = await reply;
+            ClassicAssert.IsTrue(result.IsNull, $"{command} in EXEC on an empty key returned {result}.");
+
+            _ = await db.PingAsync().WaitAsync(NonBlockingReplyTimeout);
+
+            await AssertKeyIsWritableAsync(command, key);
+            ClassicAssert.IsFalse(await db.KeyExistsAsync(destination));
+        }
+
+        /// <summary>
+        /// A blocking command run by EXEC still serves an item that is already available, and persists the update.
+        /// </summary>
+        [Test]
+        [TestCase("BLPOP", "a")]
+        [TestCase("BRPOP", "b")]
+        [TestCase("BLMOVE", "a")]
+        [TestCase("BRPOPLPUSH", "b")]
+        [TestCase("BLMPOP", "a")]
+        [TestCase("BZPOPMIN", "a")]
+        [TestCase("BZPOPMAX", "b")]
+        [TestCase("BZMPOP", "a")]
+        public async Task BlockingCommandInTransactionServesAvailableItem(string command, string expectedItem)
+        {
+            await using var redis = await ConnectionMultiplexer.ConnectAsync(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+
+            var key = $"txn:available:{command}";
+            var destination = $"{key}:dst";
+
+            if (IsSortedSetCommand(command))
+                _ = await db.SortedSetAddAsync(key, [new SortedSetEntry("a", 1), new SortedSetEntry("b", 2)]);
+            else
+                _ = await db.ListRightPushAsync(key, ["a", "b"]);
+
+            var tran = db.CreateTransaction();
+            var reply = tran.ExecuteAsync(command, BlockingCommandArgs(command, key, destination, "0"));
+
+            ClassicAssert.IsTrue(await tran.ExecuteAsync().WaitAsync(NonBlockingReplyTimeout));
+            var result = await reply;
+            ClassicAssert.IsFalse(result.IsNull, $"{command} in EXEC did not serve the available item.");
+            CollectionAssert.Contains(Flatten(result).ToArray(), expectedItem);
+
+            var remaining = IsSortedSetCommand(command) ? await db.SortedSetLengthAsync(key) : await db.ListLengthAsync(key);
+            ClassicAssert.AreEqual(1, remaining, $"{command} in EXEC did not persist the pop.");
+
+            if (command is "BLMOVE" or "BRPOPLPUSH")
+                CollectionAssert.AreEqual(new[] { expectedItem }, (await db.ListRangeAsync(destination)).Select(x => x.ToString()).ToArray());
+        }
+
+        /// <summary>
+        /// A blocking command run by EXEC on a key of the wrong type fails with WRONGTYPE rather than waiting.
+        /// </summary>
+        [Test]
+        public async Task BlockingCommandInTransactionOnWrongTypeFails()
+        {
+            await using var redis = await ConnectionMultiplexer.ConnectAsync(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+
+            foreach (var command in BlockingCommands)
+            {
+                var key = $"txn:wrongtype:{command}";
+                _ = await db.StringSetAsync(key, "not-a-collection");
+
+                var tran = db.CreateTransaction();
+                var reply = tran.ExecuteAsync(command, BlockingCommandArgs(command, key, $"{key}:dst", "0"));
+
+                ClassicAssert.IsTrue(await tran.ExecuteAsync().WaitAsync(NonBlockingReplyTimeout));
+
+                var ex = Assert.ThrowsAsync<RedisServerException>(async () => await reply);
+                ClassicAssert.IsTrue(ex.Message.StartsWith("WRONGTYPE", StringComparison.Ordinal), $"{command}: unexpected error {ex.Message}");
+                ClassicAssert.AreEqual("not-a-collection", (await db.StringGetAsync(key)).ToString());
+            }
+        }
+
+        /// <summary>
+        /// A BLMOVE run by EXEC that moves an item must wake a client blocked on the destination key.
+        /// </summary>
+        [Test]
+        public async Task BlockingMoveInTransactionWakesDestinationWaiter()
+        {
+            await using var redis = await ConnectionMultiplexer.ConnectAsync(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+
+            const string srcKey = "txn:blmove:src";
+            const string dstKey = "txn:blmove:dst";
+            _ = await db.ListRightPushAsync(srcKey, "moved");
+
+            var waiter = Task.Run(() =>
+            {
+                using var lcr = TestUtils.CreateRequest();
+                return (byte[])lcr.SendCommand($"BLPOP {dstKey} 30", 3).Clone();
+            });
+
+            await Task.Delay(500);
+
+            var tran = db.CreateTransaction();
+            var reply = tran.ExecuteAsync("BLMOVE", srcKey, dstKey, "LEFT", "RIGHT", "0");
+
+            ClassicAssert.IsTrue(await tran.ExecuteAsync().WaitAsync(NonBlockingReplyTimeout));
+            ClassicAssert.AreEqual("moved", (await reply).ToString());
+
+            var waiterResponse = await waiter.WaitAsync(NonBlockingReplyTimeout);
+            TestUtils.AssertEqualUpToExpectedLength($"*2\r\n${dstKey.Length}\r\n{dstKey}\r\n$5\r\nmoved\r\n", waiterResponse);
+            ClassicAssert.IsFalse(await db.KeyExistsAsync(srcKey));
+            ClassicAssert.IsFalse(await db.KeyExistsAsync(dstKey));
+        }
+
+        /// <summary>
+        /// A BLMOVE run by EXEC before any client has waited on a key leaves the broker able to serve later waiters.
+        /// </summary>
+        [Test]
+        public async Task BlockingMoveInTransactionBeforeAnyWaiterKeepsBrokerServing()
+        {
+            await using var redis = await ConnectionMultiplexer.ConnectAsync(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+
+            const string srcKey = "txn:first:src";
+            const string dstKey = "txn:first:dst";
+            const string laterKey = "txn:first:later";
+            _ = await db.ListRightPushAsync(srcKey, "moved");
+
+            var tran = db.CreateTransaction();
+            var reply = tran.ExecuteAsync("BLMOVE", srcKey, dstKey, "LEFT", "RIGHT", "0");
+            ClassicAssert.IsTrue(await tran.ExecuteAsync().WaitAsync(NonBlockingReplyTimeout));
+            ClassicAssert.AreEqual("moved", (await reply).ToString());
+
+            var served = await db.ExecuteAsync("BLPOP", dstKey, "0").WaitAsync(NonBlockingReplyTimeout);
+            CollectionAssert.AreEqual(new[] { dstKey, "moved" }, Flatten(served).ToArray());
+
+            var waiter = Task.Run(() =>
+            {
+                using var lcr = TestUtils.CreateRequest();
+                return (byte[])lcr.SendCommand($"BLPOP {laterKey} 30", 3).Clone();
+            });
+
+            await Task.Delay(500);
+            _ = await db.ListRightPushAsync(laterKey, "pushed");
+
+            var waiterResponse = await waiter.WaitAsync(NonBlockingReplyTimeout);
+            TestUtils.AssertEqualUpToExpectedLength($"*2\r\n${laterKey.Length}\r\n{laterKey}\r\n$6\r\npushed\r\n", waiterResponse);
+        }
+
+        /// <summary>
+        /// A push run by EXEC notifies the broker while the transaction holds the key's lock. That must not wait for
+        /// the broker, which may itself be waiting for the key's lock to serve a client that started waiting on the
+        /// key during the transaction.
+        /// </summary>
+        [Test]
+        public async Task PushInTransactionWhileBrokerWaitsOnKeyCompletes([Values] bool blockingMove)
+        {
+            server.Dispose();
+            server = TestUtils.CreateGarnetServer(TestUtils.MethodTestDir, lowMemory: true, enableLua: true);
+            server.Start();
+
+            await using var redis = await ConnectionMultiplexer.ConnectAsync(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+
+            const string srcKey = "txn:push:src";
+            const string dstKey = "txn:push:dst";
+            _ = await db.ListRightPushAsync(srcKey, "pushed");
+
+            // Busy-waits for one second, holding the transaction's lock on dstKey while the waiter below starts.
+            const string busyWaitScript = """
+                local function now()
+                    local t = redis.call('TIME')
+                    return tonumber(t[1]) * 1000000 + tonumber(t[2])
+                end
+                local deadline = now() + 1000000
+                while now() < deadline do end
+                return 1
+                """;
+
+            var tran = db.CreateTransaction();
+            _ = tran.ExecuteAsync("EVAL", busyWaitScript, "0");
+            var push = blockingMove
+                ? tran.ExecuteAsync("BLMOVE", srcKey, dstKey, "LEFT", "LEFT", "0")
+                : tran.ExecuteAsync("LMOVE", srcKey, dstKey, "LEFT", "LEFT");
+            var exec = tran.ExecuteAsync();
+
+            await Task.Delay(200);
+
+            var waiter = Task.Run(() =>
+            {
+                using var lcr = TestUtils.CreateRequest();
+                return (byte[])lcr.SendCommand($"BLPOP {dstKey} 30", 3).Clone();
+            });
+
+            ClassicAssert.IsTrue(await exec.WaitAsync(NonBlockingReplyTimeout));
+            ClassicAssert.AreEqual("pushed", (await push).ToString());
+
+            var waiterResponse = await waiter.WaitAsync(NonBlockingReplyTimeout);
+            TestUtils.AssertEqualUpToExpectedLength($"*2\r\n${dstKey.Length}\r\n{dstKey}\r\n$6\r\npushed\r\n", waiterResponse);
+            ClassicAssert.IsFalse(await db.KeyExistsAsync(srcKey));
+            ClassicAssert.IsFalse(await db.KeyExistsAsync(dstKey));
+        }
+
+        /// <summary>
+        /// A blocking command called from a script behaves as if its timeout had already expired, whether or not the
+        /// script runs as a transaction: a script must run to completion without waiting on other clients.
+        /// </summary>
+        [Test]
+        public async Task BlockingCommandInScriptOnEmptyKeyDoesNotBlock([Values] bool luaTransactionMode)
+        {
+            server.Dispose();
+            server = TestUtils.CreateGarnetServer(TestUtils.MethodTestDir, lowMemory: true, enableLua: true, luaTransactionMode: luaTransactionMode);
+            server.Start();
+
+            await using var redis = await ConnectionMultiplexer.ConnectAsync(TestUtils.GetConfig());
+            var db = redis.GetDatabase(0);
+
+            foreach (var command in BlockingCommands)
+            {
+                var key = $"script:empty:{command}";
+                var destination = $"{key}:dst";
+
+                var args = BlockingCommandArgs(command, "KEYS[1]", "KEYS[2]", "ARGV[1]")
+                    .Cast<string>()
+                    .Select(a => a.StartsWith("KEYS[", StringComparison.Ordinal) || a.StartsWith("ARGV[", StringComparison.Ordinal) ? a : $"'{a}'");
+                var script = $"return redis.call('{command}', {string.Join(", ", args)})";
+
+                var result = await db.ScriptEvaluateAsync(script, [key, destination], ["0"]).WaitAsync(NonBlockingReplyTimeout);
+                ClassicAssert.IsTrue(result.IsNull, $"{command} in a script on an empty key returned {result}.");
+
+                await AssertKeyIsWritableAsync(command, key);
+            }
+        }
+    }
+}

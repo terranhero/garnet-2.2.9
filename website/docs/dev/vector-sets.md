@@ -1,0 +1,628 @@
+---
+id: vector-sets
+sidebar_label: Vector Sets
+title: Vector Sets
+---
+
+## Overview
+
+Garnet has partial support for Vector Sets, implemented on top of the [DiskANN project](https://github.com/microsoft/DiskANN).
+
+## Design
+
+Vector Sets are a combination of one "index" key, which stores metadata and a pointer to the DiskANN data structure, and many "element" keys, which store vectors/quantized vectors/attributes/etc.  All Vector Set keys are kept in the store as binary (ie. non-object) values, but only the index key is visible - this is accomplished by putting all element keys in different namespaces.
+
+### Global Metadata
+
+In order to track allocated Vector Sets (and their respective hash slots), in progress cleanups, in progress migrations - we keep an array of `ContextMetadata` structs in namespace `VectorManager.MetadataNamespace` (which is `1`) with each index of the array used as the key.
+
+These are loaded and cached on startup, and updated (both in memory and in Tsavorite) whenever a Vector Set is created or deleted.  Simple locking (on the `VectorManager` instance) is used to serialize these updates as they should be rare.
+
+### Indexes
+
+The index key (represented by the `Index` struct) contains the following data:
+ - `ulong Context` - used to derive namespaces, detailed below
+ - `ulong IndexPtr` - a pointer to the DiskANN data structure, note this may be _dangling_ after [recovery](#recovery) or [replication](#replication)
+ - `uint Dimensions` - the expected dimension of vectors in commands targeting the Vector Set, this is inferred based on the `VADD` that creates the Vector Set
+ - `uint ReduceDims` - if a Vector Set was created with the `REDUCE` option that value, otherwise zero
+   * > [!NOTE]
+     > Today this ignored except for validation purposes, eventually DiskANN will use it.
+ - `uint NumLinks` - the `M` used to create the Vector Set, or the default value of 16 if not specified
+ - `uint BuildExplorationFactor` - the `EF` used to create the Vector Set, or the default value of 200 if not specified
+ - `VectorQuantType QuantType` - the quantizer specified at creation time, or the default value of `Q8` if not specified
+   * > [!NOTE]
+     > We have several extensions here, `XNOQUANT_U8`, `XNOQUANT_I8`, `XBIN_I8`, and `XBIN_U8` which are not from Redis.
+     > They forbid the `REDUCE` option, a restriction we may lift in the future.
+ - `VectorDistanceMetricType` - the distance metric used by this index, or a default value of `L2` if not specified
+   * > [!NOTE]
+     > This is an extension, Redis does not support explicitly setting a distance metric.
+     >
+     > Some of these options are aligned with Redis's vector index types, while others are unique to Garnet + DiskANN.
+ - `VectorSetFlags` - flags associated with the index
+
+The index key is in the store alongside other binary values like strings, hyperloglogs, and so on.  It is distinguished for `WRONGTYPE` purposes with `RecordType` field on `ISourceLogRecord` logs set to `VectorManager.RecordType` (which is `1`).
+
+> [!IMPORTANT]
+> `RecordType` is checked in a few places to correctly produce `WRONGTYPE` responses, but we need more coverage for all commands.  Probably something akin to how ACLs required per-command tests.
+
+### Elements
+
+While the Vector Set API only concerns itself with top-level index keys, ids, vectors, and attributes; DiskANN has different storage needs.  To abstract around these needs a bit, we reserve a number of different "namespaces" for each Vector Set.
+
+These namespaces are simple numbers, starting at the `Context` value stored in the `Index` struct - we currently reserve 8 namespaces per Vector Set.  What goes in which namespace is mostly hidden from Garnet, DiskANN indicates namespace (and index) to use with a modified `Context` passed to relevant callbacks.
+
+> There are two cases where we "know" the namespace involved: attributes (+3) and full vectors (+0) which are used to implement the `WITHATTR` option and the `VEMB` command respectively.  These exceptions _may_ go away in the future, but don't have to.
+
+Using namespaces prevents other commands from accessing keys which store element data.
+
+To illustrate, this means that:
+```
+VADD vector-set-key VALUES 1 123 element-key
+SET element-key string-value
+```
+Can work as expected.  Without namespacing, the `SET` would overwrite (or otherwise mangle) the element data of the Vector Set.
+
+## Operations
+
+We implement the majority of the [Redis Vector Set API](https://redis.io/docs/latest/commands/?group=vector_set):
+
+Implemented commands:
+ - [x] VADD
+ - [x] VCARD
+ - [x] VDIM
+ - [x] VEMB
+ - [x] VGETATTR
+ - [x] VINFO
+ - [x] VISMEMBER
+ - [x] VLINKS
+ - [x] VRANDMEMBER
+ - [ ] VRANGE
+ - [x] VREM
+ - [x] VSETATTR
+ - [x] VSIM
+
+### Creation (via `VADD`)
+
+[`VADD`](https://redis.io/docs/latest/commands/vadd/) implicitly creates a Vector Set when run on an empty key.
+
+DiskANN index creation must be serialized, so this requires holding an exclusive lock ([more details on locking](#locking)) that covers just that key.  During the `create_index` call to DiskANN the read/write/delete callbacks provided may be invoked - accordingly creation is re-entrant and we cannot call `create_index` directly from any Tsavorite session functions.
+
+### Explicit Creation (via `XVCREATE`)
+
+`XVCREATE` requires `DIM` and stores the same configuration as implicit creation through `VADD`.
+Its optional `EF` (default `200`, range `1` to `1000000`) is passed to native creation and stored in the index stub for recreation.
+Its optional `START_POINT` (default `4294967295`, range `0` to `4294967295`) is stored in the index stub and creation replay payload, so recreation and recovery use the same internal ID.
+It holds the existing exclusive per-set lock while checking that the key is absent, allocating a context,
+calling `create_index`, and optionally calling `set_quant_state` with the supplied opaque bytes.
+Native calls occur outside Tsavorite session functions because they can re-enter Garnet through storage callbacks.
+
+### Term Import (via `XVIMPORT`)
+
+`XVIMPORT` reads an existing index stub with `ReadVectorIndex`, retaining its lifetime lock while
+calling `DiskANNService.ImportTerm`. Missing keys are not created. Native callbacks write the term records
+outside Tsavorite session functions, and the network ID and value bytes are passed unchanged.
+
+The first accepted term sets `ImportPending` in the index stub under an exclusive lock. Ordinary vector
+operations, except `VINFO`, reject this flag until `FINISH` succeeds. The flag survives rename,
+eviction, and checkpoint recovery; an empty set with no imported terms remains usable.
+
+The six public term names map to native tags `0`, `1`, `2`, `3`, `5`, and `6`; metadata tag `4` is excluded.
+The start point accepts only vector, neighbor-list, and quantized-vector terms. It has no attributes or ID mappings.
+DiskANN owns eligibility and its persisted `_imp` marker, including restoration when the native handle is
+recreated. Garnet does not maintain a competing eligibility flag in the index stub.
+
+A successful term import is logged for AOF/replication but does not finalize the graph.
+
+### Explicit Finalization (via `XVIMPORT key FINISH`)
+
+`FINISH` holds a shared lock until DiskANN finishes all partitions, including start-point and cache setup.
+Work runs on a dedicated background pool, using the configured quantization worker count for both workers
+and partitions per database.
+
+Concurrent calls for the same native index share a job. Later calls retry only failed partitions; successful
+partitions are never rerun on that handle. Partition progress is cached until the native index is dropped.
+Shutdown cancels queued work and waits for running partitions.
+
+Success sets `ImportCompleted` and clears `ImportPending` in one RMW. Repeated `FINISH` returns `OK` from
+the stub without native work. Terminal failure sets `ImportFailed` and retains `ImportPending`, so later
+FINISH and term imports fail without recreating the native handle. Both outcomes survive rename, eviction,
+recovery, and migration. Deleting and recreating the key clears the import flags.
+
+### Insertion (via `VADD`)
+
+Once a Vector Set exists, insertions (which also use `VADD`) can proceed in parallel.
+
+Every insertion begins with a Tsavorite read, to get the [`Index`](#indexes) metadata (for validation) and the pointer to DiskANN's index.  As a consequence, most `VADD` operations despite _semantically_ being writes are, from Tsavorite's perspective, reads.  This has implications for replication, [which is discussed below](#replication).
+
+To prevent the index from being deleted mid-insertion, we hold a shared lock while calling DiskANN's `insert` function.  These locks are sharded for performance purposes, [which is discussed below](#locking).
+
+### Attribute Updates (via `VSETATTR`)
+
+Existing elements may have their attributes updates with `VSETATTR`.
+
+This is a simple passthrough to the DiskANN `set_attribute` function.
+To prevent the index from being deleted mid-insertion, we hold a shared lock while calling DiskANN's `set_attribute` function.  These locks are sharded for performance purposes, [which is discussed below](#locking).
+
+### Removal (via `VREM`)
+
+Removal works much the same as insertion, using shared locks so it can proceed in parallel.  The only meaningful difference is calling DiskANN's `remove` instead of `insert`.
+
+> [!NOTE]
+> Removing all elements from a Vector Set is not the same as deleting it. An empty Vector Set can be created with `XVCREATE` or remain after a `VREM`.
+
+### Search (via `VSIM`)
+
+Searching is a pure read operation, and so holds shared locks and proceeds in parallel like insertions and removals.
+
+Great care is taken to avoid copying during `VSIM`.  In particular, values and element ids are passed directly from the receive buffer for all encodings except `VALUES`.  Callbacks from DiskANN to Garnet likewise take great care to avoid copying, and are [detailed below](#diskann-integration).
+
+### Element Data (via `VEMB` and `VGETATTR`)
+
+These operations are handled purely on the Garnet side by first reading out the [`Index`](#indexes) structure, and then using the context value to look for data in the appropriate namespaces.
+
+> [!NOTE]
+> Strictly speaking we don't need the DiskANN index to access this data, but the current implementation does make sure the index is valid.
+
+### Metadata (via `VDIM` and `VINFO`)
+
+Configuration and `import-state` come from the [`Index`](#indexes) structure. `VINFO` also reads `size`
+from DiskANN, except during import: it then omits `size` and returns stored metadata without recreating or
+calling the native index.
+
+> [!NOTE]
+> `VINFO` directly exposes Redis implementation details in addition to "normal" data.
+> Because our implementation is different, we intentionally will not expose all the same information.
+> To be concrete `max-level`, `vset-uid`, and `hnsw-max-node-uid` are not returned.
+
+### Miscellaneous or Debugging Commands (`VCARD`, `VISMEMBER`, `VLINKS`, and `VRANDMEMBER`)
+
+These commands are implemented, though not particularly optimized in comparison to `VADD` and `VSIM`.
+
+`VISMEMBER` is processed entirely on the Garnet side, just checking for an existing external-id to internal-id map.
+
+All other commands are implemented using their paired DiskANN functions.
+
+### Deletion (via `DEL`, `UNLINK`, `FLUSHDB`, `FLUSHALL`)
+
+Deletion of Vector Sets is detected in the `GarnetTriggers.OnDispose` callback, which calls `VectorManager.RequestDeletion` to begin the process of deletion.
+
+This takes place in four steps:
+  1. The Vector Set context is marked for deletion from `GarnetTriggers.OnDispose`
+     * A background task does this, as we do not have a usable storage session in the `GarnetTriggers` callback
+  2. `GarnetTriggers.OnDispose` returns, deleting the index key
+  3. A background cleanup task scans the Tsavorite log for element keys, [see Cleanup](#cleanup) for more detail
+  4. The Vector Set context is marked available
+
+During recovery partially deleted Vector Sets are found by checking [`ContextMetadata`](#global-metadata).  Those whose index keys no longer are exist are rescheduled for cleanup, and those who still have an index key have their "mark for deletion"-bit cleared.
+
+`FLUSHDB` and `FLUSHALL` acquire _all_ exclusive locks on `VectorManager` before beginning a flush, and resets context metadata before releasing those locks.  In combination with `GarnetTriggers.OnEvict` dropping DiskANN indexes this cleanly removes all index keys and element data.
+
+## Quantization
+
+To speed up search and reduce the size of the "live set" Vector Sets support quantization.
+
+The following quantizers are supported:
+ - `NOQUANT` - disables quantization, dimensions are `float`s
+ - `BIN` - binary quantization, each dimension is a single bit
+ - `Q8` - signed 8-bit quantization, each dimension is an `sbyte`
+ - `XNOQUANT_U8` - disables quantization, but requires dimensions are [0, 255]
+ - `XNOQUANT_I8` - disables quantization, but requires dimensions are [-128, 127]
+ - `XBIN_U8` - binary quantization, each dimension is a bit, but the unquantized dimensions are [0, 255]
+ - `XBIN_I8` - binary quantization, each dimension is a bit, but the unquantized dimensions are [-128, 127]
+
+Quantizers that start with an `X` are extensions, quantizers that are not also found in Redis.  For the `_U8`, and `_I8` suffixed quantizers it is legal to use `FP32`, or `VALUES` with `VADD` but for optimal performance use `XU8` or `XI8` to remove copies and validation.
+
+Some quantizers require a sample of vectors be gathered before the actual quantization can be applied.  This gathering is opaque to Garnet, but cooperates with DiskANN to move extra calculations and backfills to background tasks.
+
+Backfills are triggered by `insert` returning `DiskANNInsertResult.QuantizationRequested` or `create_index` setting the out param `quantizationNeeded` to true, after which:
+ - `build_quant_table` is invoked on a background task once for each `DiskANNInsertResult.QuantizationRequested` returned
+ - If `build_quant_table` returns 1, some number of `backfill_quant_vectors` tasks are also executed in the background
+ - `backfill_quant_vectors` tasks run in parallel, each task receiving a unique `task_index` which is &lt; `task_count`
+ 
+ It is legal for DiskANN to request quantization multiple times - it is `diskann-garnet`'s responsibility to handle any extra, or concurrent, calls to `build_quant_table` and guarantee only one success is reported.
+
+## Locking
+
+Vector Sets workloads require extreme parallelism, and so intricate locking protocols are required for both performance and correctness.
+
+Concretely, there are 5 sorts of locks involved:
+ - Tsavorite hashbucket locks
+ - A `ReadOptimizedLock` instance
+ - `VectorManager` lock around `ContextMetadata`
+ - Spin wait around `drop_index` calls
+ - An `int[]` used for element-level locks
+
+### Tsavorite Locks
+
+Whenever we read or write a key/value pair in the store, we acquire locks in Tsavorite.  Importantly, we cannot start a new Tsavorite operation while still holding these locks - we must copy the index out before each operation so Garnet can use the read/write/delete callbacks.
+
+> [!NOTE]
+> Based on profiling, Tsavorite shared locks are a significant source of contention.  Even though reads will not block each other we still pay a cache coherency tax.  Accordingly, reducing the number of Tsavorite operations (even reads) can lead to significant performance gains.
+
+> [!IMPORTANT]
+> Some effort was spent early attempting to elide the initial index read in common cases.  This did not pay dividends on smaller clusters, but is worth exploring again on large SKUs.
+
+### `ReadOptimizedLock`
+
+As noted above, to prevent `DEL` from clobbering in use Vector Sets and concurrent `VADD`s from calling `create_index` multiple times we have to hold locks based on the Vector Set key.  As every Vector Set operations starts by taking these locks, we have sharded them into separate locks.  To derive many related keys from a single key, we mangle the low bits of a key's hash value - this is implemented in the new (but not bound to Vector Sets) type `ReadOptimizedLock`.
+
+For operations which remain reads, we only acquire a single shared lock (based on the current thread) to prevent destructive operations.
+
+For operations which are always writes (like `DEL`) we acquire all sharded locks in exclusive mode.
+
+For operations which might be either (like `VADD`) we first acquire the usual single sharded lock (in shared mode), then promote to an exclusive lock if needed.
+
+### `VectorManager` Lock Around `ContextMetadata`
+
+Whenever we need to allocate a new context or mark an old one for cleanup, we need to modify the cached `ContextMetadata` array and write the new values to Tsavorite.  To simplify this, we take a plain `lock` around `VectorManager` while updating `ContextMetadata`s.
+
+The `RMW`s into Tsavorite still proceeds in parallel, outside of the lock, but a version counter in `ContextMetadata` allows us to keep only the latest version in the store.
+
+> [!NOTE]
+> Rapid creation or deletion of Vector Sets is expected to perform poorly due to this lock.
+> This isn't a case we're very interested in right now, but if that changes this will need to be reworked.
+
+### Spin wait around `drop_index` calls
+
+When a DiskANN index needs to be dropped due to memory pressure (as indicated by a `GarnetRecordTriggers.OnEvict` call) we move that drop on a background task and guard it with exclusive `ReadOptimizedLock` acquisitions.  This is necessary to prevent an index from being dropped while it is in use.
+
+This introduces a rare race where we might try to recreate an index that was evicted to disk and then reloaded from disk _before_ the drop actually executes.  If we allowed that, the two DiskANN index instances could disagree about internal state and corrupt future inserts.
+
+To prevent that, when we recreate an index we first check if that key has a scheduled drop and if so we spin waiting for it to be processed before recreating the index.
+
+> [!NOTE]
+> The code in `VectorManager.WaitForDiskANNIndexDrop` is a naive `while(...) { Thread.Yield(); }`-loop, which is decidedly suboptimal.
+> 
+> Since this case should be rare, that should be fine.  If it turns out this is less rare than hoped, we'll need to do something smarter.
+
+### Element Ordering Locks
+
+Operations that may update an element (`VADD`, `VREM`, and `VSETATTR`) take an exclusive lock in addition to `ReadOptimizedLock`.  This guarantees that entries are placed in the AOF in the same order they occurred against the main log.
+
+Operations on different elements within the same Vector Set can proceed in parallel, and operations on the same element name in different Vector Sets can also proceed in parallel.
+
+This lock is based on the Vector Set name and the element name, and is a simple `Interlocked.CompareExchange(...)` of an element in an `int[]` with a `Thread.Yield()` busy-loop for retries.  The underlying `int[]` is chosen to have ~5% collision odds if all cores are committed to an update operation.  We could push this number lower by committing more memory to the locking scheme - right now we cap out around 2MB for large machines.
+
+| Logical Processors | `int[]` Size | Approx.Collision Odds |
+| -----------------: | -----------: | --------------------: |
+|                  8 |          512 |                    5% |
+|                 16 |        2,048 |                    6% |
+|                 32 |        8,192 |                    5% |
+|                 48 |       32,768 |                    3% |
+|                 64 |       32,768 |                    6% |
+|                 80 |       65,536 |                    5% |
+|                 96 |      131,072 |                    3% |
+|                128 |      131,072 |                    6% |
+|                192 |      524,288 |                    3% |
+
+## Replication
+
+Replicating Vector Sets is tricky because of the unusual "writes are actually reads"-semantics of most operations.
+
+### On Primaries
+
+As noted above, inserts (via `VADD`) and deletes (via `VREM`) are reads from Tsavorite's perspective.  As a consequence, normal replication (which is triggered via `MainSessionFunctions.WriteLog(Delete|RMW|Upsert)`) does not happen on those operations.
+
+To fix that, synthetic writes against related keys are made after an insert or remove.  These writes are against the same Vector Set key, without any namespace information.  See `VectorManager.ReplicateVectorSetAdd` and `VectorManager.ReplicateVectorSetRemove` for details.
+
+`XVCREATE` and `XVIMPORT` also use synthetic RMW records. Creation records carry configuration and optional
+quantizer state, not native pointers. Term records carry the tag, ID, and value; `FINISH` carries no term payload.
+On the primary, FINISH waits for accepted terms to be logged and logs its success before clearing `ImportPending`.
+Terminal failure is logged as a payload-free `XVIMPORT` record with `arg1 = 1`; replay restores the failure
+flags without running native finalization. Successful FINISH uses `arg1 = 0`.
+
+> [!IMPORTANT]
+> There is a failure case here where we crash between the insert operation completing and the replication operation completing.
+>
+> This appears to simply extend a window that already existed between when a Tsavorite operation completed and an entry was written to the AOF.
+> This needs to confirmed - if it is not the case, handling this failure needs to be figured out.
+
+> [!NOTE]
+> These synthetic writes might appear to double write volume, but that is not the case.  Actual inserts and deletes have extreme write amplification (that is, each cause DiskANN to perform many writes against the Tsavorite store), whereas the synthetic writes cause a single (no-op) modification to the Tsavorite store plus an AOF entry.
+
+> [!NOTE]
+> The replication key is the same for all operations against the same Vector Set, this could be sharded which may improve performance.
+
+### On Replicas
+
+The synthetic writes on primary are intercepted on replicas and redirected to `VectorManager.HandleVectorSetAddReplication` and `VectorManager.HandleVectorSetRemoveReplication`, rather than being handled directly by `AOFProcessor`.
+
+For performance reasons, replicated `VADD`s are applied across many threads instead of serially.  This introduces a new source of non-determinism, since `VADD`s will occur in a different order than on the primary, but this is acceptable as Vector Sets are inherently non-deterministic.  While not _exactly_ the same Redis also permits a degree of non-determinism with its `CAS` option for `VADD`, so we're not diverging an incredible amount here.
+
+Consecutive `XVIMPORT` terms also replay in parallel on the same worker pool. Switching between `VADD` and
+term-import batches, or replaying any other command, drains queued work first. `XVIMPORT key FINISH` runs
+synchronously after prior imports finish, and later commands wait for it to complete. These rules apply to
+both ordinary and chunked import records. Replay ending without FINISH leaves the import pending.
+
+Ordinary and chunked records share vector-command dispatch. Chunked `VADD`, `VREM`, and `VSETATTR` records
+execute their vector operations with the same ordering barriers, including synthetic migration records.
+
+Transactions containing a vector-set rename replay their participating tasks' operations in log order on
+one barrier participant, holding the combined transaction locks. This keeps the source available until
+the destination copy completes. Both ordinary and chunked rename records reconstruct the destination from
+the live source; logged native pointers and contexts are not reused. Rename flag updates use the replay
+transaction's storage context without recreating the native index.
+
+### Migration
+
+Migrating a Vector Set between two primaries (either as part of a `MIGRATE ... KEYS` or migration of a whole hash slot) is complicated by storing element data in namespaces.
+
+Migration preserves import flags. Pending and terminally failed imports arrive without a native handle;
+an eligible FINISH recreates it on demand, while terminal failures remain blocked.
+
+Namespaces (intentionally) do not participate in hash slots or clustering, and are a node specific concept.  This means that migration must also update the namespaces of elements as they are migrated.
+
+At a high level, migration between the originating primary a destination primary behaves as follows:
+ 1. Once target slots transition to `MIGRATING`...
+    * An addition to `ClusterSession.SingleKeySlotVerify` causes all WRITE Vector Set commands to pause once a slot is `MIGRATING` or `IMPORTING` - this is necessary because we cannot block based on the key as Vector Sets are composed of many key-value pairs across several namespaces
+ 2. `VectorManager` on the originating primary enumerates all _namespaces_ and Vector Sets that are covered by those slots
+ 3. The originating primary contacts the destination primary and reserves enough new Vector Set contexts to handled those found in step 2
+    * These Vector Sets are "in use" but also in a migrating state in `ContextMetadata`
+ 4. During the scan of the store in `MigrateOperation` any keys found with namespaces found in step 2 are migrated, but their namespace is updated prior to transmission to the appropriate new namespaces reserved in step 3
+    * Unlike with normal keys, we do not _delete_ the keys in namespaces as we enumerate them
+    * Also unlike with normal keys, we synthesize a write on the _destination_ (using a special arg and `VADD`) so replicas of the destination also get these writes
+ 5. Once all namespace keys are migrated, we migrate the Vector Set index keys, but mutate their values to have the appropriate context reserved in step 3
+    * As in 4, we synthesize a write on the _destination_ to tell any replicas to also create the index key
+ 6. When the target slots transition back to `STABLE`, we do a delete of the Vector Set index keys, drop the DiskANN indexes, and schedule the original contexts for cleanup on the originating primary
+    * Unlike in 4 & 5, we do no synthetic writes here.  The normal replication of `DEL` will cleanup replicas of the originating primary.
+
+ `KEYS` migrations differ only in the slot discovery being omitted.  We still have to determine the migrating namespaces, reserve new ones on the destination primary, and schedule cleanup only once migration is completed.  This does mean that, if any of the keys being migrated is a Vector Set, `MIGRATE ... KEYS` causes a scan of the store.
+
+> [!NOTE]
+> This approach prevents the Vector Set from being visible when it is partially migrated, which has the desirable property of not returning weird results during a migration.
+
+> [!NOTE]
+> While we explicitly reserve contexts on primaries, they are implicit on replicas.  This is because a replica should always come up with the same determination of reserved contexts.
+>
+> To keep that determinism, the synthetic `VADD`s introduced by migration are not executed in parallel.
+
+## Cleanup
+
+Deleting a Vector Set only drops the DiskANN index and removes the top-level keys (ie. the index key).  This leaves all element, attribute, neighbor lists, etc. still in the Tsavorite store.
+
+To clean up the remaining data we record the deleted index context value in `ContextMetadata` and then schedule a full sweep of the Tsavorite store looking for any keys under namespaces related to that context.  When we find those keys we delete them, see `VectorManager.RunCleanupTaskAsync()` and `VectorManager.PostDropCleanupFunctions` for details.
+
+> [!NOTE]
+> There isn't really an elegant way to avoid scanning the whole keyspace which can take awhile to free everything up.
+>
+> If we wanted to explore better options, we'd need to build something that can drop whole namespaces at once in Tsavorite.
+
+## Recovery
+
+Vector Sets represent a unique kind of recovery because most operations are mediated through DiskANN, for which we only ever have a pointer to a data structure.  This means that recovery needs to both deal with Vector Sets metadata AND the recreation of the DiskANN side of things.
+
+### Vector Set Metadata
+
+During startup we discover any old `ContextMetadata`s in Tsavorite via `GarnetRecordTriggers.OnRecoverySnapshotRead`.  Once all records are recovered, `VectorManager.ResumePostRecovery()` populates the cache `ContextMetadata` array, cancels any abandoned migrations, cancels any abandoned index deletions, and resumes cleanups that were interrupted.
+
+### Vector Sets
+
+While reading out [`Index`](#indexes) before performing a DiskANN function call, we check the stored `IndexPtr`.  If it is null, we know that the DiskANN side needs to be recreated.
+
+To recreate, we acquire exclusive locks (in the same way we would for `VADD` or `DEL`) and invoke `create_index` again.  From DiskANN's perspective, there's no difference between creating a new empty index and recreating an old one which has existing data.
+
+This means we recreate indexes lazily after recovery.  Consequently the _first_ command (regardless of if it's a `VADD`, a `VSIM`, or whatever) against an index after recovery will be slower since it needs to do extra work, and will block other commands since it needs exclusive locking.
+
+## DiskANN Integration
+
+Almost all of how Vector Sets actually function is handled by DiskANN.  Garnet just embeds it, translates between RESP commands and DiskANN functions, and manages storage.
+
+In order for DiskANN to access and store data in Garnet, we provide a set of callbacks.  All callbacks are `[UnmanagedCallersOnly]` and converted to function pointers before they are passed to Garnet.
+
+All callbacks take a `ulong context` parameter which identifies the Vector Set involved (the high 61-bits of the context) and the associated namespace (the low 3-bits of the context).  On the Garnet side, the whole `context` is effectively a namespace, but from DiskANN's perspective the top 61-bits are an opaque identifier.
+
+### Read Callback
+
+The most complicated of our callbacks, the signature is:
+```csharp
+void ReadCallbackUnmanaged(ulong context, uint numKeys, uint valueLengthHint, nint keysData, nuint keysLength, nint dataCallback, nint dataCallbackContext)
+```
+
+`context` identifies which Vector Set is being operated on AND the associated namespace, `numKeys` tells us how many keys have been encoded into `keysData`, `keysData` and `keysLength` define a `Span<byte>` of length prefixied keys, `dataCallback` is a `delegate* unmanaged[Cdecl, SuppressGCTransition]<int, nint, nint, nuint, void>` used to push found keys back into DiskANN, and `dataCallbackContext` is passed back unaltered to `dataCallback`.
+
+`valueLengthHint` is the number of bytes DiskANN expects _each_ record to be if found.  This value is just a hint, it's OK if it's wrong.  It is better to be too large than too small, within reason.
+
+In the `Span<byte>` defined by `keysData` and `keysLength` the keys are length prefixed with a 4-byte little endian `int`.
+
+As we find keys, we invoke `dataCallback(index, dataCallbackContext, dataPointer, dataLengthLength)`.  Invocations may be out of order, so `index` must be used to correlate data with keys.  If a key is not found, its index is simply skipped.  The benefits of this is that we don't copy data out of the Tsavorite log as part of reads, DiskANN is able to do distance calculations and traversal over in-place data.
+
+> [!NOTE]
+> Each invocation of `dataCallback` is a managed -&gt; native transition, which can add up very quickly.  We've reduced that as much as possible with function points and `SuppressGCTransition`, but that comes with risks.
+>
+> In particular if DiskANN raises an error or blocks in the `dataCallback` expect very bad things to happen, up to the runtime corrupting itself.  Great care must be taken to keep the DiskANN side of this call cheap and reliable.
+
+> [!IMPORTANT]
+> Tsavorite has been extended with a `ContextReadWithPrefetch` method to accommodate this pattern, which also employs prefetching when we have batches of keys to lookup.
+>
+> Additionally, some experimentation to figure out good prefetch sizes (and if [AMAC](https://dl.acm.org/doi/10.14778/2856318.2856321) is useful) based on hardware is merited.  Right now we've chosen 12 based on testing with some 96-core Intel machines, but that is unlikely to be correct in all interesting circumstances.
+
+### Write Callback
+
+A simpler callback, the signature is:
+```csharp
+byte WriteCallbackUnmanaged(ulong context, nint keyData, nuint keyLength, nint writeData, nuint writeLength)
+```
+
+`context` identifies which Vector Set is being operated on AND the associated namespace,  `keyData` and `keyLength` represent a `Span<byte>` of the key to write, and `writeData` and `writeLength` represent a `Span<byte>` of the value to write.
+
+DiskANN guarantees an extra 4-bytes BEFORE `keyData` that we can safely modify.
+
+This callback returns 1 if successful, and 0 otherwise.
+
+### Delete Callback
+
+Another simple callback, the signature is:
+```csharp
+byte DeleteCallbackUnmanaged(ulong context, nint keyData, nuint keyLength)
+```
+
+`context` identifies which Vector Set is being operated on AND the associated namespace,  and `keyData` and `keyLength` represent a `Span<byte>` of the key to delete.
+
+As with the write callback, DiskANN guarantees an extra 4-bytes BEFORE `keyData`.
+
+This callback returns 1 if the key was found and removed, and 0 otherwise.
+
+### Read Modify Write Callback
+
+A more complicated callback, the signature is:
+```csharp
+byte ReadModifyWriteCallbackUnmanaged(ulong context, nint keyData, nuint keyLength, nuint writeLength, nint dataCallback, nint dataCallbackContext)
+```
+
+`context` identifies which Vector Set is being operated on AND the associated namespace,  and `keyData` and `keyLength` represent a `Span<byte>` of the key to create, read, or update.
+
+`writeLength` is the desired number of bytes, this is only used used if we are creating a new key-value pair.
+
+As with the write and delete callbacks, DiskANN guarantees an extra 4-bytes BEFORE `keyData`.
+
+After we allocate a new key-value pair or find an existing one, `dataCallback(nint dataCallbackContext, nint dataPointer, nuint dataLength)` is called.  Changes made to data in this callback are persisted.  This needs to be _fast_ to prevent gumming up Tsavorite, as we are under epoch protection.
+
+Newly allocated values are guaranteed to be all zeros.
+
+The callback returns 1 if the key-value pair was found or created, and 0 if some error occurred.
+
+### Filter Callback
+
+A simple callback providing a way for _Garnet_ to tell DiskANN if an attribute matches the current filter.  Its signature is:
+```csharp
+byte FilterCallbackUnmanaged(ulong context, nint valueData, nuint valueLength)
+```
+
+`context` identifies whcih Vector Set is being operated on (the associated namespace is ignored), and `valueData` and `valueLength` represent a `Span<byte>` of the attribute to check.
+
+The current filter is ambient state that Garnet has already parsed and validated.
+
+If the attribute matches the current filter, 1 is returned and otherwise 0 is returned.
+
+### Log Callback
+
+A simple callback providing a way for DiskANN to log richer error messages into Garnet.  Its signature is:
+```csharp
+void LogCallbackUnmanaged(ulong context, nint logMessage, nuint logMessageLength)
+```
+
+`context` identifies which Vector Set is being operated on AND the associated namespace, and `logMessage` and `logMessageLength` represent a `Span<byte>` of the log message.
+
+The log message is UTF8 encoded text.
+
+This log message is enriched on the Garnet side with:
+ - The context without namespace bits
+ - A text version of the namespace
+ - Our best guess at the Vector Set currently operated on
+ - The number of arguments for the command being processed
+
+### DiskANN Functions
+
+Garnet calls into the following DiskANN functions:
+
+ - [x] `nint create_index(ulong context, uint dimensions, uint reduceDims, VectorQuantType quantType, VectorDistanceMetricType distanceMetric, uint buildExplorationFactor, uint numLinks, uint startPointId, nint readCallback, nint writeCallback, nint deleteCallback, nint readModifyWriteCallback, nint filterCallback, nint logCallback, out bool quantizationNeeded)`
+ - [x] `void drop_index(ulong context, nint index)`
+ - [x] `DiskANNInsertResult insert(ulong context, nint index, nint id_data, nuint id_len, nint vector_data, nuint vector_len, nint attribute_data, nuint attribute_len)`
+   * `vector_data` must be aligned for the quantizers underlying type (i.e. 4-byte for NOQUANT, 1-byte for XBIN_U8, etc.)
+ - [x] `byte remove(ulong context, nint index, nint id_data, nuint id_len)`
+ - [x] `byte set_attribute(ulong context, nint index, nint id_data, nuint id_len, nint attribute_data, nuint attribute_len)`
+ - [x] `int search_vector(ulong context, nint index, nint vector_data, nuint vector_len, float delta, uint search_exploration_factor, nint filter_data, nuint filter_len, nuint max_filtering_effort, nint output_ids, nuint output_ids_len, nint output_distances, nuint output_distances_len, uint beam_width, nint continuation)`
+   * `vector_data` must be aligned as with `insert(...)`
+ - [x] `int search_element(ulong context, nint index, nint id_data, nuint id_len, float delta, int search_exploration_factor, nint filter_data, nuint filter_len, nuint max_filtering_effort, nint output_ids, nuint output_ids_len, nint output_distances, nuint output_distances_len, uint beam_width, nint continuation)`
+ - [x] `int search_neighbors(ulong context, nint index, nint id_data, nuint id_len, nint output_ids, nuint output_ids_len, nint output_distances, nuint output_distances_len, nint continuation)`
+ - [x] `int overflow_results(ulong context, nint index, nint continuation, nint output_ids, nuint output_ids_len, nint output_distances, nuint output_distances_len, nint new_continuation)`
+ - [x] `ulong card(ulong context, nint index)`
+ - [x] `byte check_internal_id_valid(ulong context, nint index, nint internal_id, nuint internal_id_len)`
+ - [x] `void build_quant_table(ulong context, nint index)`
+ - [x] `byte backfill_quant_vectors(ulong context, nint index, nuint task_index, nuint task_count)`
+ - [x] `byte random_members(ulong context, nint index, uint count, nint output_ids, nuint output_ids_len)`
+
+ Some non-obvious subtleties:
+  - The number of results _requested_ from `search_vector` and `search_element` is indicated by `output_distances_len`
+  - `output_distances_len` is the number of _floats_ in `output_distances`, not bytes
+  - When inserting and searching, the `VectorQuantType` used to create the index defines the expected format of `vector_data` and whether `vector_len` is counting bytes, floats, etc.
+  - `byte` returning functions are effectively returning booleans, `0 == false` and `1 == true`
+  - `index` is always a pointer created by DiskANN and returned from `create_index`
+  - `context` is always the `Context` value created by Garnet and stored in [`Index`](#indexes) for a Vector Set, this implies it is always a non-0 multiple of 8
+  - `search_vector`, `search_element`, and `overflow_results` all return the number of ids written into `output_ids`, and if there are more values to return they set the `nint` _pointed to by_ `continuation` or `new_continuation`
+    * `continuation`/`new_continuation` must be passed exactly once to `overflow_results` to fetch remaining results.  Failing to call `overflow_results` can result in a memory leak, and passing more than once can result in a use-after-free.
+  - DiskANN guarantees that any keys it provides are aligned in records, i.e. they are multiples of 4-bytes in length
+  - Garnet guarantees any values it provides to _`dataCallbacks`_ are 4-byte aligned
+    * Importantly Garnet does not guarantee id holding parameters to DiskANN functions are aligned unless otherwise noted
+
+### Vector Filter Expressions (`VSIM ... FILTER`)
+
+`VSIM` supports `FILTER <expression>` for attribute-based post filtering.
+
+#### Expression syntax
+
+- Arithmetic: `+`, `-`, `*`, `/`, `%`, `**`
+- Comparison: `==`, `!=`, `>`, `<`, `>=`, `<=`
+- Logical: `and`, `or`, `not` (also `&&`, `||`, `!`)
+- Containment: `in`
+- Grouping: parentheses `()`
+
+Field access uses dot notation (for example, `.year`, `.rating`, `.genre`).
+
+#### Supported values
+
+- Numbers (integer and floating-point, e.g. `42`, `3.14`, `-5`)
+- Strings (double or single quoted, e.g. `"action"`, `'drama'`)
+- Booleans (`true` / `false`, evaluated as `1.0` / `0.0`)
+- Null (`null`, for equality checks like `.field != null`)
+- Tuple literals (for `in`, e.g. `.director in ["Spielberg", "Nolan"]`)
+- JSON arrays (for `in` when the right side is an attribute array field, e.g. `"classic" in .tags`)
+
+#### Operator precedence (low to high)
+
+Precedence matches the internal `OpTable` and determines evaluation order:
+
+| Precedence | Operators                              | Description                      |
+|------------|----------------------------------------|----------------------------------|
+| 0          | `or`, `\|\|`                           | Logical OR                       |
+| 1          | `and`, `&&`                            | Logical AND                      |
+| 2          | `>`, `>=`, `<`, `<=`, `==`, `!=`, `in` | Comparison and containment       |
+| 3          | `+`, `-`                               | Addition and subtraction         |
+| 4          | `*`, `/`, `%`                          | Multiplication, division, modulo |
+| 5          | `**`                                   | Power (right-associative)        |
+| 6          | `not`, `!`                             | Logical NOT (unary)              |
+
+#### `in` operator
+
+The `in` operator supports three use cases:
+
+- **Tuple literal membership:** `.director in ["Spielberg", "Nolan", "Kubrick"]`
+- **JSON array membership:** `"classic" in .tags` (when `.tags` is a JSON array)
+- **String substring:** `"act" in .genre` (when `.genre` is a string, checks substring containment)
+
+#### Limits
+
+Filter expressions are compiled and evaluated entirely on the thread stack (~9 KB) with zero heap allocation. This imposes fixed upper bounds:
+
+| Limit                      | Value | What it means                                                                                                                         | On overflow                                |
+|----------------------------|-------|---------------------------------------------------------------------------------------------------------------------------------------|--------------------------------------------|
+| Max tokens                 | 128   | Total number of operands + operators in the expression. A typical `.a > 1 and .b < 2` uses 7 tokens. 128 supports ~18 AND/OR clauses. | Compile error — filter returns no results  |
+| Max tuple elements         | 64    | Total elements across all `[...]` literals (e.g. `.x in [1,2,...,64]`)                                                                | Compile error                              |
+| Max runtime array elements | 64    | Total elements extracted from JSON array fields (for `in .tags`) across all candidates. Reset per candidate.                          | Array treated as null — `in` returns false |
+| Max unique selectors       | 32    | Unique field names referenced (e.g. `.year`, `.rating`). 32 supports very complex filters.                                            | Extra selectors silently ignored           |
+| Max eval stack depth       | 16    | Postfix evaluation stack depth. Typical expressions use 3–4.                                                                          | Candidate excluded                         |
+| Max parenthesis nesting    | 128   | Currently bounded by token buffer size                                                                                                | Compile error                              |
+
+#### Notes
+
+- Keywords are case-sensitive lowercase (`and`, `or`, `not`, `in`, `true`, `false`, `null`)
+- Missing attributes cause the filter to return false for that candidate
+- Escaped strings are supported (e.g. `"hello\"world"`) and compared correctly
+- `VSIM` query source can be either `ELE <element-id>` or `VALUES <dimensions> <v1> ... <vN>`
+
+#### Examples
+
+```text
+VSIM movies ELE dune FILTER '.year >= 1980 and .rating > 7'
+VSIM movies ELE dune FILTER '.genre == "action" && .rating > 8.0'
+VSIM movies ELE dune FILTER '"classic" in .tags'
+VSIM movies ELE dune FILTER '.director in ["Spielberg", "Nolan"]'
+VSIM movies ELE dune FILTER '(.year - 2000) ** 2 < 100 and .rating / 2 > 4'
+VSIM movies ELE dune FILTER '.year != null and .rating >= 4.0'
+VSIM movies VALUES 3 0.12 0.34 0.56 FILTER '.year >= 1980 and .rating > 7'
+```
+
+> [!IMPORTANT]
+> These p/invoke definitions are all a little rough and should be cleaned up.
+>
+> They were defined very loosely to ease getting the .NET &lt;-&gt; Rust interface working quickly.

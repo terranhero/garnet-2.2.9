@@ -1,0 +1,251 @@
+﻿// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using CommandLine;
+using Microsoft.Extensions.Logging;
+
+namespace Resp.benchmark
+{
+    public partial class Options
+    {
+        [Option('p', "port", Required = false, Default = 6379, HelpText = "Port to connect to")]
+        public int Port { get; set; }
+
+        [Option('h', "host", Required = false, Default = "127.0.0.1", HelpText = "IP address to connect to")]
+        public string Address { get; set; }
+
+        [Option("clientaddr", Required = false, HelpText = "IP address of client")]
+        public string ClientAddress { get; set; }
+
+        [Option('s', "skipload", Required = false, Default = false, HelpText = "Skip loading phase")]
+        public bool SkipLoad { get; set; }
+
+        [Option("workload-seed", Required = false, Default = -1, HelpText = "Seed for cluster-bench workload key generation/selection. -1 (default) auto-generates a unique per-process random seed (via Guid) so multiple benchmark instances running the same command in parallel scramble their in-range key selection independently, avoiding cross-instance lockstep on identical keys (which maximizes server-side contention). The seed only reshuffles selection within the loaded [0, DbSize) key domain, so preload/GET semantics are preserved. Set an explicit value for reproducible key selection across instances.")]
+        public int WorkloadSeed { get; set; }
+
+        [Option("offline-buffers", Required = false, Default = 128, HelpText = "Number of pre-generated request-buffer permutations per shard in cluster-bench offline mode. More permutations reduce the chance that concurrent workers select the same buffer (and thus hammer the same keys) at the same instant. Higher values increase client memory usage (~batchSize x (keyLen+valueLen+overhead) bytes per buffer, per shard).")]
+        public int OfflineBufferPermutations { get; set; }
+
+        [Option("dbsize", Required = false, Default = 1 << 10, HelpText = "DB size")]
+        public int DbSize { get; set; }
+
+        [Option("totalops", Required = false, Default = 1 << 25, HelpText = "Total ops")]
+        public int TotalOps { get; set; }
+
+        [Option("op", Required = false, Default = OpType.GET, HelpText = "Operation type (GET, SET, MGET, MSET, INCR, PING, ZADDREM, PFADD, ZADDCARD)")]
+        public OpType Op { get; set; }
+
+        [Option("keylength", Required = false, Default = 8, HelpText = "Key length (bytes) - padded, 0 indicates pad to max DB size")]
+        public int KeyLength { get; set; }
+
+        [Option("valuelength", Required = false, Default = 8, HelpText = "Value length (bytes) - 0 indicates use key as value")]
+        public int ValueLength { get; set; }
+
+        [Option('b', "batchsize", Separator = ',', Required = false, Default = new[] { 4096 }, HelpText = "Batch size / pipeline depth (for GET/SET: number of commands, for MGET/MSET: number of keys per command)")]
+        public IEnumerable<int> BatchSize { get; set; }
+
+        [Option("pipeline", Separator = ',', Required = false, Hidden = true, HelpText = "Alias for --batchsize")]
+        public IEnumerable<int> Pipeline { set { if (value != null && value.Any()) BatchSize = value; } get => BatchSize; }
+
+        [Option("runtime", Required = false, Default = 15, HelpText = "Run time (seconds)")]
+        public int RunTime { get; set; }
+
+        [Option('t', "threads", Separator = ',', Default = new[] { 1, 2, 4, 8, 16, 32 }, HelpText = "Number of threads (comma separated)")]
+        public IEnumerable<int> NumThreads { get; set; }
+
+        [Option("load-threads", Required = false, Default = 8, HelpText = "Number of threads used for the initial data load phase")]
+        public int LoadThreads { get; set; }
+
+        [Option('a', "auth", Required = false, Default = null, HelpText = "Authentication password")]
+        public string Auth { get; set; }
+
+        [Option("burst", Required = false, Default = false, HelpText = "Wait for response or burst the system (GarnetClientSession)")]
+        public bool Burst { get; set; }
+
+        [Option("lset", Required = false, Default = false, HelpText = "Use set instead of mset to load data for benchmarking.")]
+        public bool LSet { get; set; }
+
+        [Option("zipf", Required = false, Default = false, HelpText = "Zipf data distribution (0.99)")]
+        public bool Zipf { get; set; }
+
+        [Option("client", Required = false, Default = ClientType.LightClient, HelpText = "Choose ClientType to run benchmark (LightClient, SERedis, GarnetClientSession)")]
+        public ClientType Client { get; set; }
+
+        [Option("pool", Required = false, Default = false, HelpText = "Pool client instances. For cluster-bench: enables worker pool architecture (scalable for large clusters). For online bench: pools SERedis, GarnetClient and GarnetClientSession instances.")]
+        public bool Pool { get; set; }
+
+        [Option("broadcast", Required = false, Default = false, HelpText = "Enable broadcast mode in worker pool (--pool). Sends a request to every shard in parallel, then completes all pending responses.")]
+        public bool Broadcast { get; set; }
+
+        [Option("tls", Required = false, Default = false, HelpText = "Enable TLS.")]
+        public bool EnableTLS { get; set; }
+
+        [Option("tlshost", Required = false, Default = "GarnetTest", HelpText = "TLS remote host name.")]
+        public string TlsHost { get; set; }
+
+        [Option("cert-file-name", Required = false, HelpText = "TLS certificate file name (example: testcert.pfx).")]
+        public string CertFileName { get; set; }
+
+        [Option("cert-password", Required = false, HelpText = "TLS certificate password (example: placeholder).")]
+        public string CertPassword { get; set; }
+
+        [Option("cert-password-file", Required = false, HelpText = "File containing the TLS certificate password.")]
+        public string CertPasswordFile { get; set; }
+
+        [Option("issuer-certificate-path", Required = false, HelpText = "CA certificate used to validate the TLS server certificate.")]
+        public string IssuerCertificatePath { get; set; }
+
+        [Option('o', "online", Required = false, Default = false, HelpText = "Online get/set mix based on --readpercent.")]
+        public bool Online { get; set; }
+
+        [Option('x', "txn", Required = false, Default = false, HelpText = "Transaction micro benchmark")]
+        public bool Txn { get; set; }
+
+        [Option("itp", Required = false, Default = 1, HelpText = "Intra-thread parallelism (online bench only).")]
+        public int IntraThreadParallelism { get; set; }
+
+        [Option("sync", Required = false, Default = false, HelpText = "Sync mode (online bench GarnetClient only).")]
+        public bool SyncMode { get; set; }
+
+        [Option("ttl", Required = false, Default = 0, HelpText = "Ttl for keys, required if --op is SETEX, or can be used to generate keys with expiration (both string and zset) in online benchmarks. ")]
+        public int Ttl { get; set; }
+
+        [Option("sscardinality", Required = false, Default = 0, HelpText = "Number of unique sorted sets. Same key will always go to the same sorted set.")]
+        public int SortedSetCardinality { get; set; }
+
+        [Option("client-hist", Required = false, Default = false, HelpText = "Enable client side latency tracking through internal client histogram.")]
+        public bool ClientHistogram { get; set; }
+
+        [Option("op-percent", Separator = ',', Default = new[] { 60, 30, 10 }, HelpText = "Percent of commands executed from workload")]
+        public IEnumerable<int> OpPercent { get; set; }
+
+        [Option("op-workload", Separator = ',', Default = new[] { OpType.GET, OpType.SET, OpType.DEL }, HelpText = "Workload of commands for online bench.")]
+        public IEnumerable<OpType> OpWorkload { get; set; }
+
+        [Option("save-freq", Required = false, Default = 0, HelpText = "Save (checkpoint) frequency in seconds")]
+        public int SaveFreqSecs { get; set; }
+
+        [Option("logger-level", Required = false, Default = LogLevel.Information, HelpText = "Logging level")]
+        public LogLevel LogLevel { get; set; }
+
+        [Option("disable-console-logger", Required = false, Default = false, HelpText = "Disable console logger.")]
+        public bool DisableConsoleLogger { get; set; }
+
+        [Option("file-logger", Required = false, Default = null, HelpText = "Enable file logger and write to the specified path.")]
+        public string FileLogger { get; set; }
+
+        [Option("cluster-bench", Required = false, Default = false, HelpText = "Enable cluster benchmark mode. Distributes workload across discovered cluster shards.")]
+        public bool ClusterBench { get; set; }
+
+        [Option("replica-ops-percent", Required = false, Default = 0, HelpText = "Percentage of operations routed to replicas (0-100). For write ops (SET, MSET), generates corresponding reads (GET, MGET) for the same keys and routes them to replicas. Actual: X% writes to primary, (100-X)% reads split between replica/primary based on this percentage.")]
+        public int ReplicaOpsPercent { get; set; }
+
+        [Option("aof-bench", Required = false, Default = false, HelpText = "Run AOF bench at replica.")]
+        public bool AofBench { get; set; }
+
+        [Option("aof-bench-type", Required = false, Default = AofBenchType.Replay, HelpText = "Run AOF bench at replica.")]
+        public AofBenchType AofBenchType { get; set; }
+
+        [Option("aof-gen-pages", Required = false, Default = 64, HelpText = "DB size")]
+        public int AofGenPages { get; set; }
+
+        /*
+         * InProc/AofBench server options
+         */
+        [Option("aof", Required = false, Default = false, HelpText = "Enable AOF")]
+        public bool EnableAOF { get; set; }
+
+        [Option("cluster", Required = false, Default = false, HelpText = "Enable Cluster")]
+        public bool EnableCluster { get; set; }
+
+        [Option('i', "index", Required = false, Default = "1g", HelpText = "Start size of hash index in bytes (rounds down to power of 2)")]
+        public string IndexMemorySize { get; set; }
+
+        [Option("aof-null-device", Required = false, HelpText = "With main-memory replication, use null device for AOF. Ensures no disk IO, but can cause data loss during replication.")]
+        public bool UseAofNullDevice { get; set; }
+
+        [Option("aof-commit-freq", Required = false, Default = 0, HelpText = "Write ahead logging (append-only file) commit issue frequency in milliseconds. 0 = issue an immediate commit per operation, -1 = manually issue commits using COMMITAOF command")]
+        public int CommitFrequencyMs { get; set; }
+
+        [Option("aof-physical-sublog-count", Required = false, Default = 1, HelpText = "Number of sublogs used for AOF.")]
+        public int AofPhysicalSublogCount { get; set; }
+
+        [Option("aof-replay-task-count", Required = false, Default = 1, HelpText = "Number of replay tasks per physical sublog at the replica.")]
+        public int AofReplayTaskCount { get; set; }
+
+        [Option("aof-memory-size", Required = false, Default = "128m", HelpText = "Total AOF memory buffer used in bytes (rounds down to power of 2) - spills to disk after this limit. Must be at least twice AofPageSize.")]
+        public string AofMemorySize { get; set; }
+
+        [Option("aof-page-size", Required = false, Default = "32m", HelpText = "Size of each AOF page in bytes (rounds down to power of 2). Must be at least twice the main-log PageSize.")]
+        public string AofPageSize { get; set; }
+
+        /// <summary>
+        /// Parse size from string specification
+        /// </summary>
+        /// <param name="value"></param>
+        /// <param name="bytesRead"></param>
+        /// <returns></returns>
+        public static long ParseSize(string value, out int bytesRead)
+        {
+            ReadOnlySpan<char> suffix = ['k', 'm', 'g', 't', 'p'];
+            long result = 0;
+            bytesRead = 0;
+            for (var i = 0; i < value.Length; i++)
+            {
+                var c = value[i];
+                if (char.IsDigit(c))
+                {
+                    result = (result * 10) + (byte)c - '0';
+                    bytesRead++;
+                }
+                else
+                {
+                    for (var s = 0; s < suffix.Length; s++)
+                    {
+                        if (char.ToLower(c) == suffix[s])
+                        {
+                            result *= (long)Math.Pow(1024, s + 1);
+                            bytesRead++;
+
+                            if (i + 1 < value.Length && char.ToLower(value[i + 1]) == 'b')
+                                bytesRead++;
+
+                            return result;
+                        }
+                    }
+                }
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Get AOF Page size in bits
+        /// </summary>
+        /// <returns></returns>
+        public int AofPageSizeBits()
+        {
+            var size = ParseSize(AofPageSize, out _);
+            var adjustedSize = PreviousPowerOf2(size);
+            return (int)Math.Log(adjustedSize, 2);
+        }
+
+        /// <summary>
+        /// Previous power of 2
+        /// </summary>
+        /// <param name="v"></param>
+        /// <returns></returns>
+        internal static long PreviousPowerOf2(long v)
+        {
+            v |= v >> 1;
+            v |= v >> 2;
+            v |= v >> 4;
+            v |= v >> 8;
+            v |= v >> 16;
+            v |= v >> 32;
+            return v - (v >> 1);
+        }
+
+        public bool IsReplayEnabled
+            => AofBenchType is AofBenchType.Replay or AofBenchType.ReplayNoResp or AofBenchType.ReplayDirect;
+    }
+}

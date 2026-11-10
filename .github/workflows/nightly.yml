@@ -1,0 +1,139 @@
+name: Garnet Nightly Tests
+on:
+  schedule:
+    - cron:  '0 9 * * *' # Runs at 09:00 UTC, which is 1:00 AM PST
+  workflow_dispatch:
+
+env:
+  DOTNET_SKIP_FIRST_TIME_EXPERIENCE: 1
+  DOTNET_NOLOGO: true
+
+permissions:
+  contents: write  
+  
+jobs:
+  # Garnet standalone tests
+  test-garnet-standalone:
+    name: Garnet Standalone
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        test: [ 'Garnet.test', 'Garnet.test.collections', 'Garnet.test.acl', 'Garnet.test.scripting', 'Garnet.test.complexstring', 'Garnet.test.vectorset', 'Garnet.test.rangeindex', 'Garnet.test.extensions' ]
+        os: [ ubuntu-latest, windows-latest ]
+        framework: [ 'net10.0' ]
+        configuration: [ 'Debug', 'Release' ]
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+      - name: Install dependencies
+        run: dotnet restore
+      - name: Check style format
+        run: dotnet format --verify-no-changes --verbosity diagnostic
+      - name: Build Garnet
+        run: dotnet build --configuration ${{ matrix.configuration }} --no-restore
+      - name: Run tests ${{ matrix.test }}
+        run: dotnet test test/standalone/${{ matrix.test }} -f ${{ matrix.framework }} --configuration ${{ matrix.configuration }} --logger "console;verbosity=detailed" --logger trx --results-directory "${{ matrix.test }}-${{ matrix.os }}-${{ matrix.framework }}-${{ matrix.configuration }}" -- NUnit.DisplayName=FullName
+        timeout-minutes: 55
+      - name: Upload test results
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.test }}-${{ matrix.os }}-${{ matrix.framework }}-${{ matrix.configuration }}
+          path: ${{ matrix.test }}-${{ matrix.os }}-${{ matrix.framework }}-${{ matrix.configuration }}
+        if: ${{ always() }}
+
+  # Garnet cluster tests
+  test-garnet-cluster:
+    name: Garnet Cluster
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        test: [ 'Garnet.test.cluster', 'Garnet.test.cluster.migrate', 'Garnet.test.cluster.replication', 'Garnet.test.cluster.replication.tls', 'Garnet.test.cluster.replication.asyncreplay', 'Garnet.test.cluster.replication.disklesssync', 'Garnet.test.cluster.replication.vectorsets', 'Garnet.test.cluster.vectorsets', 'Garnet.test.cluster.multilog' ]
+        os: [ ubuntu-latest, windows-latest ]
+        framework: [ 'net10.0' ]
+        configuration: [ 'Debug', 'Release' ]
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+      - name: Install dependencies
+        run: dotnet restore
+      - name: Build Garnet
+        run: dotnet build --configuration ${{ matrix.configuration }} --no-restore
+      - name: Run tests ${{ matrix.test }}
+        run: dotnet test test/cluster/${{ matrix.test }} -f ${{ matrix.framework }} --configuration ${{ matrix.configuration }} --logger "console;verbosity=detailed" --logger trx --results-directory "${{ matrix.test }}-${{ matrix.os }}-${{ matrix.framework }}-${{ matrix.configuration }}" -- NUnit.DisplayName=FullName
+        timeout-minutes: 55
+      - name: Upload test results
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.test }}-${{ matrix.os }}-${{ matrix.framework }}-${{ matrix.configuration }}
+          path: ${{ matrix.test }}-${{ matrix.os }}-${{ matrix.framework }}-${{ matrix.configuration }}
+        if: ${{ always() }}
+
+  # Tsavorite tests
+  test-tsavorite:
+    name: Tsavorite
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        test: [ 'Tsavorite.test', 'Tsavorite.test.recordops', 'Tsavorite.test.session', 'Tsavorite.test.session.context', 'Tsavorite.test.hlog', 'Tsavorite.test.recovery', 'Tsavorite.test.stress' ]
+        os: [ ubuntu-latest, windows-latest ]
+        framework: [ 'net10.0' ]
+        configuration: [ 'Debug', 'Release' ]
+    steps:
+      - name: Check out code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+      - name: Set environment variable for Linux
+        run: echo "RunAzureTests=yes" >> $GITHUB_ENV
+        if: ${{ matrix.os == 'ubuntu-latest' }}
+      - name: Set environment variable for Windows
+        run: echo ("RunAzureTests=yes") >> $env:GITHUB_ENV
+        if: ${{ matrix.os == 'windows-latest' }}
+      - name: Setup .NET
+        uses: actions/setup-dotnet@a98b56852c35b8e3190ac28c8c2271da59106c68 # v6.0.0
+      - name: Setup Node.js for Azurite
+        uses: actions/setup-node@949feb2413d6458794dcd2491c4babbbce0c15c1 # v7.1.0
+        with:
+          node-version: '22'
+      - name: Cache Azurite
+        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: ${{ runner.os == 'Windows' && '%APPDATA%\npm-cache' || '~/.npm' }}
+          key: azurite-${{ runner.os }}
+      - name: Install and Run Azurite
+        shell: bash
+        run: |
+          npm install -g azurite
+          azurite --skipApiVersionCheck &
+      - name: Install dependencies
+        run: dotnet restore libs/storage/Tsavorite/cs/Tsavorite.slnx
+      - name: Build Tsavorite
+        run: dotnet build libs/storage/Tsavorite/cs/Tsavorite.slnx --configuration ${{ matrix.configuration }} --no-restore
+      - name: Resolve Tsavorite test directory
+        shell: pwsh
+        run: |
+          $tsavoriteDirMap = @{
+            'Tsavorite.test' = 'libs/storage/Tsavorite/cs/test'
+            'Tsavorite.test.recordops' = 'libs/storage/Tsavorite/cs/test/test.recordops'
+            'Tsavorite.test.session' = 'libs/storage/Tsavorite/cs/test/test.session'
+            'Tsavorite.test.session.context' = 'libs/storage/Tsavorite/cs/test/test.session.context'
+            'Tsavorite.test.hlog' = 'libs/storage/Tsavorite/cs/test/test.hlog'
+            'Tsavorite.test.recovery' = 'libs/storage/Tsavorite/cs/test/test.recovery'
+            'Tsavorite.test.stress' = 'libs/storage/Tsavorite/cs/test/test.stress'
+          }
+          $dir = $tsavoriteDirMap['${{ matrix.test }}']
+          echo "TSAVORITE_TEST_DIR=$dir" >> $env:GITHUB_ENV
+      - name: Run tests ${{ matrix.test }}
+        run: dotnet test ${{ env.TSAVORITE_TEST_DIR }} -f ${{ matrix.framework }} --configuration ${{ matrix.configuration }} --logger "console;verbosity=detailed" --logger trx --results-directory "${{ matrix.test }}-${{ matrix.os }}-${{ matrix.framework }}-${{ matrix.configuration }}"
+        timeout-minutes: 55
+      - name: Upload test results
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: ${{ matrix.test }}-${{ matrix.os }}-${{ matrix.framework }}-${{ matrix.configuration }}
+          path: ${{ matrix.test }}-${{ matrix.os }}-${{ matrix.framework }}-${{ matrix.configuration }}
+        if: ${{ always() }}

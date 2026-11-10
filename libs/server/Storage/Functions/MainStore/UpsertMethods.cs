@@ -1,0 +1,144 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Diagnostics;
+using System.Runtime.CompilerServices;
+using Garnet.common;
+using Tsavorite.core;
+using static Garnet.server.SessionFunctionsUtils;
+
+namespace Garnet.server
+{
+    /// <summary>
+    /// Callback functions for main store
+    /// </summary>
+    public readonly unsafe partial struct MainSessionFunctions : ISessionFunctions<StringInput, StringOutput, long>
+    {
+        /// <inheritdoc />
+        public bool InitialWriter(ref LogRecord dstLogRecord, in RecordSizeInfo sizeInfo, ref StringInput input, ReadOnlySpan<byte> srcValue, ref StringOutput output, ref UpsertInfo upsertInfo)
+        {
+            if (!dstLogRecord.TrySetValueSpanAndPrepareOptionals(srcValue, in sizeInfo))
+                return false;
+            if (input.HasEtag)
+            {
+                var etag = input.arg2;
+                if (etag != LogRecord.NoETag && !dstLogRecord.TrySetETag(etag))
+                    return false;
+            }
+            if (input.arg1 != 0 && !dstLogRecord.TrySetExpiration(input.arg1))
+                return false;
+            sizeInfo.AssertOptionalsIfSet(dstLogRecord.DataHeader);
+            return true;
+        }
+
+        /// <inheritdoc />
+        public bool InitialWriter(ref LogRecord dstLogRecord, in RecordSizeInfo sizeInfo, ref StringInput input, IHeapObject srcValue, ref StringOutput output, ref UpsertInfo upsertInfo)
+            => throw new GarnetException("String store should not be called with IHeapObject");
+
+        /// <inheritdoc />
+        public bool InitialWriter<TSourceLogRecord>(ref LogRecord dstLogRecord, in RecordSizeInfo sizeInfo, ref StringInput input, in TSourceLogRecord inputLogRecord, ref StringOutput output, ref UpsertInfo upsertInfo)
+            where TSourceLogRecord : ISourceLogRecord
+        {
+            if (inputLogRecord.DataHeader.ValueIsObject)
+                throw new GarnetException("String store should not be called with IHeapObject");
+            return dstLogRecord.TryCopyFrom(in inputLogRecord, in sizeInfo);
+        }
+
+        /// <inheritdoc />
+        public void PostInitialWriter(ref LogRecord logRecord, in RecordSizeInfo sizeInfo, ref StringInput input, ReadOnlySpan<byte> srcValue, ref StringOutput output, ref UpsertInfo upsertInfo)
+        {
+            functionsState.watchVersionMap.IncrementVersion(upsertInfo.KeyHash);
+            if (functionsState.appendOnlyFile != null)
+                upsertInfo.UserData |= NeedAofLog; // Mark that we need to write to AOF
+        }
+
+        /// <inheritdoc />
+        public void PostInitialWriter(ref LogRecord logRecord, in RecordSizeInfo sizeInfo, ref StringInput input, IHeapObject srcValue, ref StringOutput output, ref UpsertInfo upsertInfo)
+            => throw new GarnetException("String store should not be called with IHeapObject");
+
+        /// <inheritdoc />
+        public void PostInitialWriter<TSourceLogRecord>(ref LogRecord logRecord, in RecordSizeInfo sizeInfo, ref StringInput input, in TSourceLogRecord inputLogRecord, ref StringOutput output, ref UpsertInfo upsertInfo)
+            where TSourceLogRecord : ISourceLogRecord
+        {
+            functionsState.watchVersionMap.IncrementVersion(upsertInfo.KeyHash);
+            if (functionsState.appendOnlyFile != null)
+            {
+                Debug.Assert(!inputLogRecord.DataHeader.ValueIsObject, "String store should not be called with IHeapObject");
+                upsertInfo.UserData |= NeedAofLog; // Mark that we need to write to AOF
+            }
+        }
+
+        /// <inheritdoc />
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool InPlaceWriter(ref LogRecord logRecord, ref StringInput input, ReadOnlySpan<byte> srcValue, ref StringOutput output, ref UpsertInfo upsertInfo)
+        {
+            // Prevent SET from overwriting VectorSet or RangeIndex stubs. Normal string records have RecordType 0; skip all checks in that common case.
+            var recordType = logRecord.RecordType;
+            if (recordType != 0 && (recordType == VectorManager.RecordType || recordType == RangeIndexManager.RangeIndexRecordType))
+            {
+                upsertInfo.Action = UpsertAction.WrongType;
+                return false;
+            }
+
+            if (input.HasEtag)
+            {
+                var sizeInfo = new RecordSizeInfo { FieldInfo = GetUpsertFieldInfo(logRecord, srcValue, ref input) };
+                functionsState.storeWrapper.store.Log.PopulateRecordSizeInfo(ref sizeInfo);
+                if (!InitialWriter(ref logRecord, in sizeInfo, ref input, srcValue, ref output, ref upsertInfo))
+                    return false;
+                if (!sizeInfo.FieldInfo.HasETag && logRecord.DataHeader.HasETag)
+                    _ = logRecord.RemoveETag();
+                if (!sizeInfo.FieldInfo.HasExpiration && logRecord.DataHeader.HasExpiration)
+                    _ = logRecord.RemoveExpiration();
+                if (!logRecord.Info.Modified)
+                    functionsState.watchVersionMap.IncrementVersion(upsertInfo.KeyHash);
+            }
+            else if (!InPlaceWriterForSpanValue(ref logRecord, ref input, srcValue, ref output.SpanByteAndMemory, ref upsertInfo, this, functionsState, input.arg1))
+                return false;
+            if (functionsState.appendOnlyFile != null)
+                upsertInfo.UserData |= NeedAofLog; // Mark that we need to write to AOF
+            return true;
+        }
+
+        /// <inheritdoc />
+        public bool InPlaceWriter(ref LogRecord logRecord, ref StringInput input, IHeapObject srcValue, ref StringOutput output, ref UpsertInfo upsertInfo)
+        {
+            GarnetException.Throw("String store should not be called with IHeapObject");
+            return false;
+        }
+
+        /// <inheritdoc />
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool InPlaceWriter<TSourceLogRecord>(ref LogRecord logRecord, ref StringInput input, in TSourceLogRecord inputLogRecord, ref StringOutput output, ref UpsertInfo upsertInfo)
+            where TSourceLogRecord : ISourceLogRecord
+        {
+            if (inputLogRecord.DataHeader.ValueIsObject)
+                GarnetException.Throw("String store should not be called with IHeapObject");
+            if (!InPlaceWriterForLogRecordValue(ref logRecord, ref input, in inputLogRecord, ref output.SpanByteAndMemory, ref upsertInfo, this, functionsState))
+                return false;
+            if (functionsState.appendOnlyFile != null)
+                upsertInfo.UserData |= NeedAofLog; // Mark that we need to write to AOF
+            return true;
+        }
+
+        /// <inheritdoc />
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void PostUpsertOperation<TKey, TEpochAccessor>(TKey key, ref StringInput input, ReadOnlySpan<byte> valueSpan, ref UpsertInfo upsertInfo, TEpochAccessor epochAccessor)
+            where TKey : IKey, allows ref struct
+            where TEpochAccessor : IEpochAccessor
+        {
+            if ((upsertInfo.UserData & NeedAofLog) == NeedAofLog) // Check if we need to write to AOF
+                WriteLogUpsert(key.KeyBytes, ref input, valueSpan, upsertInfo.Version, upsertInfo.SessionID, epochAccessor);
+        }
+
+        /// <inheritdoc />
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void PostUpsertOperation<TKey, TEpochAccessor>(TKey key, ref StringInput input, IHeapObject valueObject, ref UpsertInfo upsertInfo, TEpochAccessor epochAccessor)
+            where TKey : IKey, allows ref struct
+            where TEpochAccessor : IEpochAccessor
+        {
+            throw new GarnetException("String store should not be called with IHeapObject");
+        }
+    }
+}

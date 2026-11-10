@@ -1,0 +1,1665 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.NetworkInformation;
+using System.Net.Security;
+using System.Net.Sockets;
+using System.Reflection;
+using System.Runtime.CompilerServices;
+using System.Security.Cryptography;
+using System.Security.Cryptography.X509Certificates;
+using System.Text;
+using System.Text.RegularExpressions;
+using System.Threading;
+using System.Threading.Tasks;
+using Garnet.client;
+using Garnet.common;
+using Garnet.server;
+using Garnet.server.Auth.Settings;
+using Garnet.server.TLS;
+using Microsoft.CodeAnalysis;
+using Microsoft.CodeAnalysis.CSharp;
+using Microsoft.CodeAnalysis.Text;
+using Microsoft.Extensions.Logging;
+using NUnit.Framework;
+using NUnit.Framework.Interfaces;
+using NUnit.Framework.Legacy;
+using StackExchange.Redis;
+using Tsavorite.core;
+using Tsavorite.devices;
+
+namespace Garnet.test
+{
+    public struct StoreAddressInfo
+    {
+        public long BeginAddress;
+        public long HeadAddress;
+        public long ReadOnlyAddress;
+        public long FlushedUntilAddress;
+        public long TailAddress;
+        public long MemorySize;
+        public long ReadCacheHeadAddress;
+        public long ReadCacheBeginAddress;
+        public long ReadCacheTailAddress;
+    }
+
+    /// <summary>
+    /// Get all attributes that start with given prefix.
+    /// </summary>
+    [AttributeUsage(AttributeTargets.Parameter)]
+    public sealed class ValuesPrefixAttribute : NUnitAttribute, IParameterDataSource
+    {
+        readonly string prefix;
+
+        public ValuesPrefixAttribute(string prefix)
+        {
+            this.prefix = prefix;
+        }
+
+        public IEnumerable GetData(IParameterInfo parameter)
+        {
+            return new ValuesAttribute()
+                .GetData(parameter)
+                .Cast<object>()
+                .Where(e => e.ToString().StartsWith(prefix));
+        }
+    }
+
+    public enum RevivificationMode
+    {
+        NoReviv = 0,
+        UseReviv = 1,
+    }
+
+    internal static class TestUtils
+    {
+        // Use 4KB page size for tests, independent of device sector size
+        public const int MinKvLogPageSizeBits = 12; // TODO: Same as LogSettings.kMinPageSizeBits; need to centralize
+        public const int MinKvLogPageSize = 1 << MinKvLogPageSizeBits;
+        public const int MinKvLogPageSizeInKB = MinKvLogPageSize / 1024;
+        /// <summary>
+        /// Ports a cluster sub-project can bind, one per node from its base. The largest cluster test today
+        /// creates five nodes; the headroom costs nothing because a whole block is leased either way.
+        /// </summary>
+        internal const int MaxClusterNodesPerSubProject = 8;
+
+        /// <summary>
+        /// Ports a standalone test project reserves: the one its servers bind, plus the alternate that
+        /// NetworkTests uses for a second server while the shared one from SetUp is still bound.
+        /// </summary>
+        internal const int StandalonePortCount = 2;
+
+        private static int testPort;
+        private static EndPoint endPoint;
+
+        /// <summary>
+        /// Base port for this test host, assigned once per process by <see cref="ReserveTestPorts"/>, which
+        /// every test project's <c>TestProjectSetup</c> calls from an assembly-level <c>[OneTimeSetUp]</c>.
+        /// <para>
+        /// Reading this before that runs means a missing or misordered setup fixture, not a port problem, so it
+        /// throws rather than quietly allocating. Allocating here instead would attribute the block to the
+        /// wrong project in the lease directory and in every diagnostic that follows, which is precisely the
+        /// kind of misattribution that makes a port conflict expensive to diagnose.
+        /// </para>
+        /// </summary>
+        public static int TestPort =>
+            testPort != 0
+                ? testPort
+                : throw new InvalidOperationException(
+                    $"Test ports have not been reserved for this assembly. Every test project needs a " +
+                    $"[SetUpFixture] whose [OneTimeSetUp] calls {nameof(TestUtils)}.{nameof(ReserveTestPorts)}, " +
+                    $"which is what claims the port block this host binds.");
+
+        /// <summary>
+        /// Second port for this test host, part of the same reserved run and so covered by the same lease.
+        /// Used where a test needs its own server while the shared one is still listening.
+        /// </summary>
+        public static int AlternateTestPort => TestPort + 1;
+
+        /// <summary>
+        /// Test server end point. Settable because the cluster harness repoints it at the node under test.
+        /// </summary>
+        public static EndPoint EndPoint
+        {
+            get => endPoint ??= new IPEndPoint(IPAddress.Loopback, TestPort);
+            set => endPoint = value;
+        }
+
+        /// <summary>
+        /// Reserves this test project's ports and holds them for the life of the process. Call from a
+        /// <c>[SetUpFixture]</c> in each standalone sub-project.
+        /// </summary>
+        /// <param name="projectAssembly">
+        /// The test project's own assembly, normally <c>typeof(TestProjectSetup).Assembly</c>. Its name
+        /// identifies the project, so adding a sub-project requires no central registration and cannot collide
+        /// with an existing entry.
+        /// </param>
+        public static void ReserveTestPorts(Assembly projectAssembly)
+        {
+            testPort = TestPortAllocator.Reserve(StandalonePortCount, projectAssembly.GetName().Name);
+            endPoint = new IPEndPoint(IPAddress.Loopback, testPort);
+        }
+
+        /// <summary>
+        /// Whether a port can currently be bound.
+        /// </summary>
+        /// <param name="port">Port to test.</param>
+        /// <returns>True when the port is free.</returns>
+        internal static bool IsPortFree(int port) => TestPortAllocator.IsPortFree(port);
+
+        /// <summary>
+        /// Adds port-allocation context to a test that failed because a server could not bind, so the reader
+        /// can tell an environment conflict on this machine from a defect in Garnet or in the test.
+        /// <para>
+        /// This runs from <see cref="OnTearDown"/>, which every fixture calls, rather than at the throw site:
+        /// the bind happens inside <c>GarnetServer.Start</c> and the exception travels through hundreds of
+        /// call sites that would otherwise each need wrapping. The failure is matched on the message
+        /// <c>GarnetServerTcp</c> produces, which is authored here in the repository rather than supplied by
+        /// the platform, so it is neither locale-dependent nor liable to drift.
+        /// </para>
+        /// </summary>
+        private static void ReportPortConflictIfBindFailed()
+        {
+            var result = TestContext.CurrentContext.Result;
+            if (result.Outcome.Status != TestStatus.Failed)
+                return;
+
+            var report = BuildPortConflictReport(result.Message);
+            if (report is not null)
+                TestContext.Progress.WriteLine(report);
+        }
+
+        /// <summary>
+        /// Builds the port-allocation context for a failed test, or returns null when the failure is not one
+        /// this context explains. Separated from <see cref="ReportPortConflictIfBindFailed"/> so the decision
+        /// and the wording can be asserted without having to make a real test fail.
+        /// </summary>
+        /// <param name="failureMessage">The failed test's message.</param>
+        /// <returns>The report to emit, or null when this failure is unrelated.</returns>
+        internal static string BuildPortConflictReport(string failureMessage)
+        {
+            if (failureMessage is null)
+                return null;
+
+            // Matches the message GarnetServerTcp produces. That string is authored in this repository rather
+            // than supplied by the platform, so it is neither locale-dependent nor liable to drift.
+            var match = BindFailurePattern.Match(failureMessage);
+            if (!match.Success)
+                return null;
+
+            // Only an occupied port is explained by how ports were allocated. GarnetServerTcp already reports
+            // AccessDenied as a platform-reserved range and AddressNotAvailable as an address absent from the
+            // machine; neither is another process taking the port, so repeating this reasoning for them would
+            // state a confident diagnosis that is simply wrong.
+            if (match.Groups["error"].Value != nameof(SocketError.AddressAlreadyInUse))
+                return null;
+
+            var endpoint = match.Groups["endpoint"].Value;
+            var reservation = TryParsePort(endpoint, out var port) ? TestPortAllocator.FindReservation(port) : null;
+            var occupant =
+                $"Identify the occupant with 'Get-NetTCPConnection -LocalPort {(reservation is null ? "<port>" : port.ToString())}' " +
+                $"on Windows or 'ss -ltnp' on Linux, and stop it by process id rather than by name.";
+
+            if (reservation is null)
+            {
+                // Covers an endpoint the test constructed itself, which the allocator never promised anything
+                // about - saying otherwise would send the reader looking for an external process that does not
+                // exist.
+                return $"A Garnet test server failed to bind {endpoint}. That port was not reserved by this " +
+                    $"test host, so it carries none of the allocator's guarantees: the test supplied the " +
+                    $"endpoint directly. {occupant}";
+            }
+
+            var held = $"This host holds {reservation.BasePort}-{reservation.BasePort + reservation.PortCount - 1} " +
+                $"for '{reservation.Purpose}', probed free at startup.";
+
+            if (!reservation.IsWhollyInUniverse)
+            {
+                // A pinned run may sit anywhere, including inside the ephemeral range, where the kernel can
+                // hand the port to an outbound connection between the probe and the bind. That is the one case
+                // the allocator cannot rule out, so it must not be described as external software.
+                return $"A Garnet test server failed to bind {endpoint}. {held} Those ports were pinned with " +
+                    $"{TestPortAllocator.PinnedBaseEnvVar} and lie outside " +
+                    $"{TestPortAllocator.UniverseBase}-{TestPortAllocator.UniverseBase + TestPortAllocator.UniverseSize - 1}, " +
+                    $"so the operating system may itself have assigned one to an outbound connection - the " +
+                    $"collision pinning opts out of. Re-run without the pin, or pin inside that range, before " +
+                    $"treating this as a conflict with other software. {occupant}";
+            }
+
+            return $"A Garnet test server failed to bind {endpoint}. {held} Reserved ports lie below " +
+                $"{TestPortAllocator.UniverseBase + TestPortAllocator.UniverseSize}, beneath every supported " +
+                $"platform's ephemeral range, so the operating system cannot have assigned one to an outbound " +
+                $"connection, and the lease excludes every other Garnet test host. A conflict here is therefore " +
+                $"software outside this suite taking the port mid-run, not a defect in Garnet or in this test. " +
+                $"{occupant} Set {TestPortAllocator.PinnedBaseEnvVar} to pin a known-free base port if it recurs.";
+        }
+
+        /// <summary>
+        /// Recognizes the bind failure <c>GarnetServerTcp</c> reports, capturing the endpoint and the socket
+        /// error so the two can be judged separately.
+        /// </summary>
+        private static readonly Regex BindFailurePattern =
+            new(@"Could not bind (?<endpoint>\S+) \((?<error>\w+)\)", RegexOptions.Compiled);
+
+        /// <summary>
+        /// Reads the port from an endpoint as rendered by <see cref="IPEndPoint.ToString"/>, which is
+        /// <c>address:port</c> for IPv4 and <c>[address]:port</c> for IPv6 - so the port follows the last
+        /// colon in both forms.
+        /// </summary>
+        /// <param name="endpoint">Endpoint text captured from the failure message.</param>
+        /// <param name="port">The parsed port.</param>
+        /// <returns>True when a port could be read.</returns>
+        private static bool TryParsePort(string endpoint, out int port)
+        {
+            port = 0;
+            var colon = endpoint.LastIndexOf(':');
+            return colon >= 0 && int.TryParse(endpoint.AsSpan(colon + 1), out port);
+        }
+
+        /// <summary>
+        /// Whether to use a test progress logger
+        /// </summary>
+        static readonly bool useTestLogger = false;
+
+        internal static string CustomRespCommandInfoJsonPath = "CustomRespCommandsInfo.json";
+        internal static string CustomRespCommandDocsJsonPath = "CustomRespCommandsDocs.json";
+
+        private static bool CustomCommandsInfoInitialized;
+        private static bool CustomCommandsDocsInitialized;
+        private static IReadOnlyDictionary<string, RespCommandsInfo> RespCustomCommandsInfo;
+        private static IReadOnlyDictionary<string, RespCommandDocs> RespCustomCommandsDocs;
+
+        internal static string AzureTestContainer
+        {
+            get
+            {
+                var container = "Garnet.test".Replace('.', '-').ToLowerInvariant();
+                return container;
+            }
+        }
+        internal static string AzureTestDirectory => $"{Environment.ProcessId}_{TestContext.CurrentContext.Test.MethodName}";
+        internal const string AzureEmulatedStorageString = "UseDevelopmentStorage=true;";
+        internal static AzureStorageNamedDeviceFactoryCreator AzureStorageNamedDeviceFactoryCreator =
+            IsRunningAzureTests ? new AzureStorageNamedDeviceFactoryCreator(AzureEmulatedStorageString, null) : null;
+
+        public const string certFile = "testcert.pfx";
+        public const string certPassword = "placeholder";
+
+        static X509Certificate2 clientCertificate;
+        static readonly object clientCertificateLock = new();
+
+        /// <summary>
+        /// Returns the client certificate used by TLS-enabled tests, importing it from disk on first use.
+        /// Importing a PKCS#12 file is expensive - on Windows it materializes a key container - and the
+        /// options factory a client calls runs once per connection attempt, so importing per connection
+        /// spends that cost inside the client's connect timeout on every attempt and retry.
+        /// </summary>
+        public static X509Certificate2 GetClientCertificate()
+        {
+            if (clientCertificate is not null) return clientCertificate;
+            lock (clientCertificateLock)
+                return clientCertificate ??= CertificateUtils.GetMachineCertificateByFile(certFile, certPassword);
+        }
+
+        public const string pemCertFile = "testcert.pem";
+        public const string pemCertKeyFile = "testcert.key.pem";
+
+        internal static bool IsRunningAzureTests
+        {
+            get
+            {
+                if ("yes".Equals(Environment.GetEnvironmentVariable("RunAzureTests")) ||
+                    "yes".Equals(Environment.GetEnvironmentVariable("RUNAZURETESTS")) ||
+                    IsAzuriteRunning())
+                {
+                    return true;
+                }
+                return false;
+            }
+        }
+
+        internal static bool IsRunningAsGitHubAction
+        => "true".Equals(Environment.GetEnvironmentVariable("GITHUB_ACTIONS"), StringComparison.OrdinalIgnoreCase);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        internal static void AssertEqualUpToExpectedLength(string expectedResponse, byte[] response)
+        {
+            ClassicAssert.AreEqual(expectedResponse, Encoding.ASCII.GetString(response, 0, expectedResponse.Length));
+        }
+
+        /// <summary>
+        /// Get command info for custom commands defined in custom commands json file
+        /// </summary>
+        /// <param name="customCommandsInfo">Mapping between command name and command info</param>
+        /// <param name="logger">Logger</param>
+        /// <returns></returns>
+        internal static bool TryGetCustomCommandsInfo(out IReadOnlyDictionary<string, RespCommandsInfo> customCommandsInfo, ILogger logger = null)
+        {
+            customCommandsInfo = default;
+
+            if (!CustomCommandsInfoInitialized && !TryInitializeCustomCommandsInfo(logger)) return false;
+
+            customCommandsInfo = RespCustomCommandsInfo;
+            return true;
+        }
+
+        /// <summary>
+        /// Get command info for custom commands defined in custom commands json file
+        /// </summary>
+        /// <param name="customCommandsDocs">Mapping between command name and command info</param>
+        /// <param name="logger">Logger</param>
+        /// <returns></returns>
+        internal static bool TryGetCustomCommandsDocs(out IReadOnlyDictionary<string, RespCommandDocs> customCommandsDocs, ILogger logger = null)
+        {
+            customCommandsDocs = default;
+
+            if (!CustomCommandsDocsInitialized && !TryInitializeCustomCommandsDocs(logger)) return false;
+
+            customCommandsDocs = RespCustomCommandsDocs;
+            return true;
+        }
+
+        private static bool TryInitializeCustomCommandsInfo(ILogger logger)
+        {
+            if (!TryGetRespCommandData<RespCommandsInfo>(CustomRespCommandInfoJsonPath, logger, out var tmpCustomCommandsInfo))
+                return false;
+
+            RespCustomCommandsInfo = tmpCustomCommandsInfo;
+            CustomCommandsInfoInitialized = true;
+            return true;
+        }
+
+        private static bool TryInitializeCustomCommandsDocs(ILogger logger)
+        {
+            if (!TryGetRespCommandData<RespCommandDocs>(CustomRespCommandDocsJsonPath, logger, out var tmpCustomCommandsDocs))
+                return false;
+
+            RespCustomCommandsDocs = tmpCustomCommandsDocs;
+            CustomCommandsDocsInitialized = true;
+            return true;
+        }
+
+        private static bool TryGetRespCommandData<TData>(string resourcePath, ILogger logger, out IReadOnlyDictionary<string, TData> commandData)
+        where TData : class, IRespCommandData<TData>
+        {
+            var streamProvider = StreamProviderFactory.GetStreamProvider(FileLocationType.Local);
+            var commandsInfoProvider = RespCommandsDataProviderFactory.GetRespCommandsDataProvider<TData>();
+
+            return commandsInfoProvider.TryImportRespCommandsData(resourcePath,
+                streamProvider, out commandData, logger);
+        }
+
+        static bool IsAzuriteRunning()
+        {
+            // If Azurite is running, it will run on localhost and listen on port 10000 and/or 10001.
+            var expectedIp = IPAddress.Loopback;
+            var expectedPorts = new[] { 10000, 10001 };
+
+            var activeTcpListeners = IPGlobalProperties.GetIPGlobalProperties().GetActiveTcpListeners();
+
+            var relevantListeners = activeTcpListeners.Where(t =>
+                    expectedPorts.Contains(t.Port) &&
+                    t.Address == expectedIp)
+                .ToList();
+
+            return relevantListeners.Any();
+        }
+
+        internal static void IgnoreIfNotRunningAzureTests()
+        {
+            // Need this environment variable set AND Azure Storage Emulator running
+            if (!IsRunningAzureTests)
+                Assert.Ignore("Environment variable RunAzureTests is not defined");
+        }
+
+        public static void IgnoreIfExceptionInjectionDisabled()
+        {
+#if !DEBUG
+            Assert.Ignore("Relies on ExceptionInjectionHelper, only enabled in DEBUG builds");
+#endif
+        }
+
+        public static void WaitUntilNextSecond(IDatabase db, long baseSeconds)
+        {
+            // LASTSAVE returns Unix seconds via DateTimeOffset.ToUnixTimeSeconds() so it has
+            // only second-resolution. Loop on getting the server time and sleeping until the
+            // server's time advances into the next Unix second.
+            while (true)
+            {
+                var actualValue = db.Execute("TIME");
+                var currentSeconds = (long)((RedisValue[])actualValue)[0];
+                if (currentSeconds > baseSeconds)
+                    break;
+                Thread.Sleep(100);
+            }
+        }
+
+        /// <summary>
+        /// Create GarnetServer
+        /// </summary>
+        public static GarnetServer CreateGarnetServer(
+            string logCheckpointDir,
+            EndPoint[] endpoints = null,
+            bool disablePubSub = false,
+            bool tryRecover = false,
+            bool lowMemory = false,
+            string memorySize = default,
+            string pageSize = default,
+            int pageCount = 0,
+            bool enableAOF = false,
+            bool enableTLS = false,
+            string tlsCertFileName = null,
+            string tlsCertPassword = null,
+            bool disableObjects = false,
+            int metricsSamplingFreq = -1,
+            bool latencyMonitor = false,
+            int latencyMonitorPrecision = GarnetServerOptions.DefaultLatencyMonitorPrecision,
+            bool commandStatsMonitor = false,
+            int commitFrequencyMs = 0,
+            bool commitWait = false,
+            bool useAzureStorage = false,
+            string defaultPassword = null,
+            bool useAcl = false, // NOTE: Temporary until ACL is enforced as default
+            string aclFile = null,
+            bool aclStrictCustomCommands = true,
+            string indexSize = "1m",
+            string indexMaxSize = default,
+            int indexOverflowThreshold = default,
+            string[] extensionBinPaths = null,
+            bool extensionAllowUnsignedAssemblies = true,
+            bool getSG = false,
+            int indexResizeFrequencySecs = 60,
+            IAuthenticationSettings authenticationSettings = null,
+            ConnectionProtectionOption enableDebugCommand = ConnectionProtectionOption.Yes,
+            ConnectionProtectionOption enableModuleCommand = ConnectionProtectionOption.No,
+            bool enableLua = false,
+            bool enableReadCache = false,
+            string readCacheMemorySize = default,
+            string readCachePageSize = default,
+            int readCachePageCount = 0,
+            ILogger logger = null,
+            IEnumerable<string> loadModulePaths = null,
+            string pubSubPageSize = null,
+            bool asyncReplay = false,
+            LuaMemoryManagementMode luaMemoryMode = LuaMemoryManagementMode.Native,
+            string luaMemoryLimit = "",
+            int luaScriptCacheSize = LuaOptions.DefaultScriptCacheSize,
+            TimeSpan? luaTimeout = null,
+            LuaLoggingMode luaLoggingMode = LuaLoggingMode.Enable,
+            IEnumerable<string> luaAllowedFunctions = null,
+            bool luaTransactionMode = false,
+            string unixSocketPath = null,
+            UnixFileMode unixSocketPermission = default,
+            int slowLogThreshold = 0,
+            TextWriter logTo = null,
+            bool enableCluster = false,
+            int expiredKeyDeletionScanFrequencySecs = -1,
+            bool useReviv = false,
+            bool useInChainRevivOnly = false,
+            bool useLogNullDevice = false,
+            bool enableVectorSetPreview = true,
+            bool enableRangeIndexPreview = false,
+            string aofMemorySize = "64m",
+            string aofPageSize = null,
+            int aofPhysicalSublogCount = 1,
+            bool copyReadsToTail = false,
+            int replayTaskCount = 1,
+            bool failOnRecoveryError = false,
+            bool fastAofTruncate = false,
+            bool useAofNullDevice = false,
+            LogCompactionType compactionType = LogCompactionType.None,
+            int mutablePercent = 90,
+            int compactionMaxSegments = 32,
+            string segmentSize = "1g",
+            bool? nativeAllocator = null,
+            string bufferPoolMemoryBudget = null,
+            string networkBufferSize = null,
+            string networkBufferMemoryBudget = null,
+            int networkConnectionLimit = GarnetServerOptions.DefaultNetworkConnectionLimit,
+            string networkReceiveBufferMinSize = null,
+            string networkSendBufferMinSize = null,
+            string sessionScratchBufferMaxRetainedSize = null,
+            int? sessionParseStateMaxRetainedArgs = null,
+            int? networkSendThrottleMax = null,
+            TimeSpan? networkSendTimeout = null,
+            TimeSpan? tlsHandshakeTimeout = null
+        )
+        {
+            if (useAzureStorage)
+                IgnoreIfNotRunningAzureTests();
+            var logDir = useLogNullDevice ? null : logCheckpointDir;
+            if (useAzureStorage && !useLogNullDevice)
+                logDir = $"{AzureTestContainer}/{AzureTestDirectory}";
+
+            if (logCheckpointDir != null && !useAzureStorage && !useLogNullDevice)
+                logDir = new DirectoryInfo(string.IsNullOrEmpty(logDir) ? "." : logDir).FullName;
+
+            var checkpointDir = logCheckpointDir;
+            if (useAzureStorage)
+                checkpointDir = $"{AzureTestContainer}/{AzureTestDirectory}";
+
+            if (logCheckpointDir != null && !useAzureStorage)
+                checkpointDir = new DirectoryInfo(string.IsNullOrEmpty(checkpointDir) ? "." : checkpointDir).FullName;
+
+            if (useAcl)
+            {
+                if (authenticationSettings != null)
+                    throw new ArgumentException($"Cannot set both {nameof(useAcl)} and {nameof(authenticationSettings)}");
+                authenticationSettings = new AclAuthenticationPasswordSettings(aclFile, defaultPassword);
+            }
+            else if (defaultPassword != null)
+            {
+                if (authenticationSettings != null)
+                    throw new ArgumentException($"Cannot set both {nameof(defaultPassword)} and {nameof(authenticationSettings)}");
+                authenticationSettings = new PasswordAuthenticationSettings(defaultPassword);
+            }
+
+            // Increase minimum thread pool size to 16 if needed
+            int threadPoolMinThreads = 0;
+            ThreadPool.GetMinThreads(out int workerThreads, out int completionPortThreads);
+            if (workerThreads < 16 || completionPortThreads < 16)
+                threadPoolMinThreads = 16;
+
+            GarnetServerOptions opts = new(logger)
+            {
+                EnableStorageTier = logDir != null,
+                LogDir = logDir,
+                CheckpointDir = checkpointDir,
+                EndPoints = endpoints ?? [EndPoint],
+                DisablePubSub = disablePubSub,
+                NetworkBufferSize = networkBufferSize,
+                NetworkBufferMemoryBudget = networkBufferMemoryBudget,
+                NetworkConnectionLimit = networkConnectionLimit,
+                NetworkReceiveBufferMinSize = networkReceiveBufferMinSize,
+                NetworkSendBufferMinSize = networkSendBufferMinSize,
+                SessionScratchBufferMaxRetainedSize = sessionScratchBufferMaxRetainedSize,
+                SessionParseStateMaxRetainedArgs = sessionParseStateMaxRetainedArgs ?? GarnetServerOptions.DefaultSessionParseStateMaxRetainedArgs,
+                Recover = tryRecover,
+                IndexMemorySize = indexSize,
+                UseNativeAllocator = nativeAllocator ?? false,
+                EnableAOF = enableAOF,
+                EnableLua = enableLua,
+                LuaTransactionMode = luaTransactionMode,
+                AofMemorySize = aofMemorySize,
+                CommitFrequencyMs = commitFrequencyMs,
+                WaitForCommit = commitWait,
+                AclStrictCustomCommands = aclStrictCustomCommands,
+                TlsOptions = enableTLS ? new GarnetTlsOptions(
+                    certFileName: tlsCertFileName ?? certFile,
+                    certPassword: tlsCertPassword ?? certPassword,
+                    clientCertificateRequired: true,
+                    certificateRevocationCheckMode: X509RevocationMode.NoCheck,
+                    issuerCertificatePath: null,
+                    null, 0, false, null, logger: logger)
+                : null,
+                DisableObjects = disableObjects,
+                QuietMode = true,
+                MetricsSamplingFrequency = metricsSamplingFreq,
+                LatencyMonitor = latencyMonitor,
+                LatencyMonitorPrecision = latencyMonitorPrecision,
+                CommandStatsMonitor = commandStatsMonitor,
+                DeviceFactoryCreator = useAzureStorage ?
+                        logger == null ? TestUtils.AzureStorageNamedDeviceFactoryCreator : new AzureStorageNamedDeviceFactoryCreator(AzureEmulatedStorageString, logger)
+                        : new LocalStorageNamedDeviceFactoryCreator(logger: logger),
+                AuthSettings = authenticationSettings,
+                ExtensionBinPaths = extensionBinPaths,
+                ExtensionAllowUnsignedAssemblies = extensionAllowUnsignedAssemblies,
+                EnableScatterGatherGet = getSG,
+                IndexResizeFrequencySecs = indexResizeFrequencySecs,
+                ThreadPoolMinThreads = threadPoolMinThreads,
+                LoadModuleCS = loadModulePaths,
+                EnableCluster = enableCluster,
+                EnableDebugCommand = enableDebugCommand,
+                EnableModuleCommand = enableModuleCommand,
+                EnableReadCache = enableReadCache,
+                AofReplayMaxLagBytes = asyncReplay ? -1 : 0,
+                AofReplayTaskCount = replayTaskCount,
+                AofPhysicalSublogCount = aofPhysicalSublogCount,
+                LuaOptions = enableLua ? new LuaOptions(luaMemoryMode, luaMemoryLimit, luaTimeout ?? Timeout.InfiniteTimeSpan, luaLoggingMode, luaAllowedFunctions ?? [], logger) { ScriptCacheSize = luaScriptCacheSize } : null,
+                UnixSocketPath = unixSocketPath,
+                UnixSocketPermission = unixSocketPermission,
+                SlowLogThreshold = slowLogThreshold,
+                ExpiredKeyDeletionScanFrequencySecs = expiredKeyDeletionScanFrequencySecs,
+                EnableVectorSetPreview = enableVectorSetPreview,
+                EnableRangeIndexPreview = enableRangeIndexPreview,
+                CopyReadsToTail = copyReadsToTail,
+                FailOnRecoveryError = failOnRecoveryError,
+                FastAofTruncate = fastAofTruncate,
+                UseAofNullDevice = useAofNullDevice,
+                CompactionType = compactionType,
+                MutablePercent = mutablePercent,
+                CompactionMaxSegments = compactionMaxSegments,
+                SegmentSize = segmentSize,
+            };
+
+            if (!string.IsNullOrEmpty(memorySize))
+                opts.LogMemorySize = memorySize;
+
+            if (!string.IsNullOrEmpty(pageSize))
+                opts.PageSize = pageSize;
+
+            if (pageCount != 0)
+            {
+                opts.PageCount = pageCount;
+
+                // If there is a pageCount and no memorySize, then we are bypassing the size tracker (which is automatically started if memorySize is specified).
+                if (string.IsNullOrEmpty(memorySize))
+                    opts.LogMemorySize = string.Empty;
+            }
+
+            if (networkSendThrottleMax.HasValue)
+                opts.NetworkSendThrottleMax = networkSendThrottleMax.Value;
+
+            if (networkSendTimeout.HasValue)
+                opts.NetworkSendTimeout = networkSendTimeout.Value;
+
+            if (tlsHandshakeTimeout.HasValue)
+                opts.TlsHandshakeTimeout = tlsHandshakeTimeout.Value;
+
+            if (!string.IsNullOrEmpty(pubSubPageSize))
+                opts.PubSubPageSize = pubSubPageSize;
+
+            if (indexMaxSize != default)
+                opts.IndexMaxMemorySize = indexMaxSize;
+
+            if (indexOverflowThreshold != default)
+                opts.IndexOverflowThreshold = indexOverflowThreshold;
+
+            if (!string.IsNullOrEmpty(aofPageSize))
+                opts.AofPageSize = aofPageSize;
+
+            if (lowMemory)
+            {
+                opts.LogMemorySize = string.IsNullOrEmpty(memorySize) ? $"{MinKvLogPageSizeInKB * LogSizeTracker.MinTargetPageCount}k" : memorySize; // Must be LogSizeTracker.MinTargetPageCount pages due to memory size tracking
+                opts.PageSize = pageSize == default ? $"{MinKvLogPageSize}" : pageSize;
+
+                // If there is a pageCount and no memorySize, then we are bypassing the size tracker (which is automatically started if memorySize is specified).
+                // This is especially useful for two-page tests, which is less than LogSizeTracker.MinTargetPageCount pages.
+                if (pageCount != 0 && memorySize == default)
+                    opts.LogMemorySize = string.Empty;
+            }
+
+            if (enableReadCache)
+            {
+                opts.ReadCacheMemorySize = readCacheMemorySize ?? opts.LogMemorySize;
+                opts.ReadCachePageSize = readCachePageSize ?? opts.PageSize;
+                opts.ReadCachePageCount = readCachePageCount != 0 ? readCachePageCount : opts.PageCount;
+
+                // If there is a pageCount and no memorySize, then we are bypassing the size tracker (which is automatically started if memorySize is specified).
+                if (opts.ReadCachePageCount != 0 && string.IsNullOrEmpty(opts.ReadCacheMemorySize))
+                    opts.ReadCacheMemorySize = string.Empty;
+            }
+
+            ILoggerFactory loggerFactory = null;
+            if (useTestLogger || logTo != null)
+            {
+                loggerFactory = LoggerFactory.Create(builder =>
+                {
+                    if (useTestLogger)
+                    {
+                        _ = builder.AddProvider(new NUnitLoggerProvider(TestContext.Progress, $"{Environment.ProcessId}_{TestContext.CurrentContext.Test.MethodName}", null, false, false, LogLevel.Trace));
+                    }
+
+                    if (logTo != null)
+                    {
+                        _ = builder.AddProvider(new NUnitLoggerProvider(logTo, logLevel: LogLevel.Trace));
+                    }
+
+                    _ = builder.SetMinimumLevel(LogLevel.Trace);
+                });
+            }
+
+            if (useReviv)
+            {
+                opts.UseRevivBinsPowerOf2 = true;
+                opts.RevivBinBestFitScanLimit = 0;
+                opts.RevivNumberOfBinsToSearch = int.MaxValue;
+                opts.RevivifiableFraction = 1;
+                opts.RevivInChainOnly = false;
+                opts.RevivBinRecordCounts = [];
+                opts.RevivBinRecordSizes = [];
+            }
+
+            if (useInChainRevivOnly)
+            {
+                opts.RevivInChainOnly = true;
+            }
+
+            if (bufferPoolMemoryBudget != null)
+                opts.BufferPoolMemoryBudget = bufferPoolMemoryBudget;
+
+            return new GarnetServer(opts, loggerFactory);
+        }
+
+        /// <summary>
+        /// Create logger factory for given TextWriter and loglevel
+        /// E.g. Use with TestContext.Progress to print logs while test is running.
+        /// </summary>
+        /// <param name="textWriter"></param>
+        /// <param name="logLevel"></param>
+        /// <param name="scope"></param>
+        /// <param name="skipCmd"></param>
+        /// <param name="recvOnly"></param>
+        /// <param name="matchLevel"></param>
+        /// <returns></returns>
+        public static (ILoggerFactory, NUnitLoggerProvider) CreateLoggerFactoryInstance(
+            TextWriter textWriter,
+            LogLevel logLevel,
+            string scope = "",
+            HashSet<string> skipCmd = null,
+            bool recvOnly = false,
+            bool matchLevel = false)
+        {
+            var provider = new NUnitLoggerProvider(textWriter, scope, skipCmd, recvOnly, matchLevel, logLevel);
+            return (LoggerFactory.Create(builder =>
+            {
+                builder.AddProvider(provider);
+                builder.SetMinimumLevel(logLevel);
+            }), provider);
+        }
+
+        public static (GarnetServer[] Nodes, GarnetServerOptions[] Options) CreateGarnetCluster(
+            string checkpointDir,
+            EndPointCollection endpoints,
+            bool enableCluster = true,
+            bool disablePubSub = false,
+            bool disableObjects = false,
+            bool tryRecover = false,
+            bool enableAOF = false,
+            int timeout = -1,
+            int gossipDelay = 1,
+            bool UseAzureStorage = false,
+            bool UseTLS = false,
+            bool cleanClusterConfig = false,
+            bool lowMemory = false,
+            string MemorySize = default,
+            string PageSize = default,
+            string SegmentSize = "1g",
+            bool FastAofTruncate = false,
+            string AofMemorySize = "64m",
+            string AofPageSize = default,
+            bool OnDemandCheckpoint = false,
+            int CommitFrequencyMs = 0,
+            bool useAofNullDevice = false,
+            bool DisableStorageTier = false,
+            string authUsername = null,
+            string authPassword = null,
+            bool useAcl = false, // NOTE: Temporary until ACL is enforced as default
+            string aclFile = null,
+            X509CertificateCollection certificates = null,
+            ILoggerFactory loggerFactory = null,
+            AadAuthenticationSettings authenticationSettings = null,
+            int metricsSamplingFrequency = 0,
+            bool enableLua = false,
+            bool asyncReplay = false,
+            bool enableDisklessSync = false,
+            int replicaDisklessSyncDelay = 1,
+            string replicaDisklessSyncFullSyncAofThreshold = null,
+            LuaMemoryManagementMode luaMemoryMode = LuaMemoryManagementMode.Native,
+            string luaMemoryLimit = "",
+            int luaScriptCacheSize = LuaOptions.DefaultScriptCacheSize,
+            EndPoint clusterAnnounceEndpoint = null,
+            bool luaTransactionMode = false,
+            DeviceType deviceType = DeviceType.Default,
+            int clusterReplicationReestablishmentTimeout = 0,
+            string aofSizeLimit = "",
+            int compactionFrequencySecs = 0,
+            LogCompactionType compactionType = LogCompactionType.Scan,
+            bool latencyMonitory = false,
+            int metricSamplingFrequencySecs = 0,
+            int loggingFrequencySecs = 5,
+            int checkpointThrottleFlushDelayMs = 0,
+            bool clusterReplicaResumeWithData = false,
+            int replicaSyncTimeout = 60,
+            int sublogCount = 1,
+            int replayTaskCount = 1,
+            int expiredObjectCollectionFrequencySecs = 0,
+            ClusterPreferredEndpointType clusterPreferredEndpointType = ClusterPreferredEndpointType.Ip,
+            string clusterAnnounceHostname = null,
+            int vectorSetReplayTaskCount = 0,
+            int threadPoolMinIOCompletionThreads = 0,
+            bool enableRangeIndexPreview = false,
+            TimeSpan? networkSendTimeout = null,
+            bool enableVectorSetPreview = true)
+        {
+            if (UseAzureStorage)
+                IgnoreIfNotRunningAzureTests();
+            var nodes = new GarnetServer[endpoints.Count];
+            var opts = new GarnetServerOptions[nodes.Length];
+            for (var i = 0; i < nodes.Length; i++)
+            {
+                var endpoint = (IPEndPoint)endpoints[i];
+
+                opts[i] = GetGarnetServerOptions(
+                    checkpointDir,
+                    checkpointDir,
+                    endpoint,
+                    enableCluster: enableCluster,
+                    disablePubSub,
+                    disableObjects,
+                    tryRecover,
+                    enableAOF,
+                    timeout,
+                    gossipDelay,
+                    UseAzureStorage,
+                    useTLS: UseTLS,
+                    cleanClusterConfig: cleanClusterConfig,
+                    lowMemory: lowMemory,
+                    memorySize: MemorySize,
+                    pageSize: PageSize,
+                    segmentSize: SegmentSize,
+                    fastAofTruncate: FastAofTruncate,
+                    aofMemorySize: AofMemorySize,
+                    aofPageSize: AofPageSize,
+                    onDemandCheckpoint: OnDemandCheckpoint,
+                    commitFrequencyMs: CommitFrequencyMs,
+                    useAofNullDevice: useAofNullDevice,
+                    disableStorageTier: DisableStorageTier,
+                    authUsername: authUsername,
+                    authPassword: authPassword,
+                    useAcl: useAcl,
+                    aclFile: aclFile,
+                    certificates: certificates,
+                    logger: loggerFactory?.CreateLogger("GarnetServer"),
+                    aadAuthenticationSettings: authenticationSettings,
+                    metricsSamplingFrequency: metricsSamplingFrequency,
+                    enableLua: enableLua,
+                    asyncReplay: asyncReplay,
+                    enableDisklessSync: enableDisklessSync,
+                    replicaDisklessSyncDelay: replicaDisklessSyncDelay,
+                    replicaDisklessSyncFullSyncAofThreshold: replicaDisklessSyncFullSyncAofThreshold,
+                    luaMemoryMode: luaMemoryMode,
+                    luaMemoryLimit: luaMemoryLimit,
+                    clusterAnnounceEndpoint: clusterAnnounceEndpoint,
+                    luaTransactionMode: luaTransactionMode,
+                    deviceType: deviceType,
+                    clusterReplicationReestablishmentTimeout: clusterReplicationReestablishmentTimeout,
+                    aofSizeLimit: aofSizeLimit,
+                    compactionFrequencySecs: compactionFrequencySecs,
+                    compactionType: compactionType,
+                    latencyMonitory: latencyMonitory,
+                    loggingFrequencySecs: loggingFrequencySecs,
+                    checkpointThrottleFlushDelayMs: checkpointThrottleFlushDelayMs,
+                    clusterReplicaResumeWithData: clusterReplicaResumeWithData,
+                    replicaSyncTimeout: replicaSyncTimeout,
+                    sublogCount: sublogCount,
+                    replayTaskCount: replayTaskCount,
+                    expiredObjectCollectionFrequencySecs: expiredObjectCollectionFrequencySecs,
+                    clusterPreferredEndpointType: clusterPreferredEndpointType,
+                    clusterAnnounceHostname: clusterAnnounceHostname,
+                    vectorSetReplayTaskCount: vectorSetReplayTaskCount,
+                    threadPoolMinIOCompletionThreads: threadPoolMinIOCompletionThreads,
+                    enableRangeIndexPreview: enableRangeIndexPreview,
+                    networkSendTimeout: networkSendTimeout,
+                    enableVectorSetPreview: enableVectorSetPreview);
+
+                ClassicAssert.IsNotNull(opts);
+
+                if (opts[i].EndPoints[0] is IPEndPoint ipEndpoint)
+                {
+                    var iter = 0;
+                    while (!IsPortAvailable(ipEndpoint.Port))
+                    {
+                        ClassicAssert.Less(iter, 30, "Failed to connect within 30 seconds");
+                        TestContext.Progress.WriteLine($"Waiting for Port {ipEndpoint.Port} to become available for {TestContext.CurrentContext.WorkerId}:{iter++}");
+                        Thread.Sleep(1000);
+                    }
+                }
+
+                nodes[i] = new GarnetServer(opts[i], loggerFactory);
+            }
+            return (nodes, opts);
+        }
+
+        public static GarnetServerOptions GetGarnetServerOptions(
+            string checkpointDir,
+            string logDir,
+            EndPoint endpoint,
+            bool enableCluster = true,
+            bool disablePubSub = false,
+            bool disableObjects = false,
+            bool tryRecover = false,
+            bool enableAOF = false,
+            int timeout = -1,
+            int gossipDelay = 5,
+            bool useAzureStorage = false,
+            bool useTLS = false,
+            bool cleanClusterConfig = false,
+            bool lowMemory = false,
+            string memorySize = default,
+            string pageSize = default,
+            string segmentSize = "1g",
+            bool fastAofTruncate = false,
+            string aofMemorySize = "64m",
+            string aofPageSize = default,
+            bool onDemandCheckpoint = false,
+            int commitFrequencyMs = 0,
+            bool useAofNullDevice = false,
+            bool disableStorageTier = false,
+            string authUsername = null,
+            string authPassword = null,
+            bool useAcl = false, // NOTE: Temporary until ACL is enforced as default
+            string aclFile = null,
+            X509CertificateCollection certificates = null,
+            AadAuthenticationSettings aadAuthenticationSettings = null,
+            int metricsSamplingFrequency = 0,
+            bool enableLua = false,
+            bool asyncReplay = false,
+            bool enableDisklessSync = false,
+            int replicaDisklessSyncDelay = 1,
+            string replicaDisklessSyncFullSyncAofThreshold = null,
+            ILogger logger = null,
+            LuaMemoryManagementMode luaMemoryMode = LuaMemoryManagementMode.Native,
+            string luaMemoryLimit = "",
+            int luaScriptCacheSize = LuaOptions.DefaultScriptCacheSize,
+            TimeSpan? luaTimeout = null,
+            LuaLoggingMode luaLoggingMode = LuaLoggingMode.Enable,
+            IEnumerable<string> luaAllowedFunctions = null,
+            string unixSocketPath = null,
+            EndPoint clusterAnnounceEndpoint = null,
+            bool luaTransactionMode = false,
+            DeviceType deviceType = DeviceType.Default,
+            int clusterReplicationReestablishmentTimeout = 0,
+            string aofSizeLimit = "",
+            int compactionFrequencySecs = 0,
+            LogCompactionType compactionType = LogCompactionType.Scan,
+            bool latencyMonitory = false,
+            int loggingFrequencySecs = 5,
+            int checkpointThrottleFlushDelayMs = 0,
+            bool clusterReplicaResumeWithData = false,
+            int replicaSyncTimeout = 60,
+            int sublogCount = 1,
+            int replayTaskCount = 1,
+            int expiredObjectCollectionFrequencySecs = 0,
+            ClusterPreferredEndpointType clusterPreferredEndpointType = ClusterPreferredEndpointType.Ip,
+            string clusterAnnounceHostname = null,
+            bool enableVectorSetPreview = true,
+            int vectorSetReplayTaskCount = 0,
+            bool enableRangeIndexPreview = false,
+            int vectorSetQuantizationTaskCount = 0,
+            int threadPoolMinIOCompletionThreads = 0,
+            TimeSpan? networkSendTimeout = null)
+        {
+            if (useAzureStorage)
+                IgnoreIfNotRunningAzureTests();
+
+            if (useAzureStorage)
+            {
+                logDir = Path.Join(AzureTestContainer, AzureTestDirectory);
+                checkpointDir = Path.Join(AzureTestContainer, AzureTestDirectory);
+            }
+
+            if (endpoint is IPEndPoint ipEndpoint)
+            {
+                logDir = Path.Join(logDir, ipEndpoint.Port.ToString());
+                checkpointDir = Path.Join(checkpointDir, ipEndpoint.Port.ToString());
+            }
+            else if (endpoint is UnixDomainSocketEndPoint && !string.IsNullOrEmpty(unixSocketPath))
+            {
+                var socketFileName = Path.GetFileName(unixSocketPath);
+
+                logDir = Path.Join(logDir, socketFileName);
+                checkpointDir = Path.Join(checkpointDir, socketFileName);
+            }
+            else throw new NotSupportedException("Unsupported endpoint type.");
+
+            if (!useAzureStorage)
+            {
+                logDir = Path.GetFullPath(logDir);
+                checkpointDir = Path.GetFullPath(checkpointDir);
+            }
+
+            IAuthenticationSettings authenticationSettings = null;
+            if (useAcl && aadAuthenticationSettings != null)
+            {
+                authenticationSettings = new AclAuthenticationAadSettings(aclFile, authPassword, aadAuthenticationSettings);
+            }
+            else if (useAcl)
+            {
+                authenticationSettings = new AclAuthenticationPasswordSettings(aclFile, authPassword);
+            }
+            else if (authPassword != null)
+            {
+                authenticationSettings = new PasswordAuthenticationSettings(authPassword);
+            }
+
+            GarnetServerOptions opts = new(logger)
+            {
+                ThreadPoolMinThreads = 512,
+                SegmentSize = segmentSize,
+                EnableStorageTier = useAzureStorage || (!disableStorageTier && logDir != null),
+                LogDir = disableStorageTier ? null : logDir,
+                CheckpointDir = checkpointDir,
+                EndPoints = [endpoint],
+                DisablePubSub = disablePubSub,
+                DisableObjects = disableObjects,
+                EnableDebugCommand = ConnectionProtectionOption.Yes,
+                EnableModuleCommand = ConnectionProtectionOption.Yes,
+                Recover = tryRecover,
+                IndexMemorySize = "1m",
+                EnableCluster = enableCluster,
+                CleanClusterConfig = cleanClusterConfig,
+                ClusterTimeout = timeout,
+                QuietMode = true,
+                EnableAOF = enableAOF,
+                LogMemorySize = "1g",
+                GossipDelay = gossipDelay,
+                MetricsSamplingFrequency = metricsSamplingFrequency,
+                TlsOptions = useTLS ? new GarnetTlsOptions(
+                    certFileName: certFile,
+                    certPassword: certPassword,
+                    clientCertificateRequired: true,
+                    certificateRevocationCheckMode: X509RevocationMode.NoCheck,
+                    issuerCertificatePath: null,
+                    certSubjectName: null,
+                    certificateRefreshFrequency: 0,
+                    enableCluster: true,
+                    clientTargetHost: null,
+                    serverCertificateRequired: true,
+                    tlsServerOptionsOverride: null,
+                    clusterTlsClientOptionsOverride: new SslClientAuthenticationOptions
+                    {
+                        ClientCertificates = certificates ?? [GetClientCertificate()],
+                        TargetHost = "GarnetTest",
+                        AllowRenegotiation = false,
+                        RemoteCertificateValidationCallback = ValidateServerCertificate,
+                    },
+                    logger: logger)
+                : null,
+                DeviceFactoryCreator = useAzureStorage ?
+                    logger == null ? TestUtils.AzureStorageNamedDeviceFactoryCreator : new AzureStorageNamedDeviceFactoryCreator(AzureEmulatedStorageString, logger)
+                    : new LocalStorageNamedDeviceFactoryCreator(logger: logger),
+                FastAofTruncate = fastAofTruncate,
+                AofMemorySize = aofMemorySize,
+                AofPageSize = aofPageSize ?? "32m",
+                AofSizeLimit = aofSizeLimit,
+                OnDemandCheckpoint = onDemandCheckpoint,
+                CommitFrequencyMs = commitFrequencyMs,
+                UseAofNullDevice = useAofNullDevice,
+                AuthSettings = useAcl ? authenticationSettings : (authPassword != null ? authenticationSettings : null),
+                ClusterUsername = authUsername,
+                ClusterPassword = authPassword,
+                EnableLua = enableLua,
+                LuaTransactionMode = luaTransactionMode,
+                AofReplayMaxLagBytes = asyncReplay ? -1 : 0,
+                LuaOptions = enableLua ? new LuaOptions(luaMemoryMode, luaMemoryLimit, luaTimeout ?? Timeout.InfiniteTimeSpan, luaLoggingMode, luaAllowedFunctions ?? [], logger) { ScriptCacheSize = luaScriptCacheSize } : null,
+                UnixSocketPath = unixSocketPath,
+                ReplicaDisklessSync = enableDisklessSync,
+                ReplicaDisklessSyncDelay = replicaDisklessSyncDelay,
+                ReplicaDisklessSyncFullSyncAofThreshold = replicaDisklessSyncFullSyncAofThreshold,
+                ClusterAnnounceEndpoint = clusterAnnounceEndpoint,
+                ClusterAnnounceHostname = clusterAnnounceHostname,
+                ClusterPreferredEndpointType = clusterPreferredEndpointType,
+                DeviceType = deviceType,
+                ClusterReplicationReestablishmentTimeout = clusterReplicationReestablishmentTimeout,
+                CompactionFrequencySecs = compactionFrequencySecs,
+                CompactionType = compactionType,
+                LatencyMonitor = latencyMonitory,
+                LoggingFrequency = loggingFrequencySecs,
+                CheckpointThrottleFlushDelayMs = checkpointThrottleFlushDelayMs,
+                ClusterReplicaResumeWithData = clusterReplicaResumeWithData,
+                ReplicaSyncTimeout = replicaSyncTimeout <= 0 ? Timeout.InfiniteTimeSpan : TimeSpan.FromSeconds(replicaSyncTimeout),
+                AofPhysicalSublogCount = sublogCount,
+                AofReplayTaskCount = replayTaskCount,
+                EnableVectorSetPreview = enableVectorSetPreview,
+                VectorSetReplayTaskCount = vectorSetReplayTaskCount,
+                EnableRangeIndexPreview = enableRangeIndexPreview,
+                VectorSetQuantizationTaskCount = vectorSetQuantizationTaskCount,
+                ExpiredObjectCollectionFrequencySecs = expiredObjectCollectionFrequencySecs,
+                ThreadPoolMinIOCompletionThreads = threadPoolMinIOCompletionThreads,
+            };
+
+            if (networkSendTimeout.HasValue)
+                opts.NetworkSendTimeout = networkSendTimeout.Value;
+
+            if (lowMemory)
+            {
+                opts.LogMemorySize = string.IsNullOrEmpty(memorySize) ? $"{MinKvLogPageSizeInKB * LogSizeTracker.MinTargetPageCount}k" : memorySize;  // Must be LogSizeTracker.MinTargetPageCount pages due to memory size tracking
+                opts.PageSize = pageSize == default ? $"{MinKvLogPageSize}" : pageSize;
+            }
+
+            return opts;
+        }
+
+        public static bool IsPortAvailable(int port)
+        {
+            bool inUse = true;
+
+            IPGlobalProperties ipProperties = IPGlobalProperties.GetIPGlobalProperties();
+            IPEndPoint[] ipEndPoints = ipProperties.GetActiveTcpListeners();
+
+            foreach (IPEndPoint endPoint in ipEndPoints)
+            {
+                if (endPoint.Port == port)
+                {
+                    inUse = false;
+                    break;
+                }
+            }
+
+            return inUse;
+        }
+
+        /// <summary>
+        /// Create config options for SE.Redis client
+        /// </summary>
+        public static ConfigurationOptions GetConfig(
+            EndPointCollection endpoints = default,
+            bool allowAdmin = false,
+            bool disablePubSub = false,
+            bool useTLS = false,
+            string authUsername = null,
+            string authPassword = null,
+            X509CertificateCollection certificates = null,
+            RedisProtocol? protocol = null)
+        {
+            var cmds = RespCommandsInfo.TryGetRespCommandNames(out var names)
+                ? new HashSet<string>(names)
+                : new HashSet<string>();
+
+            if (disablePubSub)
+            {
+                cmds.Remove("SUBSCRIBE");
+                cmds.Remove("PUBLISH");
+            }
+
+            var defaultEndPoints = endpoints == default ? [EndPoint] : endpoints;
+            var configOptions = new ConfigurationOptions
+            {
+                EndPoints = defaultEndPoints,
+                CommandMap = CommandMap.Create(cmds),
+                ConnectTimeout = (int)TimeSpan.FromSeconds(Debugger.IsAttached ? 100 : 2).TotalMilliseconds,
+                SyncTimeout = (int)TimeSpan.FromSeconds(30).TotalMilliseconds,
+                AsyncTimeout = (int)TimeSpan.FromSeconds(30).TotalMilliseconds,
+                AllowAdmin = allowAdmin,
+                // Gates how often the multiplexer may retry a dropped connection. Tests restart nodes
+                // routinely, and the first command issued afterwards blocks until the next retry is
+                // allowed, so a long interval is dead time added to every such test.
+                ReconnectRetryPolicy = new LinearRetry((int)TimeSpan.FromMilliseconds(250).TotalMilliseconds),
+                ConnectRetry = 5,
+                IncludeDetailInExceptions = true,
+                AbortOnConnectFail = true,
+                Password = authPassword,
+                User = authUsername,
+                ClientName = $"{Environment.ProcessId}_{TestContext.CurrentContext.Test.MethodName}",
+                Protocol = protocol,
+            };
+
+            if (Debugger.IsAttached)
+            {
+                configOptions.SyncTimeout = (int)TimeSpan.FromHours(2).TotalMilliseconds;
+                configOptions.AsyncTimeout = (int)TimeSpan.FromHours(2).TotalMilliseconds;
+            }
+
+            if (useTLS)
+            {
+                configOptions.Ssl = true;
+                configOptions.SslHost = "GarnetTest";
+                configOptions.SslClientAuthenticationOptions = (host) =>
+                (
+                    new SslClientAuthenticationOptions
+                    {
+                        ClientCertificates = certificates ?? [GetClientCertificate()],
+                        TargetHost = "GarnetTest",
+                        AllowRenegotiation = false,
+                        RemoteCertificateValidationCallback = ValidateServerCertificate,
+                    }
+                );
+            }
+            return configOptions;
+        }
+
+        public static GarnetClient GetGarnetClient(
+            EndPoint endpoint = null,
+            bool useTLS = false,
+            bool recordLatency = false,
+            client.LightEpoch epoch = null,
+            NetworkWriterOptions? networkWriterOptions = null)
+        {
+            SslClientAuthenticationOptions sslOptions = null;
+            if (useTLS)
+            {
+                sslOptions = new SslClientAuthenticationOptions
+                {
+                    ClientCertificates = [GetClientCertificate()],
+                    TargetHost = "GarnetTest",
+                    AllowRenegotiation = false,
+                    RemoteCertificateValidationCallback = ValidateServerCertificate,
+                };
+            }
+            return new GarnetClient(endpoint ?? EndPoint, sslOptions, networkWriterOptions: networkWriterOptions, recordLatency: recordLatency, epoch: epoch);
+        }
+
+        public static GarnetClientSession GetGarnetClientSession(bool useTLS = false, bool raw = false, EndPoint endPoint = null)
+        {
+            SslClientAuthenticationOptions sslOptions = null;
+            if (useTLS)
+            {
+                sslOptions = new SslClientAuthenticationOptions
+                {
+                    ClientCertificates = [GetClientCertificate()],
+                    TargetHost = "GarnetTest",
+                    AllowRenegotiation = false,
+                    RemoteCertificateValidationCallback = ValidateServerCertificate,
+                };
+            }
+            return new GarnetClientSession(endPoint ?? EndPoint, new(), tlsOptions: sslOptions, rawResult: raw);
+        }
+
+        public static LightClientRequest CreateRequest(LightClient.OnResponseDelegateUnsafe onReceive = null, bool useTLS = false, CountResponseType countResponseType = CountResponseType.Tokens)
+        {
+            SslClientAuthenticationOptions sslOptions = null;
+            if (useTLS)
+            {
+                sslOptions = new SslClientAuthenticationOptions
+                {
+                    ClientCertificates = [GetClientCertificate()],
+                    TargetHost = "GarnetTest",
+                    AllowRenegotiation = false,
+                    RemoteCertificateValidationCallback = ValidateServerCertificate,
+                };
+            }
+            return new LightClientRequest(EndPoint, 0, onReceive, sslOptions, countResponseType);
+        }
+
+        public static string GetHostName(ILogger logger = null)
+        {
+            try
+            {
+                var serverName = Environment.MachineName; // host name sans domain
+                var fqhn = Dns.GetHostEntry(serverName).HostName; // fully qualified hostname
+                return fqhn;
+            }
+            catch (SocketException ex)
+            {
+                logger?.LogError(ex, "GetHostName threw an error");
+            }
+
+            return "";
+        }
+
+        public static EndPointCollection GetShardEndPoints(int shards, IPAddress address, int port)
+        {
+            EndPointCollection endPoints = [];
+            for (var i = 0; i < shards; i++)
+                endPoints.Add(address, port + i);
+            return endPoints;
+        }
+
+        internal static string MethodTestDir => UnitTestWorkingDir();
+
+        /// <summary>
+        /// Find root test directory (test/) based on prefix Garnet.test.
+        /// After splitting on "Garnet.test", we land in test/standalone/ or test/cluster/,
+        /// so navigate up one level to reach test/.
+        /// </summary>
+        internal static string RootTestsProjectPath =>
+            Path.GetFullPath(Path.Combine(TestContext.CurrentContext.TestDirectory.Split("Garnet.test")[0], ".."));
+
+        /// <summary>
+        /// Build path for unit test working directory.
+        /// </summary>
+        /// <returns></returns>
+        internal static string UnitTestWorkingDir()
+        {
+            // Include process id to avoid conflicts between parallel test runs, and remove the prefix to keep the length short.
+            var testPath = $"{Environment.ProcessId}_{TestContext.CurrentContext.Test.ClassName.Split("Garnet.test")[0]}_{TestContext.CurrentContext.Test.MethodName}";
+
+            // Incorporate arguments (as a hash code) so different runs of the same method get different folders
+            //
+            // Using hashes instead of the arguments themselves to keep length down
+            if ((TestContext.CurrentContext.Test.Arguments?.Length ?? 0) > 0)
+            {
+                HashCode hash = new();
+                foreach (var arg in TestContext.CurrentContext.Test.Arguments)
+                {
+                    if (arg is string str)
+                    {
+                        hash.Add(str);
+                    }
+                    else
+                    {
+                        var argAsStr = arg?.ToString() ?? "--EMPTY--";
+                        hash.Add(argAsStr);
+                    }
+                }
+
+                testPath += $"_{hash.ToHashCode()}";
+            }
+
+            var rootPath = Path.Combine(RootTestsProjectPath, ".tmp", testPath);
+
+            return EnsureExtendedLengthPathIfNeeded(rootPath);
+        }
+
+        /// <summary>
+        /// On Windows, rewrites <paramref name="path"/> as a Win32 extended-length path (prefixed with
+        /// <c>\\?\</c>, or <c>\\?\UNC\</c> for a network share) when its fully-qualified length is close
+        /// enough to the 260-char MAX_PATH limit that the files tests create beneath it could exceed it.
+        /// Extended-length paths are exempt from that limit and are honored by the device layer (which
+        /// passes them straight to CreateFileW) as well as the BCL file APIs.
+        /// </summary>
+        /// <remarks>
+        /// This mirrors the equivalent helper in Tsavorite's TestUtils. Without it, a checkout under a long
+        /// root makes the deepest files Garnet creates — checkpoint files such as
+        /// "\Store\checkpoints\cpr-checkpoints\&lt;guid&gt;\snapshot.obj.dat" (~88 chars) — exceed the limit,
+        /// and the device layer rejects them. Because the directory name embeds a per-process randomized
+        /// <see cref="HashCode"/>, its length varies between runs, so such failures are intermittent.
+        ///
+        /// Only a path that actually needs rewriting is canonicalized: when it is close enough to the limit,
+        /// it is fully qualified via <see cref="Path.GetFullPath(string)"/> so that relative segments and
+        /// forward slashes are normalized to backslashes (as required by extended-length paths, which Windows
+        /// does not normalize) before the <c>\\?\</c> prefix is applied. The input is returned unchanged on
+        /// non-Windows platforms, when it is already extended-length, or when it is short enough that no child
+        /// path can overflow; this keeps the common short-path case (normal checkouts and CI) on ordinary paths.
+        ///
+        /// The constants below are duplicated rather than taken from Tsavorite's Native32 because that type's
+        /// members are internal and Garnet.test.cluster, which compiles this file via a linked Compile item,
+        /// is not granted InternalsVisibleTo by Tsavorite.core.
+        /// </remarks>
+        internal static string EnsureExtendedLengthPathIfNeeded(string path)
+        {
+            if (string.IsNullOrEmpty(path) || !OperatingSystem.IsWindows() || path.StartsWith(ExtendedLengthPathPrefix, StringComparison.Ordinal))
+                return path;
+
+            var fullPath = Path.GetFullPath(path);
+
+            // The device layer rejects non-extended paths longer than MAX_PATH - 11 (the 11 reserves room for
+            // a ".<segmentId>" suffix). Once this directory's fully-qualified length is within the reserve
+            // below of MAX_PATH, switch to an extended-length path so those children stay valid.
+            const int win32MaxPath = 260;
+            const int reservedForChildPaths = 100;
+            if (fullPath.Length <= win32MaxPath - reservedForChildPaths)
+                return path;
+
+            // UNC paths (\\server\share\...) use the \\?\UNC\server\share\... form.
+            if (fullPath.StartsWith(@"\\", StringComparison.Ordinal))
+                return ExtendedLengthPathPrefix + "UNC" + fullPath[1..];
+
+            return ExtendedLengthPathPrefix + fullPath;
+        }
+
+        /// <summary>The Win32 extended-length path prefix; paths using it bypass the MAX_PATH limit.</summary>
+        private const string ExtendedLengthPathPrefix = @"\\?\";
+
+        /// <summary>
+        /// Delete a directory recursively
+        /// </summary>
+        /// <param name="path">The folder to delete</param>
+        /// <param name="wait">If true, loop on exceptions that are retryable, and verify the directory no longer exists. Generally true on SetUp, false on TearDown</param>
+        internal static void DeleteDirectory(string path, bool wait = false)
+        {
+            while (true)
+            {
+                try
+                {
+                    if (!Directory.Exists(path))
+                        return;
+
+                    // Recursively delete subdirectories, then fall through to delete this directory.
+                    foreach (string directory in Directory.GetDirectories(path))
+                        DeleteDirectory(directory, wait);
+                    break;
+                }
+                catch
+                {
+                }
+            }
+
+            var retry = true;
+            while (retry)
+            {
+                // Exceptions may happen due to a handle briefly remaining held after Dispose().
+                retry = false;
+                try
+                {
+                    if (Directory.Exists(path))
+                        Directory.Delete(path, true);
+                }
+                catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+                {
+                    // If we're not waiting, try once more then give up.
+                    if (!wait)
+                    {
+                        try { Directory.Delete(path, true); }
+                        catch { }
+                        return;
+                    }
+                    retry = true;
+                    _ = Thread.Yield();
+                }
+            }
+        }
+
+        /// <summary>
+        /// Inserts filler string keys to advance the log past a captured address, then polls
+        /// <c>INFO STORE</c> with exponential backoff until <c>Log.FlushedUntilAddress</c>
+        /// reaches <paramref name="flushUntilAddress"/>. This guarantees that the record at
+        /// that address has been written to disk.
+        /// </summary>
+        /// <param name="db">The Redis database to insert filler keys into.</param>
+        /// <param name="server">The StackExchange.Redis server for issuing INFO commands.</param>
+        /// <param name="flushUntilAddress">The log address to wait for (typically the TailAddress
+        /// captured after inserting the record of interest).</param>
+        /// <param name="fillerCount">Number of filler keys to insert before polling (default 200).</param>
+        /// <param name="fillerPrefix">Prefix for filler key names (default "flushfiller").</param>
+        /// <param name="timeoutMs">Maximum time in ms to wait for flush (default 5000).</param>
+        public static async Task FlushAndWaitForStoreAsync(IDatabase db, IServer server,
+            long flushUntilAddress, int fillerCount = 2000, string fillerPrefix = "flushfiller",
+            int timeoutMs = 5000)
+        {
+            for (var i = 0; i < fillerCount; i++)
+                await db.StringSetAsync($"{fillerPrefix}{i:D4}", $"data{i:D4}").ConfigureAwait(false);
+
+            var deadline = Environment.TickCount64 + timeoutMs;
+            var backoffMs = 10;
+            while (Environment.TickCount64 < deadline)
+            {
+                var addressInfo = GetStoreAddressInfo(server);
+                if (addressInfo.FlushedUntilAddress >= flushUntilAddress)
+                    return;
+
+                await Task.Delay(backoffMs).ConfigureAwait(false);
+                backoffMs = Math.Min(backoffMs * 2, 500);
+            }
+
+            Assert.Fail($"Timed out waiting for FlushedUntilAddress to reach {flushUntilAddress} " +
+                        $"(current: {GetStoreAddressInfo(server).FlushedUntilAddress})");
+        }
+
+        /// <summary>
+        /// Delegate to use in TLS certificate validation
+        /// Test certificate should be issued by "CN=Garnet"
+        /// </summary>
+        /// <param name="sender"></param>
+        /// <param name="certificate"></param>
+        /// <param name="chain"></param>
+        /// <param name="sslPolicyErrors"></param>
+        /// <returns></returns>
+        /// <exception cref="Exception"></exception>
+        public static bool ValidateServerCertificate(
+          object sender,
+          X509Certificate certificate,
+          X509Chain chain,
+          SslPolicyErrors sslPolicyErrors)
+        {
+            if (sslPolicyErrors == SslPolicyErrors.None)
+                return true;
+
+            if (sslPolicyErrors.HasFlag(SslPolicyErrors.RemoteCertificateChainErrors))
+            {
+                // Check chain elements
+                foreach (var itemInChain in chain.ChainElements)
+                {
+                    if (itemInChain.Certificate.Issuer.Contains("CN=Garnet"))
+                        return true;
+                }
+            }
+            throw new Exception($"Certicate errors found {sslPolicyErrors}!");
+        }
+
+        public static void CreateTestLibrary(string[] namespaces, string[] referenceFiles, string[] filesToCompile, string dstFilePath)
+        {
+            if (File.Exists(dstFilePath))
+            {
+                File.Delete(dstFilePath);
+            }
+
+            foreach (var referenceFile in referenceFiles)
+            {
+                ClassicAssert.IsTrue(File.Exists(referenceFile), $"File '{Path.GetFullPath(referenceFile)}' does not exist.");
+            }
+
+            var references = referenceFiles.Select(f => MetadataReference.CreateFromFile(f));
+
+            foreach (var fileToCompile in filesToCompile)
+            {
+                ClassicAssert.IsTrue(File.Exists(fileToCompile), $"File '{Path.GetFullPath(fileToCompile)}' does not exist.");
+            }
+
+            var explicitUsings = @"
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+";
+
+            var parseFunc = new Func<string, SyntaxTree>(filePath =>
+            {
+                var source = $"{explicitUsings}{Environment.NewLine}{File.ReadAllText(filePath)}";
+                var stringText = SourceText.From(source, Encoding.UTF8);
+                return SyntaxFactory.ParseSyntaxTree(stringText,
+                    CSharpParseOptions.Default.WithLanguageVersion(LanguageVersion.Latest), string.Empty);
+            });
+
+            var syntaxTrees = filesToCompile.Select(f => parseFunc(f));
+
+            var compilationOptions = new CSharpCompilationOptions(OutputKind.DynamicallyLinkedLibrary)
+                .WithAllowUnsafe(true)
+                .WithOverflowChecks(true)
+                .WithOptimizationLevel(OptimizationLevel.Release)
+                .WithUsings(namespaces);
+
+
+            var compilation = CSharpCompilation.Create(Path.GetFileName(dstFilePath), syntaxTrees, references, compilationOptions);
+
+            try
+            {
+                var result = compilation.Emit(dstFilePath);
+                ClassicAssert.IsTrue(result.Success, string.Join(Environment.NewLine, result.Diagnostics.Select(d => d.ToString())));
+            }
+            catch (Exception ex)
+            {
+                Assert.Fail(ex.Message);
+            }
+        }
+
+        public static StoreAddressInfo GetStoreAddressInfo(IServer server, bool includeReadCache = false)
+        {
+            StoreAddressInfo result = default;
+            var info = server.Info("STORE");
+            foreach (var section in info)
+            {
+                foreach (var entry in section)
+                {
+                    if (entry.Key.Equals("Log.BeginAddress"))
+                        result.BeginAddress = long.Parse(entry.Value);
+                    else if (entry.Key.Equals("Log.HeadAddress"))
+                        result.HeadAddress = long.Parse(entry.Value);
+                    else if (entry.Key.Equals("Log.SafeReadOnlyAddress"))
+                        result.ReadOnlyAddress = long.Parse(entry.Value);
+                    else if (entry.Key.Equals("Log.FlushedUntilAddress"))
+                        result.FlushedUntilAddress = long.Parse(entry.Value);
+                    else if (entry.Key.Equals("Log.TailAddress"))
+                        result.TailAddress = long.Parse(entry.Value);
+                    else if (entry.Key.Equals("Log.CurrentMemorySizeBytes"))
+                        result.MemorySize = long.Parse(entry.Value);
+                    else if (includeReadCache && entry.Key.Equals("ReadCache.HeadAddress"))
+                        result.ReadCacheHeadAddress = long.Parse(entry.Value);
+                    else if (includeReadCache && entry.Key.Equals("ReadCache.BeginAddress"))
+                        result.ReadCacheBeginAddress = long.Parse(entry.Value);
+                    else if (includeReadCache && entry.Key.Equals("ReadCache.TailAddress"))
+                        result.ReadCacheTailAddress = long.Parse(entry.Value);
+                }
+            }
+            return result;
+        }
+
+        /// <summary>
+        /// Get effective memory size based on configured memory size and page size.
+        /// </summary>
+        /// <param name="memorySize">Memory size string</param>
+        /// <param name="pageSize">Page size string</param>
+        /// <param name="parsedPageSize">Parsed page size</param>
+        /// <returns>Effective memory size</returns>
+        public static long GetEffectiveMemorySize(string memorySize, string pageSize, out long parsedPageSize)
+        {
+            parsedPageSize = ServerOptions.PreviousPowerOf2(ServerOptions.ParseSize(pageSize, out _));
+            return ServerOptions.ParseSize(memorySize, out _);
+        }
+
+        /// <summary>
+        /// Get a random alphanumeric string of specified length
+        /// </summary>
+        /// <param name="len">Length of string</param>
+        /// <returns>Random alphanumeric string</returns>
+        public static string GetRandomString(int len)
+        {
+            const string chars = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789";
+            return RandomNumberGenerator.GetString(chars, len);
+        }
+
+        internal static void OnTearDown(bool waitForDelete = false, ILogger logger = null, bool suppressFailure = false)
+        {
+            ReportPortConflictIfBindFailed();
+
+            var failTestOnLeak = !suppressFailure && TestContext.CurrentContext.Result.Outcome.Status == TestStatus.Passed;
+
+            DeleteDirectory(MethodTestDir, wait: waitForDelete);
+            var count = Tsavorite.core.LightEpoch.ActiveInstanceCount();
+            var failMsg = "";
+
+            if (count != 0)
+            {
+                // Reset all instances to avoid impacting other tests
+                Tsavorite.core.LightEpoch.ResetAllInstances();
+                logger?.LogError("Tsavorite.core.LightEpoch instances still active: {count}", count);
+                failMsg += $"Tsavorite.core.LightEpoch instances still active: {count}";
+            }
+
+            var count2 = client.LightEpoch.ActiveInstanceCount();
+            if (count2 != 0)
+            {
+                // Reset all instances to avoid impacting other tests
+                client.LightEpoch.ResetAllInstances();
+                logger?.LogError("Garnet.client.LightEpoch instances still active: {count2}", count2);
+
+                if (!string.IsNullOrEmpty(failMsg))
+                {
+                    failMsg += Environment.NewLine;
+                }
+
+                failMsg += $"Garnet.client.LightEpoch instances still active: {count2}";
+            }
+
+            if (failTestOnLeak && !string.IsNullOrEmpty(failMsg))
+            {
+                Assert.Fail(failMsg);
+            }
+            else if (logger is null && !string.IsNullOrEmpty(failMsg))
+            {
+                // Guarantee the leak message goes _somewhere_ if it doesn't fail the test
+                TestContext.Out.WriteLine(failMsg);
+            }
+        }
+    }
+}

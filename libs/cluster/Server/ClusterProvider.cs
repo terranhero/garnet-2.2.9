@@ -1,0 +1,387 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Threading;
+using System.Threading.Tasks;
+using Garnet.common;
+using Garnet.networking;
+using Garnet.server;
+using Garnet.server.ACL;
+using Garnet.server.Auth;
+using Microsoft.Extensions.Logging;
+
+namespace Garnet.cluster
+{
+    /// <summary>
+    /// Cluster provider
+    /// </summary>
+    public sealed partial class ClusterProvider : IClusterProvider
+    {
+        internal readonly ClusterManager clusterManager;
+        internal readonly ReplicationManager replicationManager;
+        internal readonly FailoverManager failoverManager;
+        internal readonly MigrationManager migrationManager;
+        internal readonly ILoggerFactory loggerFactory;
+        internal readonly StoreWrapper storeWrapper;
+        internal readonly GarnetServerOptions serverOptions;
+        internal readonly RangeIndexManager rangeIndexManager;
+        internal readonly GarnetEpoch<ServerEpochObserverSource> garnetEpoch;
+        ClusterAuthContainer authContainer;
+
+        /// <summary>
+        /// Get cluster username
+        /// </summary>
+        public string ClusterUsername => ClusterAuth.ClusterUsername;
+
+        /// <summary>
+        /// Get cluster password
+        /// </summary>
+        public string ClusterPassword => ClusterAuth.ClusterPassword;
+
+        /// <summary>
+        /// Current cluster authentication container, read with a memory barrier so reconnecting gossip
+        /// clients observe credential rotations performed through <see cref="UpdateClusterAuth"/>.
+        /// </summary>
+        internal ClusterAuthContainer ClusterAuth => Volatile.Read(ref authContainer);
+
+        /// <summary>
+        /// Create new cluster provider
+        /// </summary>
+        public ClusterProvider(StoreWrapper storeWrapper, RangeIndexManager rangeIndexManager)
+        {
+            this.storeWrapper = storeWrapper;
+            this.serverOptions = storeWrapper.serverOptions;
+            this.rangeIndexManager = rangeIndexManager;
+            this.loggerFactory = storeWrapper.loggerFactory;
+            this.garnetEpoch = new GarnetEpoch<ServerEpochObserverSource>(new ServerEpochObserverSource(storeWrapper));
+
+            authContainer = new ClusterAuthContainer
+            {
+                ClusterUsername = serverOptions.ClusterUsername,
+                ClusterPassword = serverOptions.ClusterPassword
+            };
+
+            if (serverOptions.GossipSamplePercent is > 100 or < 0)
+            {
+                throw new Exception("Gossip sample fraction should be in range [0,100]");
+            }
+
+            this.clusterManager = new ClusterManager(this, logger: loggerFactory?.CreateLogger("ClusterManager"));
+            this.replicationManager = new ReplicationManager(this, logger: loggerFactory?.CreateLogger("ReplicationManager"));
+
+            this.failoverManager = new FailoverManager(this, logger: loggerFactory?.CreateLogger("FailoverManager"));
+            this.migrationManager = new MigrationManager(this, logger: loggerFactory?.CreateLogger("MigrationManager"));
+        }
+
+        /// <inheritdoc />
+        public bool AllowDataLoss
+            => serverOptions.AllowDataLoss;
+
+        /// <inheritdoc />
+        public ValueTask RecoverAsync()
+            => replicationManager.RecoverAsync();
+
+        /// <inheritdoc />
+        public bool PreventRoleChange()
+            => replicationManager.BeginRecovery(RecoveryStatus.ReadRole, upgradeLock: false);
+
+        /// <inheritdoc />
+        public void AllowRoleChange()
+            => replicationManager.EndRecovery(RecoveryStatus.NoRecovery, downgradeLock: false);
+
+        /// <inheritdoc />
+        public void Start()
+        {
+            clusterManager?.Start();
+            replicationManager?.Start();
+        }
+
+        /// <inheritdoc />
+        public IClusterSession CreateClusterSession(TransactionManager txnManager, IGarnetAuthenticator authenticator, UserHandle userHandle, GarnetSessionMetrics garnetSessionMetrics, BasicGarnetApi basicGarnetApi, StringBasicContext stringContext, VectorBasicContext vectorContext, INetworkSender networkSender, ILogger logger = null)
+            => new ClusterSession(this, txnManager, authenticator, userHandle, garnetSessionMetrics, basicGarnetApi, stringContext, vectorContext, networkSender, logger);
+
+        /// <inheritdoc />
+        public void UpdateClusterAuth(string clusterUsername, string clusterPassword)
+        {
+            ClusterAuthContainer oldAuthContainer, newAuthContainer;
+            do
+            {
+                oldAuthContainer = authContainer;
+                newAuthContainer = new ClusterAuthContainer
+                {
+                    ClusterUsername = clusterUsername ?? oldAuthContainer.ClusterUsername, // If null username, we will reuse the old username
+                    ClusterPassword = clusterPassword
+                };
+            } while (Interlocked.CompareExchange(ref authContainer, newAuthContainer, oldAuthContainer) != oldAuthContainer);
+        }
+
+        /// <inheritdoc />
+        public void OnGossipClientConfigChanged()
+            => clusterManager?.SwapGossipClients();
+
+        /// <inheritdoc />
+        public void Dispose()
+        {
+            failoverManager?.Dispose();
+            clusterManager?.Dispose();
+            replicationManager?.Dispose();
+            migrationManager?.Dispose();
+        }
+
+        public bool IsPrimary() => clusterManager?.CurrentConfig.LocalNodeRole == NodeRole.PRIMARY;
+
+        /// <inheritdoc />
+        public bool IsReplica()
+            => clusterManager?.CurrentConfig.LocalNodeRole == NodeRole.REPLICA || replicationManager?.IsRecovering == true;
+
+        /// <inheritdoc />
+        public bool IsWritePaused => failoverManager?.IsWritePaused ?? false;
+
+        /// <inheritdoc />
+        public bool IsReplica(string nodeId)
+        {
+            var config = clusterManager?.CurrentConfig;
+            if (config is null)
+            {
+                return false;
+            }
+
+            return config.GetNodeRoleFromNodeId(nodeId) == NodeRole.REPLICA;
+        }
+
+        /// <inheritdoc />
+        public void ResetGossipStats()
+            => clusterManager?.gossipStats.Reset();
+
+        /// <inheritdoc />
+        public void FlushConfig()
+            => clusterManager?.FlushConfig();
+
+        /// <inheritdoc />
+        public void FlushDB(bool unsafeTruncateLog = false)
+        {
+            storeWrapper.store.Log.ShiftBeginAddress(storeWrapper.store.Log.TailAddress, truncateLog: unsafeTruncateLog);
+        }
+
+        /// <inheritdoc />
+        public void AddNewCheckpointEntry(bool full, AofAddress CheckpointCoveredAofAddress, Guid storeCheckpointToken, Guid objectStoreCheckpointToken)
+        {
+            var entry = new CheckpointEntry(storeWrapper.serverOptions.AofPhysicalSublogCount);
+
+            entry.metadata.storeVersion = storeWrapper.store.CurrentVersion;
+            entry.metadata.storeHlogToken = storeCheckpointToken;
+            entry.metadata.storeIndexToken = storeCheckpointToken;
+            entry.metadata.storeCheckpointCoveredAofAddress = CheckpointCoveredAofAddress;
+            entry.metadata.storePrimaryReplId = replicationManager.PrimaryReplId;
+
+            // Keep track of checkpoints for replica
+            // Used to delete old checkpoints and cleanup and also cleanup during attachment to new primary
+            replicationManager.AddCheckpointEntry(entry, full);
+
+            // Truncate AOF
+            SafeTruncateAOF(CheckpointCoveredAofAddress);
+        }
+
+        /// <inheritdoc />
+        public void SafeTruncateAOF(in AofAddress truncateUntil)
+        {
+            var role = clusterManager.CurrentConfig.LocalNodeRole;
+            if (role == NodeRole.PRIMARY)
+                replicationManager.AofSyncDriverStore.SafeTruncateAof(role, truncateUntil);
+            else
+            {
+                if (serverOptions.FastAofTruncate)
+                    storeWrapper.appendOnlyFile?.Log.UnsafeShiftBeginAddress(truncateUntil, truncateLog: true);
+                else
+                {
+                    storeWrapper.appendOnlyFile?.Log.TruncateUntil(truncateUntil);
+                }
+            }
+        }
+
+        /// <inheritdoc />
+        public void OnCheckpointInitiated(ref AofAddress CheckpointCoveredAofAddress)
+        {
+            Debug.Assert(serverOptions.EnableCluster);
+            if (serverOptions.EnableAOF && clusterManager.CurrentConfig.LocalNodeRole == NodeRole.REPLICA)
+            {
+                // When the replica takes a checkpoint on encountering the checkpoint end marker, it needs to truncate the AOF only
+                // until the checkpoint start marker. Otherwise, we will be left with an AOF that starts at the checkpoint end marker.
+                // ReplicationCheckpointStartOffset is set by { ReplicaReplayTask.Consume -> AofProcessor.ProcessAofRecordInternal } when
+                // it encounters the checkpoint start marker.
+
+                CheckpointCoveredAofAddress = replicationManager.ReplicationCheckpointStartOffset;
+            }
+            else
+                CheckpointCoveredAofAddress = storeWrapper.appendOnlyFile.Log.TailAddress;
+
+            replicationManager?.UpdateCommitSafeAofAddress(ref CheckpointCoveredAofAddress);
+        }
+
+        /// <inheritdoc />
+        public MetricsItem[] GetReplicationInfo()
+        {
+            var clusterEnabled = serverOptions.EnableCluster;
+            var config = clusterEnabled ? clusterManager.CurrentConfig : null;
+            var replicaInfo = clusterEnabled ? replicationManager.GetReplicaInfo() : null;
+            var role = clusterEnabled ? config.LocalNodeRole : NodeRole.PRIMARY;
+            var replication_offset = !clusterEnabled ? "N/A" : replicationManager.ReplicationOffset.ToString();
+            var replication_offset2 = !clusterEnabled ? "N/A" : replicationManager.ReplicationOffset2.ToString();
+
+            var replicationInfo = new List<MetricsItem>()
+            {
+                new("role", NodeRole.PRIMARY == role ? "master" : "slave"),
+                new("connected_slaves", !clusterEnabled ? "0" : replicationManager.ConnectedReplicasCount.ToString()),
+                new("master_failover_state", !clusterEnabled ? FailoverUtils.GetFailoverStatus(FailoverStatus.NO_FAILOVER) : failoverManager.GetFailoverStatus()),
+                new("master_replid", clusterEnabled ? replicationManager.PrimaryReplId : Generator.DefaultHexId()),
+                new("master_replid2", clusterEnabled ? replicationManager.PrimaryReplId2 : Generator.DefaultHexId()),
+                new("master_repl_offset", replication_offset),
+                new("second_repl_offset", replication_offset2),
+                new("store_current_safe_aof_address", clusterEnabled ? replicationManager.StoreCurrentSafeAofAddress.ToString() : "N/A"),
+                new("store_recovered_safe_aof_address", clusterEnabled ? replicationManager.StoreRecoveredSafeAofTailAddress.ToString() : "N/A"),
+                new("recover_status", replicationManager.currentRecoveryStatus.ToString()),
+                new("last_failover_state", !clusterEnabled ? FailoverUtils.GetFailoverStatus(FailoverStatus.NO_FAILOVER) : failoverManager.GetLastFailoverStatus()),
+                new("sync_driver_count", !clusterEnabled ? "0" : replicationManager.AofSyncDriverStore.AofSyncDriverCount.ToString())
+            };
+
+            if (clusterEnabled)
+            {
+                if (role == NodeRole.REPLICA)
+                {
+                    var (address, port) = config.GetWorkerClientAddressFromNodeId(config.LocalNodePrimaryId);
+                    var primaryLinkStatus = clusterManager.GetPrimaryLinkStatus(config);
+                    var replicationOffsetAccLag = storeWrapper.appendOnlyFile.Log.TailAddress.AggregateDiff(replicationManager.ReplicationOffset);
+                    var replicationOffsetVectorLag = storeWrapper.appendOnlyFile.Log.TailAddress.Diff(replicationManager.ReplicationOffset);
+                    var rcm = storeWrapper.appendOnlyFile.readConsistencyManager;
+                    replicationInfo.Add(new("master_host", address));
+                    replicationInfo.Add(new("master_port", port.ToString()));
+                    replicationInfo.Add(primaryLinkStatus[0]);
+                    replicationInfo.Add(primaryLinkStatus[1]);
+                    replicationInfo.Add(new("master_sync_in_progress", replicationManager.IsRecovering.ToString()));
+                    replicationInfo.Add(new("slave_read_repl_offset", replication_offset));
+                    replicationInfo.Add(new("slave_priority", "100"));
+                    replicationInfo.Add(new("slave_read_only", "1"));
+                    replicationInfo.Add(new("replica_announced", "1"));
+                    replicationInfo.Add(new("master_sync_last_io_seconds_ago", replicationManager.LastPrimarySyncSeconds.ToString()));
+                    replicationInfo.Add(new("replication_offset_vector_lag", replicationOffsetVectorLag.ToString()));
+                    replicationInfo.Add(new("replication_offset_acc_lag", replicationOffsetAccLag.ToString()));
+                    replicationInfo.Add(new("aof_replay_max_lag_bytes", storeWrapper.serverOptions.AofReplayMaxLagBytes.ToString()));
+                    replicationInfo.Add(new("physical_sublog_max_sequence_vector", rcm == null ? "-1" : rcm.GetPhysicalSublogMaxSequenceVector()));
+                    replicationInfo.Add(new("physical_sublog_max_drift_sequence_vector", rcm == null ? "-1" : rcm.GetPhysicalSublogMaxDriftSequenceVector()));
+                }
+                else
+                {
+                    // replica0: ip=127.0.0.1,port=7001,state=online,offset=56,lag=0
+                    for (var i = 0; i < replicaInfo.Count; i++)
+                        replicationInfo.Add(new($"slave{i}", replicaInfo[i].ToString()));
+                }
+            }
+            return [.. replicationInfo];
+        }
+
+        /// <inheritdoc />
+        public MetricsItem[] GetCheckpointInfo()
+            => [new("memory_checkpoint_entry", replicationManager.GetLatestCheckpointFromMemoryInfo()),
+                new("disk_checkpoint_entry", replicationManager.GetLatestCheckpointFromDiskInfo())];
+
+        /// <inheritdoc />
+        public (AofAddress replication_offset, List<RoleInfo> replicaInfo) GetPrimaryInfo()
+        {
+            if (!serverOptions.EnableCluster)
+            {
+                return (replicationManager.ReplicationOffset, default);
+            }
+            return (replicationManager.ReplicationOffset, replicationManager.GetReplicaInfo());
+        }
+
+        /// <inheritdoc />
+        public RoleInfo GetReplicaInfo()
+        {
+            if (!serverOptions.EnableCluster)
+            {
+                return new RoleInfo()
+                {
+                };
+            }
+
+            var config = clusterManager.CurrentConfig;
+            clusterManager.GetConnectionInfo(config.LocalNodePrimaryId, out var connection);
+
+            var (address, port) = config.GetWorkerClientAddressFromNodeId(config.LocalNodePrimaryId);
+            var info = new RoleInfo()
+            {
+                address = address,
+                port = port,
+                replication_offset = replicationManager.ReplicationOffset,
+                replication_state = replicationManager.IsRecovering ? "sync" :
+                        connection.connected ? "connected" : "connect"
+            };
+
+            return info;
+        }
+
+        /// <inheritdoc />
+        public MetricsItem[] GetGossipStats(bool metricsDisabled)
+        {
+            var gossipStats = clusterManager.gossipStats;
+            var (activeMemoryUsageBytes, maxMemoryUsageBytes) = metricsDisabled
+                ? default
+                : clusterManager.clusterConnectionStore.GetMemoryUsage();
+            return
+                [
+                    new("meet_requests_recv", metricsDisabled ? "0" : gossipStats.meet_requests_recv.ToString()),
+                    new("meet_requests_succeed", metricsDisabled ? "0" : gossipStats.meet_requests_succeed.ToString()),
+                    new("meet_requests_failed", metricsDisabled ? "0" : gossipStats.meet_requests_failed.ToString()),
+                    new("gossip_success_count", metricsDisabled ? "0" : gossipStats.gossip_success_count.ToString()),
+                    new("gossip_failed_count", metricsDisabled ? "0" : gossipStats.gossip_failed_count.ToString()),
+                    new("gossip_timeout_count", metricsDisabled ? "0" : gossipStats.gossip_timeout_count.ToString()),
+                    new("gossip_full_send", metricsDisabled ? "0" : gossipStats.gossip_full_send.ToString()),
+                    new("gossip_empty_send", metricsDisabled ? "0" : gossipStats.gossip_empty_send.ToString()),
+                    new("gossip_bytes_send", metricsDisabled ? "0" : gossipStats.gossip_bytes_send.ToString()),
+                    new("gossip_bytes_recv", metricsDisabled ? "0" : gossipStats.gossip_bytes_recv.ToString()),
+                    new("gossip_open_connections", metricsDisabled ? "0" : this.clusterManager.clusterConnectionStore.Count.ToString()),
+                    new("gossip_active_memory_bytes", metricsDisabled ? "0" : activeMemoryUsageBytes.ToString()),
+                    new("gossip_max_memory_bytes", metricsDisabled ? "0" : maxMemoryUsageBytes.ToString())
+                ];
+        }
+
+        public MetricsItem[] GetBufferPoolStats()
+            => [new("migration_manager", migrationManager.GetBufferPoolStats()), new("replication_manager", replicationManager.GetBufferPoolStats())];
+
+        public void PurgeBufferPool(ManagerType managerType)
+        {
+            if (managerType == ManagerType.MigrationManager)
+                migrationManager.Purge();
+            else if (managerType == ManagerType.ReplicationManager)
+                replicationManager.Purge();
+            else
+                throw new GarnetException();
+        }
+
+        public ValueTask ClusterPublishAsync(RespCommand cmd, Span<byte> channel, Span<byte> message)
+            => clusterManager.TryClusterPublishAsync(cmd, channel, message);
+
+        internal GarnetClusterCheckpointManager ReplicationLogCheckpointManager
+        {
+            get
+            {
+                Debug.Assert(serverOptions.EnableCluster);
+                return (GarnetClusterCheckpointManager)storeWrapper.store.CheckpointManager;
+            }
+        }
+
+        /// <summary>
+        /// Wait for config transition
+        /// </summary>
+        /// <param name="token">Cancellation token for the transition wait.</param>
+        /// <returns></returns>
+        public ValueTask<bool> BumpAndWaitForEpochTransitionAsync(CancellationToken token = default)
+            => garnetEpoch.BumpAndWaitForEpochTransitionAsync(token);
+
+        /// <inheritdoc />
+        public string GetRunId() => replicationManager.PrimaryReplId;
+    }
+}

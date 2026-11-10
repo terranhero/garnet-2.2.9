@@ -1,0 +1,664 @@
+﻿// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Buffers;
+using System.Diagnostics;
+using System.Net;
+using System.Text;
+using Garnet.common;
+using Garnet.server;
+using Microsoft.Extensions.Logging;
+
+namespace Garnet.cluster
+{
+    internal sealed unsafe partial class ClusterSession : IClusterSession
+    {
+        public string RemoteNodeId { get; private set; }
+        byte gossipVersion = ClusterConfig.MinimumSupportedClusterConfigVersion;
+
+        /// <summary>
+        /// Implements CLUSTER BUMPEPOCH command
+        /// </summary>
+        /// <param name="invalidParameters"></param>
+        /// <returns></returns>
+        private bool NetworkClusterBumpEpoch(out bool invalidParameters)
+        {
+            invalidParameters = false;
+
+            // Expecting exactly 0 arguments
+            if (parseState.Count != 0)
+            {
+                invalidParameters = true;
+                return true;
+            }
+
+            // Process BUMPEPOCH
+            if (clusterProvider.clusterManager.TryBumpClusterEpoch())
+            {
+                while (!RespWriteUtils.TryWriteDirect(CmdStrings.RESP_OK, ref dcurr, dend))
+                    SendAndReset();
+            }
+            else
+            {
+                while (!RespWriteUtils.TryWriteError(CmdStrings.RESP_ERR_GENERIC_CONFIG_UPDATE, ref dcurr, dend))
+                    SendAndReset();
+            }
+            return true;
+        }
+
+        /// <summary>
+        /// Implements CLUSTER FORGET command
+        /// </summary>
+        /// <param name="invalidParameters"></param>
+        /// <returns></returns>
+        private bool NetworkClusterForget(out bool invalidParameters)
+        {
+            invalidParameters = false;
+
+            // Expecting 1 or 2 arguments
+            if (parseState.Count is < 1 or > 2)
+            {
+                invalidParameters = true;
+                return true;
+            }
+
+            // Parse Node-Id
+            var nodeId = parseState.GetString(0);
+
+            var expirySeconds = 60;
+            if (parseState.Count == 2)
+            {
+                // [Optional] Parse expiry in seconds 
+                if (!parseState.TryGetInt(1, out expirySeconds))
+                {
+                    while (!RespWriteUtils.TryWriteError(CmdStrings.RESP_ERR_GENERIC_VALUE_IS_NOT_INTEGER, ref dcurr, dend))
+                        SendAndReset();
+                    return true;
+                }
+            }
+
+            logger?.LogTrace("CLUSTER FORGET {nodeid} {seconds}", nodeId, expirySeconds);
+            // NOTE: Release epoch to prevent deadlock when acquiring SuspendConfigMerge exclusive lock within TryRemoveWorker.
+            ReleaseCurrentEpoch();
+            try
+            {
+                if (!clusterProvider.clusterManager.TryRemoveWorker(nodeId, expirySeconds, out var errorMessage))
+                {
+                    while (!RespWriteUtils.TryWriteError(errorMessage, ref dcurr, dend))
+                        SendAndReset();
+                }
+                else
+                {
+                    // Terminate any outstanding migration tasks
+                    _ = clusterProvider.migrationManager.TryRemoveMigrationTask(nodeId);
+                    while (!RespWriteUtils.TryWriteDirect(CmdStrings.RESP_OK, ref dcurr, dend))
+                        SendAndReset();
+                }
+            }
+            finally
+            {
+                AcquireCurrentEpoch();
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Implements CLUSTER INFO command
+        /// </summary>
+        /// <param name="invalidParameters"></param>
+        /// <returns></returns>
+        private bool NetworkClusterInfo(out bool invalidParameters)
+        {
+            invalidParameters = false;
+
+            // Expecting exactly 0 arguments
+            if (parseState.Count != 0)
+            {
+                invalidParameters = true;
+                return true;
+            }
+
+            var clusterInfo = clusterProvider.clusterManager.GetInfo();
+            WriteAsciiLargeRespString(clusterInfo);
+
+            return true;
+        }
+
+        /// <summary>
+        /// Implements CLUSTER HELP command
+        /// </summary>
+        /// <param name="invalidParameters"></param>
+        /// <returns></returns>
+        private bool NetworkClusterHelp(out bool invalidParameters)
+        {
+            invalidParameters = false;
+
+            // Expecting exactly 0 arguments
+            if (parseState.Count != 0)
+            {
+                invalidParameters = true;
+                return true;
+            }
+
+            var clusterCommands = ClusterCommandInfo.GetClusterCommands();
+            while (!RespWriteUtils.TryWriteArrayLength(clusterCommands.Count, ref dcurr, dend))
+                SendAndReset();
+            foreach (var command in clusterCommands)
+            {
+                while (!RespWriteUtils.TryWriteSimpleString(command, ref dcurr, dend))
+                    SendAndReset();
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Implements CLUSTER MEET command
+        /// </summary>
+        /// <param name="invalidParameters"></param>
+        /// <returns></returns>
+        private bool NetworkClusterMeet(out bool invalidParameters)
+        {
+            invalidParameters = false;
+
+            // Expecting exactly 2 arguments
+            if (parseState.Count != 2)
+            {
+                invalidParameters = true;
+                return true;
+            }
+
+            var ipAddress = parseState.GetString(0);
+            if (!parseState.TryGetInt(1, out var port))
+            {
+                while (!RespWriteUtils.TryWriteError(
+                           Encoding.ASCII.GetBytes(string.Format(CmdStrings.GenericErrInvalidPort,
+                           parseState.GetString(1))), ref dcurr, dend))
+                    SendAndReset();
+                return true;
+            }
+
+            logger?.LogTrace("CLUSTER MEET");
+            clusterProvider.clusterManager.RunMeetTask(ipAddress, port);
+            while (!RespWriteUtils.TryWriteDirect(CmdStrings.RESP_OK, ref dcurr, dend))
+                SendAndReset();
+
+            return true;
+        }
+
+        /// <summary>
+        /// Implements CLUSTER MYID command
+        /// </summary>
+        /// <param name="invalidParameters"></param>
+        /// <returns></returns>
+        private bool NetworkClusterMyId(out bool invalidParameters)
+        {
+            invalidParameters = false;
+
+            // Expecting exactly 0 arguments
+            if (parseState.Count != 0)
+            {
+                invalidParameters = true;
+                return true;
+            }
+
+            while (!RespWriteUtils.TryWriteAsciiBulkString(clusterProvider.clusterManager.CurrentConfig.LocalNodeId, ref dcurr, dend))
+                SendAndReset();
+
+            return true;
+        }
+
+        /// <summary>
+        /// Implements CLUSTER MYPARENTID command
+        /// </summary>
+        /// <param name="invalidParameters"></param>
+        /// <returns></returns>
+        private bool NetworkClusterMyParentId(out bool invalidParameters)
+        {
+            invalidParameters = false;
+
+            // Expecting exactly 0 arguments
+            if (parseState.Count != 0)
+            {
+                invalidParameters = true;
+                return true;
+            }
+
+            var current = clusterProvider.clusterManager.CurrentConfig;
+            var parentId = current.LocalNodeRole == NodeRole.PRIMARY ? current.LocalNodeId : current.LocalNodePrimaryId;
+            while (!RespWriteUtils.TryWriteAsciiBulkString(parentId, ref dcurr, dend))
+                SendAndReset();
+
+            return true;
+        }
+
+        /// <summary>
+        /// Implements CLUSTER ENDPOINT command
+        /// </summary>
+        /// <param name="invalidParameters"></param>
+        /// <returns></returns>
+        private bool NetworkClusterEndpoint(out bool invalidParameters)
+        {
+            invalidParameters = false;
+
+            // Expecting exactly 1 argument
+            if (parseState.Count != 1)
+            {
+                invalidParameters = true;
+                return true;
+            }
+
+            var nodeId = parseState.GetString(0);
+
+            var current = clusterProvider.clusterManager.CurrentConfig;
+            Worker worker = current.GetWorkerFromNodeId(nodeId);
+            string endpoint = worker.Role == NodeRole.UNASSIGNED
+                ? "unassigned:0"
+                : new IPEndPoint(IPAddress.Parse(worker.Address), worker.Port).ToString();
+            while (!RespWriteUtils.TryWriteAsciiBulkString(endpoint, ref dcurr, dend))
+                SendAndReset();
+            return true;
+        }
+
+        /// <summary>
+        /// Implements CLUSTER NODES command
+        /// </summary>
+        /// <param name="invalidParameters"></param>
+        /// <returns></returns>
+        private bool NetworkClusterNodes(out bool invalidParameters)
+        {
+            invalidParameters = false;
+
+            // Expecting exactly 0 arguments
+            if (parseState.Count != 0)
+            {
+                invalidParameters = true;
+                return true;
+            }
+
+            var nodes = clusterProvider.clusterManager.CurrentConfig.GetClusterInfo(clusterProvider);
+
+            WriteAsciiLargeRespString(nodes);
+
+            return true;
+        }
+
+        /// <summary>
+        /// Implements CLUSTER SET-CONFIG-EPOCH command
+        /// </summary>
+        /// <param name="invalidParameters"></param>
+        /// <returns></returns>
+        private bool NetworkClusterSetConfigEpoch(out bool invalidParameters)
+        {
+            invalidParameters = false;
+
+            // Expecting exactly 1 arguments
+            if (parseState.Count != 1)
+            {
+                invalidParameters = true;
+                return true;
+            }
+
+            if (!parseState.TryGetLong(0, out var configEpoch))
+            {
+                while (!RespWriteUtils.TryWriteError(CmdStrings.RESP_ERR_GENERIC_VALUE_IS_NOT_INTEGER, ref dcurr, dend))
+                    SendAndReset();
+                return true;
+            }
+
+            if (clusterProvider.clusterManager.CurrentConfig.NumWorkers > 1)
+            {
+                while (!RespWriteUtils.TryWriteError(CmdStrings.RESP_ERR_GENERIC_CONFIG_EPOCH_ASSIGNMENT, ref dcurr, dend))
+                    SendAndReset();
+            }
+            else
+            {
+                if (!clusterProvider.clusterManager.TrySetLocalConfigEpoch(configEpoch, out var errorMessage))
+                {
+                    while (!RespWriteUtils.TryWriteError(errorMessage, ref dcurr, dend))
+                        SendAndReset();
+                }
+                else
+                {
+                    while (!RespWriteUtils.TryWriteDirect(CmdStrings.RESP_OK, ref dcurr, dend))
+                        SendAndReset();
+                }
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Implements CLUSTER SHARDS command
+        /// </summary>
+        /// <param name="invalidParameters"></param>
+        /// <returns></returns>
+        private bool NetworkClusterShards(out bool invalidParameters)
+        {
+            invalidParameters = false;
+
+            // Expecting exactly 0 arguments
+            if (parseState.Count != 0)
+            {
+                invalidParameters = true;
+                return true;
+            }
+
+            var preferredType = clusterProvider.serverOptions.ClusterPreferredEndpointType;
+            var shardsInfo = clusterProvider.clusterManager.CurrentConfig.GetShardsInfo(clusterProvider.clusterManager.clusterConnectionStore, preferredType);
+
+            WriteLargeAsciiDirectString(shardsInfo);
+
+            return true;
+        }
+
+        /// <summary>
+        /// Implements CLUSTER GOSSIP command
+        /// </summary>
+        /// <param name="invalidParameters"></param>
+        /// <returns></returns>
+        private bool NetworkClusterGossip(out bool invalidParameters)
+        {
+            invalidParameters = false;
+
+            // Expecting 1 or 2 arguments
+            if (parseState.Count is < 1 or > 2)
+            {
+                invalidParameters = true;
+                return true;
+            }
+
+            var gossipWithMeet = false;
+
+            var currTokenIdx = 0;
+            if (parseState.Count > 1)
+            {
+                var withMeetSpan = parseState.GetArgSliceByRef(currTokenIdx++).ReadOnlySpan;
+
+                Debug.Assert(withMeetSpan.EqualsUpperCaseSpanIgnoringCase(CmdStrings.WITHMEET));
+                if (withMeetSpan.EqualsUpperCaseSpanIgnoringCase(CmdStrings.WITHMEET))
+                    gossipWithMeet = true;
+            }
+
+            var gossipMessage = parseState.GetArgSliceByRef(currTokenIdx).ToArray();
+
+            clusterProvider.clusterManager.gossipStats.UpdateGossipBytesRecv(gossipMessage.Length);
+            var current = clusterProvider.clusterManager.CurrentConfig;
+            bool unsupportedVersion = false;
+
+            // Try merge if not just a ping message
+            if (gossipMessage.Length > 0)
+            {
+                // Validate config version before full deserialization
+                if (!ClusterConfig.TryPeekVersion(gossipMessage, out var version) || !ClusterConfig.IsSupportedVersion(version))
+                {
+                    logger?.LogWarning("Received gossip with incompatible config version: {version}", version);
+                    unsupportedVersion = true;
+                }
+                else
+                {
+                    var other = ClusterConfig.FromByteArray(gossipMessage);
+                    // Accept gossip message if it is a gossipWithMeet or node from node that is already known and trusted
+                    // GossipWithMeet messages are only send through a call to CLUSTER MEET at the remote node
+                    if (gossipWithMeet || current.IsKnown(other.LocalNodeId))
+                    {
+                        if (!current.CanUseGossipVersion(version))
+                        {
+                            logger?.LogWarning("Rejecting gossip version {version}: separate client and peer endpoints require version two", version);
+                            while (!RespWriteUtils.TryWriteError("ERR Separate client and peer endpoints require gossip version two", ref dcurr, dend))
+                                SendAndReset();
+                            return true;
+                        }
+                        if (version != gossipVersion)
+                        {
+                            gossipVersion = version;
+                            lastSentConfig = null;
+                        }
+                        // NOTE: release the epoch to avoid deadlock with MIGRATE config suspension
+                        ReleaseCurrentEpoch();
+                        try
+                        {
+                            _ = clusterProvider.clusterManager.TryMerge(other);
+                        }
+                        finally
+                        {
+                            AcquireCurrentEpoch();
+                        }
+
+                        // Remember that this connection is being used for another cluster node to talk to us
+                        Debug.Assert(RemoteNodeId is null || RemoteNodeId == other.LocalNodeId, "Node Id shouldn't change once set for a connection");
+                        RemoteNodeId = other.LocalNodeId;
+                    }
+                    else
+                        logger?.LogWarning("Received gossip from unknown node: {node-id}", other.LocalNodeId);
+                }
+            }
+
+            byte replyVersion = unsupportedVersion ? ClusterConfig.MaximumSupportedClusterConfigVersion : gossipVersion;
+            if (lastSentConfig != current || gossipWithMeet || unsupportedVersion)
+            {
+                if (!current.CanUseGossipVersion(replyVersion))
+                {
+                    logger?.LogWarning("Rejecting gossip reply version {version}: separate client and peer endpoints require version two", replyVersion);
+                    while (!RespWriteUtils.TryWriteError("ERR Separate client and peer endpoints require gossip version two", ref dcurr, dend))
+                        SendAndReset();
+                    return true;
+                }
+                var configByteArray = current.ToGossipByteArray(replyVersion);
+                clusterProvider.clusterManager.gossipStats.UpdateGossipBytesSend(configByteArray.Length);
+                WriteLargeBulkString(configByteArray);
+                // A version offer does not update the configuration cache for the selected format.
+                if (!unsupportedVersion)
+                    lastSentConfig = current;
+            }
+            else
+            {
+                while (!RespWriteUtils.TryWriteBulkString([], ref dcurr, dend))
+                    SendAndReset();
+            }
+
+            // After each GOSSIP, ensure cluster connections for replication are in a good state
+            if (Server is GarnetServerBase garnetServer)
+            {
+                clusterProvider.replicationManager.EnsureReplication(this, garnetServer.ActiveClusterSessions());
+            }
+
+            return true;
+        }
+
+        /// <summary>
+        /// Implements CLUSTER RESET command
+        /// </summary>
+        /// <param name="invalidParameters"></param>
+        /// <returns></returns>
+        private bool NetworkClusterReset(out bool invalidParameters)
+        {
+            invalidParameters = false;
+
+            // Expecting 0, 1 or 2 arguments
+            if (parseState.Count > 2)
+            {
+                invalidParameters = true;
+                return true;
+            }
+
+            var soft = true;
+            var expirySeconds = 60;
+
+            if (parseState.Count > 0)
+            {
+                var option = parseState.GetArgSliceByRef(0).ReadOnlySpan;
+                soft = option.EqualsUpperCaseSpanIgnoringCase("SOFT"u8);
+            }
+
+            if (parseState.Count > 1)
+            {
+                if (!parseState.TryGetInt(1, out expirySeconds))
+                {
+                    while (!RespWriteUtils.TryWriteError(CmdStrings.RESP_ERR_GENERIC_VALUE_IS_NOT_INTEGER, ref dcurr, dend))
+                        SendAndReset();
+                    return true;
+                }
+            }
+
+            // NOTE: Release epoch to prevent deadlock when acquiring SuspendConfigMerge exclusive lock within TryReset.
+            ReleaseCurrentEpoch();
+            ReadOnlySpan<byte> resp = default;
+            try
+            {
+                resp = clusterProvider.clusterManager.TryReset(soft, expirySeconds);
+            }
+            finally
+            {
+                AcquireCurrentEpoch();
+            }
+            if (!soft) clusterProvider.FlushDB(true);
+
+            while (!RespWriteUtils.TryWriteDirect(resp, ref dcurr, dend))
+                SendAndReset();
+
+            return true;
+        }
+
+        /// <summary>
+        /// Implement CLUSTER PUBLISH command
+        /// </summary>
+        /// <param name="invalidParameters"></param>
+        /// <returns></returns>
+        /// <seealso cref="M:Garnet.client.GarnetClientExtensions.ExecuteClusterPublishNoResponse"/>
+        private bool NetworkClusterPublish(out bool invalidParameters)
+        {
+            invalidParameters = false;
+
+            //  CLUSTER PUBLISH|SPUBLISH channel message
+            // Expecting exactly 2 arguments
+            if (parseState.Count != 2)
+            {
+                logger?.LogError("Cluster publish was rejected because it expected 2 arguments but received {argumentCount}", parseState.Count);
+                return true;
+            }
+
+            if (clusterProvider.storeWrapper.subscribeBroker == null)
+            {
+                logger?.LogError("Cluster publish was rejected because pub/sub is disabled; enable it with --pubsub");
+                return true;
+            }
+
+            clusterProvider.storeWrapper.subscribeBroker.Publish(parseState.GetArgSliceByRef(0), parseState.GetArgSliceByRef(1));
+            return true;
+        }
+
+
+        /// <summary>
+        /// Handle a potentially large already encoded RESP response, breaking it into pieces if necessary.
+        /// </summary>
+        private void WriteLargeAsciiDirectString(ReadOnlySpan<char> message)
+        {
+            // Attempt to write w/o any buffering
+            if (RespWriteUtils.TryWriteAsciiDirect(message, ref dcurr, dend))
+            {
+                return;
+            }
+
+            var buffer = ArrayPool<byte>.Shared.Rent(message.Length);
+            try
+            {
+                var len = Encoding.ASCII.GetBytes(message, buffer);
+                var remaining = buffer.AsSpan()[..len];
+
+                while (!remaining.IsEmpty)
+                {
+                    var space = Math.Min((int)(dend - dcurr), remaining.Length);
+                    _ = RespWriteUtils.TryWriteDirect(remaining[..space], ref dcurr, dend);
+
+                    SendAndReset();
+
+                    remaining = remaining[space..];
+                }
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
+        }
+
+        /// <summary>
+        /// Writes a bulk string that may be larger than the response buffer. Small values take the atomic
+        /// path unchanged; only a value that cannot fit an empty buffer is chunked. Without this an
+        /// over-sized element makes the caller's retry loop unable to progress and kills the session.
+        /// </summary>
+        private void WriteLargeBulkString(ReadOnlySpan<byte> message)
+        {
+            if (RespWriteUtils.TryWriteBulkString(message, ref dcurr, dend))
+                return;
+
+            // Flushing is conditional because SendAndReset throws when there is nothing to send, which is
+            // exactly the case where the message is over-sized and the buffer is still empty.
+            if (dcurr > networkSender.GetResponseObjectHead())
+            {
+                SendAndReset();
+                if (RespWriteUtils.TryWriteBulkString(message, ref dcurr, dend))
+                    return;
+            }
+
+            while (!RespWriteUtils.TryWriteBulkStringLength(message, ref dcurr, dend))
+                SendAndReset();
+
+            var remaining = message;
+            while (!remaining.IsEmpty)
+            {
+                var space = Math.Min((int)(dend - dcurr), remaining.Length);
+                _ = RespWriteUtils.TryWriteDirect(remaining[..space], ref dcurr, dend);
+                SendAndReset();
+                remaining = remaining[space..];
+            }
+
+            while (!RespWriteUtils.TryWriteNewLine(ref dcurr, dend))
+                SendAndReset();
+        }
+
+        /// <summary>
+        /// Handle a potentially large bulk string by breaking it into pieces if necessary.
+        /// </summary>
+        private void WriteAsciiLargeRespString(ReadOnlySpan<char> message)
+        {
+            while (!RespWriteUtils.TryWriteBulkStringLength(message.Length, ref dcurr, dend))
+                SendAndReset();
+
+            // Attempt to write w/o any buffering
+            if (RespWriteUtils.TryWriteAsciiDirect(message, ref dcurr, dend))
+            {
+                while (!RespWriteUtils.TryWriteNewLine(ref dcurr, dend))
+                    SendAndReset();
+
+                return;
+            }
+
+            var buffer = ArrayPool<byte>.Shared.Rent(message.Length);
+            try
+            {
+                var len = Encoding.ASCII.GetBytes(message, buffer);
+                var remaining = buffer.AsSpan()[..len];
+
+                while (!remaining.IsEmpty)
+                {
+                    var space = Math.Min((int)(dend - dcurr), remaining.Length);
+                    _ = RespWriteUtils.TryWriteDirect(remaining[..space], ref dcurr, dend);
+
+                    SendAndReset();
+
+                    remaining = remaining[space..];
+                }
+
+                while (!RespWriteUtils.TryWriteNewLine(ref dcurr, dend))
+                    SendAndReset();
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(buffer);
+            }
+        }
+    }
+}

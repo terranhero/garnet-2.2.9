@@ -1,0 +1,178 @@
+﻿// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+namespace Garnet.server
+{
+    public enum AofEntryType : byte
+    {
+        /// <summary>
+        /// Store upsert
+        /// </summary>
+        StoreUpsert = 0x00,
+        /// <summary>
+        /// Store RMW
+        /// </summary>
+        StoreRMW = 0x01,
+        /// <summary>
+        /// Store delete
+        /// </summary>
+        StoreDelete = 0x02,
+        /// <summary>
+        /// Object store upsert
+        /// </summary>
+        ObjectStoreUpsert = 0x10,
+        /// <summary>
+        /// Object store RMW
+        /// </summary>
+        ObjectStoreRMW = 0x11,
+        /// <summary>
+        /// Object store delete
+        /// </summary>
+        ObjectStoreDelete = 0x12,
+        /// <summary>
+        /// Transaction start
+        /// </summary>
+        TxnStart = 0x20,
+        /// <summary>
+        /// Transaction commit
+        /// </summary>
+        TxnCommit = 0x21,
+        /// <summary>
+        /// Transaction abort
+        /// </summary>
+        TxnAbort = 0x22,
+        /// <summary>
+        /// Checkpoint start marker for unified checkpoint
+        /// </summary>
+        CheckpointStartCommit = 0x30,
+        /// <summary>
+        /// Checkpoint end marker for unified checkpoint
+        /// </summary>
+        CheckpointEndCommit = 0x32,
+        /// <summary>
+        /// Streaming checkpoint start marker for main store
+        /// </summary>
+        MainStoreStreamingCheckpointStartCommit = 0x40,
+        /// <summary>
+        /// Streaming checkpoint start marker for object store
+        /// </summary>
+        ObjectStoreStreamingCheckpointStartCommit = 0x41,
+        /// <summary>
+        /// Streaming checkpoint end marker for main store
+        /// </summary>
+        MainStoreStreamingCheckpointEndCommit = 0x42,
+        /// <summary>
+        /// Streaming checkpoint end marker for object store
+        /// </summary>
+        ObjectStoreStreamingCheckpointEndCommit = 0x43,
+        /// <summary>
+        /// StoredProcedure
+        /// </summary>
+        StoredProcedure = 0x50,
+
+        /// <summary>
+        /// Flush all
+        /// </summary>
+        FlushAll = 0x60,
+        /// <summary>
+        /// Flush db
+        /// </summary>
+        FlushDb = 0x61,
+
+        /// <summary>
+        /// Unified store upsert string
+        /// </summary>
+        UnifiedStoreStringUpsert = 0x70,
+        /// <summary>
+        /// Unified store upsert object
+        /// </summary>
+        UnifiedStoreObjectUpsert = 0x71,
+        /// <summary>
+        /// Unified store RMW
+        /// </summary>
+        UnifiedStoreRMW = 0x72,
+        /// <summary>
+        /// Unified store delete
+        /// </summary>
+        UnifiedStoreDelete = 0x73,
+
+        /// <summary>
+        /// One chunk of a migrated Range Index's serialized BF-Tree file — an internal AOF-only
+        /// transport entry, replayed via <c>RangeIndexManager.HandleRangeIndexStreamReplay</c>.
+        /// </summary>
+        RangeIndexStreamChunk = 0x80,
+    }
+
+    internal enum AofStoreType : byte
+    {
+        MainStoreType = 0x0,
+        ObjectStoreType = 0x1,
+        TxnType = 0x2,
+        ReplicationType = 0x3,
+        CheckpointType = 0x4,
+        FlushDbType = 0x5,
+    }
+
+    internal static class AofEntryTypeExtensions
+    {
+        /// <summary>
+        /// Returns true if the entry type carries a key payload after the header.
+        /// Keyless entries (transactions, checkpoints, flush, stored procedures) have no key.
+        /// </summary>
+        internal static bool HasKey(this AofEntryType opType) => opType switch
+        {
+            AofEntryType.StoreUpsert or
+            AofEntryType.StoreRMW or
+            AofEntryType.StoreDelete or
+            AofEntryType.ObjectStoreUpsert or
+            AofEntryType.ObjectStoreRMW or
+            AofEntryType.ObjectStoreDelete or
+            AofEntryType.UnifiedStoreStringUpsert or
+            AofEntryType.UnifiedStoreObjectUpsert or
+            AofEntryType.UnifiedStoreRMW or
+            AofEntryType.UnifiedStoreDelete or
+            AofEntryType.RangeIndexStreamChunk => true,
+            _ => false,
+        };
+
+        /// <summary>
+        /// True if this op's replayed record carries a length-prefixed value currentComponent after the key (Upsert shapes). This mirrors
+        /// the layout the replay parsers expect, and is used by both the chunked writer (which components to emit) and the reader
+        /// (how to reconstruct), so they always agree.
+        /// </summary>
+        internal static bool HasChunkValue(this AofEntryType opType) => opType switch
+        {
+            AofEntryType.StoreUpsert or
+            AofEntryType.ObjectStoreUpsert or
+            AofEntryType.UnifiedStoreStringUpsert or
+            AofEntryType.UnifiedStoreObjectUpsert => true,
+            _ => false,
+        };
+
+        /// <summary>
+        /// True if this op's replayed record carries a raw (non-length-prefixed) input tail after the key/value (Upsert-with-input
+        /// and RMW shapes). Object upserts and deletes carry no input. Used by both the chunked writer and reader.
+        /// </summary>
+        internal static bool HasChunkInput(this AofEntryType opType) => opType switch
+        {
+            AofEntryType.StoreUpsert or
+            AofEntryType.StoreRMW or
+            AofEntryType.ObjectStoreRMW or
+            AofEntryType.UnifiedStoreStringUpsert or
+            AofEntryType.UnifiedStoreRMW => true,
+            _ => false,
+        };
+
+        /// <summary>
+        /// True if this op's chunked value is a streamed OBJECT value (whose length is not known up front), so the reader must
+        /// accumulate it rather than pre-allocate from the header's overflowValueLength (which is 0 for these). Span (string)
+        /// upsert values are pre-sized instead.
+        /// </summary>
+        internal static bool HasChunkObjectValue(this AofEntryType opType) => opType switch
+        {
+            AofEntryType.ObjectStoreUpsert or
+            AofEntryType.UnifiedStoreObjectUpsert => true,
+            _ => false,
+        };
+    }
+}

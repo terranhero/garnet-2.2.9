@@ -1,0 +1,211 @@
+﻿// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+namespace Garnet.common
+{
+    /// <summary>
+    /// Exception injection types - used only in debug mode for testing
+    /// </summary>
+    public enum ExceptionInjectionType
+    {
+        /// <summary>
+        /// Placeholder for "no fault"
+        /// </summary>
+        None = 0,
+
+        /// <summary>
+        /// Fail replica attachment after primary maintenance has drained.
+        /// </summary>
+        Replication_Fail_After_Primary_Task_Drain,
+
+        /// <summary>
+        /// Pause an in-flight background collection cycle before its storage mutations.
+        /// </summary>
+        Failover_Pause_Background_Object_Collection,
+
+        /// <summary>
+        /// Pause between sampling write admission state and loading cluster configuration.
+        /// </summary>
+        Failover_Pause_Between_Write_Admission_Reads,
+
+        /// <summary>
+        /// Pause an admitted transaction before executing a database flush.
+        /// </summary>
+        Failover_Pause_Before_Transactional_Flush,
+
+        /// <summary>
+        /// Network failure after GarnetServerTcp handler created
+        /// </summary>
+        Network_After_GarnetServerTcp_Handler_Created,
+        /// <summary>
+        /// Network failure after TcpNetworkHandlerBase start server
+        /// </summary>
+        Network_After_TcpNetworkHandlerBase_Start_Server,
+        /// <summary>
+        /// Primary replication sync orchestration failure right before background aof stream starts
+        /// </summary>
+        Replication_Fail_Before_Background_AOF_Stream_Task_Start,
+        /// <summary>
+        /// Acquire checkpoint entry from memory entries
+        /// </summary>
+        Replication_Acquire_Checkpoint_Entry_Fail_Condition,
+        /// <summary>
+        /// Wait after checkpoint acquisition
+        /// </summary>
+        Replication_Wait_After_Checkpoint_Acquisition,
+        /// <summary>
+        /// Wait at migration slot driver right after acquiring the end scan range
+        /// </summary>
+        Migration_Slot_End_Scan_Range_Acquisition,
+        /// <summary>
+        /// AOF on replica has diverged from stream coming from primary.
+        /// </summary>
+        Divergent_AOF_Stream,
+        /// <summary>
+        /// Consume callback on ReplicaSyncTask faults.
+        /// </summary>
+        Aof_Sync_Task_Consume,
+        /// <summary>
+        /// Failed to add AOF sync task due to unknown node
+        /// </summary>
+        Replication_Failed_To_AddAofSyncTask_UnknownNode,
+        /// <summary>
+        /// Delay response on receive checkpoint to trigger timeout
+        /// </summary>
+        Replication_Timeout_On_Receive_Checkpoint,
+        /// <summary>
+        /// Replication InProgress during disk-based replica attach sync operation
+        /// </summary>
+        Replication_InProgress_During_DiskBased_Replica_Attach_Sync,
+        /// <summary>
+        /// Replication InProgress during diskless replica attach sync operation
+        /// </summary>
+        Replication_InProgress_During_Diskless_Replica_Attach_Sync,
+        /// <summary>
+        /// Replication diskless sync reset cts
+        /// </summary>
+        Replication_Diskless_Sync_Reset_Cts,
+        /// <summary>
+        /// Fail TakeOverAsPrimary during failover by throwing before BeginRecovery is called.
+        /// </summary>
+        Failover_Fail_TakeOverAsPrimary,
+        /// <summary>
+        /// During deletion of a Vector Set, leaving it partially deleted - at a particular point of execution.
+        /// </summary>
+        VectorSet_Interrupt_Delete_0,
+        /// <summary>
+        /// During deletion of a Vector Set, leaving it partially deleted - at a particular point of execution.
+        /// </summary>
+        VectorSet_Interrupt_Delete_1,
+        /// <summary>
+        /// During deletion of a Vector Set, leaving it partially deleted - at a particular point of execution.
+        /// </summary>
+        VectorSet_Interrupt_Delete_2,
+        /// <summary>
+        /// During deletion of a Vector Set, leaving it partially deleted - at a particular point of execution.
+        /// </summary>
+        VectorSet_Interrupt_Delete_3,
+        /// <summary>
+        /// Failure after handler registered in activeHandlers but before Start() is called.
+        /// This means no SAEA receive loop is running, so the only cleanup path is public Dispose().
+        /// </summary>
+        Dispose_After_Handler_Registered_Before_Start,
+        /// <summary>
+        /// RangeIndex migration: pause after populating sketch, before setting TRANSMITTING.
+        /// </summary>
+        RangeIndex_Migration_Before_Transmitting,
+        /// <summary>
+        /// RangeIndex migration: pause after entering TRANSMITTING state, before starting snapshot/transmit loop.
+        /// </summary>
+        RangeIndex_Migration_After_Transmitting,
+        /// <summary>
+        /// RangeIndex migration: pause after all keys transmitted, before setting DELETING.
+        /// </summary>
+        RangeIndex_Migration_Before_Deleting,
+        /// <summary>
+        /// RangeIndex migration: pause after entering DELETING state, before deleting keys.
+        /// </summary>
+        RangeIndex_Migration_After_Deleting,
+        /// <summary>
+        /// RangeIndex migration (receive side): pause inside ProcessRecord after a chunk has been
+        /// processed, while the dispose guard is held. Lets a test race Dispose() against an
+        /// in-flight ProcessRecord.
+        /// </summary>
+        RangeIndex_Migration_Receive_Pause_In_ProcessRecord,
+        /// <summary>
+        /// Vector Set: pause after a VADD/VREM has modified the index but before append-log RMW against main store.
+        /// </summary>
+        VectorSet_Pause_Before_Synthetic_Replication_Rmw,
+        /// <summary>
+        /// RangeIndex AOF replay: force PublishMigratedIndex to be treated as failed once a stream
+        /// reassembles, to exercise the publish-failure throw path in ProcessStreamChunk.
+        /// </summary>
+        RangeIndex_Replay_Force_Publish_Failure,
+        /// <summary>
+        /// Vector Set: pause in the index-recreate window before RMW write refreshed index pointer back to the main store.
+        /// </summary>
+        VectorSet_Pause_Before_Recreate_Rmw,
+
+        /// <summary>
+        /// Pause before the RMW that persists a <c>ContextMetadata</c> record.
+        /// </summary>
+        VectorSet_Pause_Before_Context_Metadata_Rmw,
+
+        /// <summary>
+        /// Pause when a checkpoint reaches the end of its fuzzy region, before it captures the
+        /// last address the snapshot covers.
+        /// </summary>
+        Checkpoint_Pause_At_Flush_Begin,
+        /// <summary>
+        /// Cluster gossip: fail a single round of the main gossip loop, to exercise recovery from a transient
+        /// error raised while connections are initialized or the configuration is broadcast.
+        /// </summary>
+        Cluster_Gossip_Round_Fail,
+        /// <summary>
+        /// TLS network reader: pause at the top of the decrypt loop while a partial (not-yet-consumable) frame
+        /// remains buffered, before the next read. Lets a test deterministically deliver a graceful close
+        /// (close_notify/EOF) mid-frame to exercise the reader's end-of-stream handling.
+        /// </summary>
+        Tls_Pause_With_Partial_Frame,
+        /// <summary>
+        /// Replica full sync: fail recovery of the checkpoint received from the primary, before any of it is applied.
+        /// </summary>
+        Replication_Fail_Replica_Checkpoint_Recovery,
+        /// <summary>
+        /// Replica full sync: stand in for a transferred HybridLog checkpoint whose metadata cannot be read, so the
+        /// token scan finds candidates but rejects every one of them.
+        /// </summary>
+        Replication_Fail_Replica_Unreadable_Checkpoint,
+        /// <summary>
+        /// Cluster gossip: pause at the top of a pending connection add (before the store write lock is taken),
+        /// so a test can republish the GOSSIP_CLIENT configuration while an add is in flight and verify the
+        /// pending node was built against the stale snapshot and is rebuilt before being advertised.
+        /// </summary>
+        Cluster_Gossip_Pause_Before_AddConnection,
+        /// <summary>
+        /// GarnetClient: pause before encrypting a flush chunk, while its source buffer is still in use.
+        /// </summary>
+        GarnetClient_Tls_Pause_Before_Write,
+        /// <summary>
+        /// GarnetClient: pause after connecting a socket, before publishing its writer.
+        /// </summary>
+        GarnetClient_Connect_Pause_Before_Publish,
+        /// <summary>
+        /// Pause after receiving the full diskless snapshot, before recovery resets the AOF addresses.
+        /// </summary>
+        Replication_Pause_Before_Diskless_Snapshot_Recovery,
+        /// <summary>
+        /// Pause a periodic commit before checking the node role and committing the AOF.
+        /// </summary>
+        Aof_Pause_Before_Periodic_Commit,
+        /// <summary>
+        /// Server network sender: pause a send completion that frees a slot for a waiting send, after it has
+        /// decremented the send count and before it releases the waiter.
+        /// </summary>
+        Sender_Pause_Before_Slot_Release,
+        /// <summary>
+        /// Server network sender: pause after a send timeout closes the socket, before waiting for its send slot.
+        /// </summary>
+        Sender_Pause_Before_Timed_Out_Slot_Wait,
+    }
+}

@@ -1,0 +1,155 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Diagnostics;
+using Tsavorite.core;
+
+namespace Garnet.server
+{
+    /// <summary>
+    /// Unified store functions
+    /// </summary>
+    public readonly unsafe partial struct UnifiedSessionFunctions : ISessionFunctions<UnifiedInput, UnifiedOutput, long>
+    {
+        public RecordFieldInfo GetRMWModifiedFieldInfo<TSourceLogRecord>(in TSourceLogRecord srcLogRecord,
+            ref UnifiedInput input) where TSourceLogRecord : ISourceLogRecord
+        {
+            var fieldInfo = new RecordFieldInfo
+            {
+                KeySize = srcLogRecord.Key.Length,
+                ValueSize = srcLogRecord.DataHeader.ValueIsObject ? ObjectIdMap.ObjectIdSize : 0,
+                ValueIsObject = srcLogRecord.DataHeader.ValueIsObject,
+                HasETag = !srcLogRecord.DataHeader.ValueIsObject && srcLogRecord.DataHeader.HasETag,
+                HasExpiration = srcLogRecord.DataHeader.HasExpiration,
+                RecordType = srcLogRecord.RecordType,
+            };
+
+            if (input.header.cmd != RespCommand.NONE)
+            {
+                var cmd = input.header.cmd;
+
+                switch (cmd)
+                {
+                    case RespCommand.EXPIRE:
+                        {
+                            // Set HasExpiration to match with EvaluateExpireInPlace.
+                            if (srcLogRecord.DataHeader.HasExpiration)
+                            {
+                                // case ExpireOption.NX:                // HasExpiration is true so we will retain it
+                                // case ExpireOption.XX:
+                                // case ExpireOption.None:
+                                // case ExpireOption.GT:
+                                // case ExpireOption.XXGT:
+                                // case ExpireOption.LT:
+                                // case ExpireOption.XXLT:
+                                fieldInfo.HasExpiration = true;         // Will update or retain
+                            }
+                            else
+                            {
+                                var expirationWithOption = new ExpirationWithOption(input.arg1);
+                                switch (expirationWithOption.ExpireOption)
+                                {
+                                    case ExpireOption.NX:
+                                    case ExpireOption.None:
+                                    case ExpireOption.LT:
+                                        // If expiry doesn't exist, LT should treat the current expiration as infinite, so the new value must be less
+                                        fieldInfo.HasExpiration = true;     // Will update or retain
+                                        break;
+                                    default:
+                                        // case ExpireOption.XX:
+                                        // case ExpireOption.GT:            // If expiry doesn't exist, GT should treat the current expiration as infinite, so the new value cannot be greater
+                                        // case ExpireOption.XXGT:
+                                        // case ExpireOption.XXLT:
+                                        fieldInfo.HasExpiration = false;    // Will not add one and there is not one there now
+                                        break;
+                                }
+                            }
+                        }
+
+                        if (!srcLogRecord.DataHeader.ValueIsObject)
+                            fieldInfo.ValueSize = srcLogRecord.ValueSpan.Length;
+                        return fieldInfo;
+                    case RespCommand.PERSIST:
+                        fieldInfo.HasExpiration = false;
+                        if (!srcLogRecord.DataHeader.ValueIsObject)
+                            fieldInfo.ValueSize = srcLogRecord.ValueSpan.Length;
+                        return fieldInfo;
+                    default:
+                        return fieldInfo;
+                }
+            }
+
+            fieldInfo.ValueSize = input.parseState.GetArgSliceByRef(0).Length;
+            fieldInfo.HasExpiration = input.arg1 != 0;
+            return fieldInfo;
+        }
+
+        public RecordFieldInfo GetRMWInitialFieldInfo<TKey>(TKey key, ref UnifiedInput input)
+            where TKey : IKey, allows ref struct
+        {
+            // We know namespaces aren't present in string/object functions, so don't populate
+            return new RecordFieldInfo
+            {
+                KeySize = key.KeyBytes.Length,
+                ValueSize = 0,
+                HasETag = false
+            };
+        }
+
+        public RecordFieldInfo GetUpsertFieldInfo<TKey>(TKey key, ReadOnlySpan<byte> value,
+            ref UnifiedInput input)
+            where TKey : IKey, allows ref struct
+        {
+            // During renames we might be moving a Vector Set or Ranged Index, if so we need to set the RecordType appropriately
+            byte recordType;
+            if (input.header.cmd is RespCommand.RENAME or RespCommand.RENAMENX)
+            {
+                recordType = (byte)input.arg1;
+                Debug.Assert(recordType is 0 or VectorManager.RecordType or RangeIndexManager.RangeIndexRecordType, "Unexpected RecordType on rename operation");
+            }
+            else
+            {
+                recordType = 0;
+            }
+
+            return new RecordFieldInfo
+            {
+                KeySize = key.KeyBytes.Length,
+                ValueSize = value.Length,
+                ValueIsObject = false,
+                HasETag = false,
+                RecordType = recordType,
+            };
+        }
+
+        public RecordFieldInfo GetUpsertFieldInfo<TKey>(TKey key, IHeapObject value, ref UnifiedInput input)
+            where TKey : IKey, allows ref struct
+        {
+            return new RecordFieldInfo
+            {
+                KeySize = key.KeyBytes.Length,
+                ValueSize = ObjectIdMap.ObjectIdSize,
+                ValueIsObject = true,
+                HasETag = false,
+            };
+        }
+
+        public RecordFieldInfo GetUpsertFieldInfo<TKey, TSourceLogRecord>(TKey key,
+            in TSourceLogRecord inputLogRecord,
+            ref UnifiedInput input)
+            where TKey : IKey, allows ref struct
+            where TSourceLogRecord : ISourceLogRecord
+        {
+            return new RecordFieldInfo
+            {
+                KeySize = key.KeyBytes.Length,
+                ValueSize = inputLogRecord.DataHeader.ValueIsObject ? ObjectIdMap.ObjectIdSize : inputLogRecord.ValueSpan.Length,
+                ValueIsObject = inputLogRecord.DataHeader.ValueIsObject,
+                HasETag = !inputLogRecord.DataHeader.ValueIsObject && inputLogRecord.DataHeader.HasETag,
+                HasExpiration = inputLogRecord.DataHeader.HasExpiration,
+                RecordType = inputLogRecord.RecordType,
+            };
+        }
+    }
+}

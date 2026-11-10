@@ -1,0 +1,98 @@
+﻿// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+namespace Garnet.cluster
+{
+    /// <summary>
+    /// NodeRole identifier.
+    /// Persisted in the cluster config (ClusterConfigSerializer) and gossiped, so values are
+    /// EXPLICIT and APPEND-ONLY: never change/reorder an existing value; add new roles at the end.
+    /// </summary>
+    public enum NodeRole : byte
+    {
+        /// <summary>
+        /// PRIMARY Role identifier
+        /// </summary>
+        PRIMARY = 0x0,
+        /// <summary>
+        /// REPLICA Role identifier
+        /// </summary>
+        REPLICA = 0x1,
+        /// <summary>
+        /// UNASSIGNED Role identifier
+        /// </summary>
+        UNASSIGNED = 0x2,
+    }
+
+    /// <summary>
+    /// Cluster worker definition
+    /// </summary>
+    public struct Worker
+    {
+        /// <summary>
+        /// Unique node ID
+        /// </summary>
+        public string Nodeid;
+
+        /// <summary>
+        /// Client IP address
+        /// </summary>
+        public string Address;
+
+        /// <summary>
+        /// Client port
+        /// </summary>
+        public int Port;
+
+        /// <summary>
+        /// Cluster IP address; null when a legacy relay has not supplied it.
+        /// </summary>
+        public string ClusterAddress;
+
+        /// <summary>
+        /// Cluster port; zero when a legacy relay has not supplied it.
+        /// </summary>
+        public int ClusterPort;
+
+        /// <summary>
+        /// Effective peer IP address, falling back to the client address when peer metadata is absent.
+        /// </summary>
+        internal string PeerAddress => ClusterAddress ?? Address;
+
+        /// <summary>
+        /// Effective peer port, falling back to the client port when peer metadata is absent.
+        /// </summary>
+        internal int PeerPort => ClusterAddress == null ? Port : ClusterPort;
+
+        /// <summary>
+        /// Configuration epoch.
+        /// </summary>
+        public long ConfigEpoch;
+
+        /// <summary>
+        /// Role of node (i.e 0: primary 1: replica).
+        /// </summary>
+        public NodeRole Role;
+
+        /// <summary>
+        /// Node ID that this node is replicating (i.e. primary id).
+        /// </summary>
+        public string ReplicaOfNodeId;
+
+        /// <summary>
+        /// Replication offset (readonly value for information only)
+        /// </summary>
+        public long ReplicationOffset;
+
+        /// <summary>
+        /// Hostname of this instance
+        /// </summary>
+        public string hostname;
+
+        /// <summary>
+        /// ToString
+        /// </summary>
+        /// <returns></returns>
+        public override string ToString() => $"{Nodeid} {Address} {Port} {ConfigEpoch} {Role} {ReplicaOfNodeId}";
+    }
+}

@@ -1,0 +1,449 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Threading.Tasks;
+using NUnit.Framework;
+using NUnit.Framework.Legacy;
+using Tsavorite.core;
+using static Tsavorite.test.TestUtils;
+
+namespace Tsavorite.test
+{
+    // Must be in a separate block so the "using StructStoreFunctions" is the first line in its namespace declaration.
+    public class LocalKeyStructComparer : IKeyComparer
+    {
+        internal long? forceCollisionHash;
+
+        public long GetHashCode64<TKey>(TKey key)
+            where TKey : IKey, allows ref struct
+            => forceCollisionHash ?? Utility.GetHashCode(key.KeyBytes.AsRef<KeyStruct>().kfield1);
+
+        public bool Equals<TFirstKey, TSecondKey>(TFirstKey k1, TSecondKey k2)
+            where TFirstKey : IKey, allows ref struct
+            where TSecondKey : IKey, allows ref struct
+            => k1.KeyBytes.AsRef<KeyStruct>().kfield1 == k2.KeyBytes.AsRef<KeyStruct>().kfield1 && k1.KeyBytes.AsRef<KeyStruct>().kfield2 == k2.KeyBytes.AsRef<KeyStruct>().kfield2;
+
+        public override string ToString() => $"forceHashCollision: {forceCollisionHash}";
+    }
+}
+
+namespace Tsavorite.test
+{
+    using StructAllocator = SpanByteAllocator<StoreFunctions<LocalKeyStructComparer, SpanByteRecordTriggers>>;
+    using StructStoreFunctions = StoreFunctions<LocalKeyStructComparer, SpanByteRecordTriggers>;
+    [TestFixture]
+    class CompletePendingTests : TestBase
+    {
+        private TsavoriteKV<StructStoreFunctions, StructAllocator> store;
+        private IDevice log;
+        readonly LocalKeyStructComparer comparer = new();
+
+        [SetUp]
+        public void Setup()
+        {
+            // Clean up log files from previous test runs in case they weren't cleaned up
+            DeleteDirectory(MethodTestDir, wait: true);
+
+            log = Devices.CreateLogDevice(Path.Join(MethodTestDir, "CompletePendingTests.log"), preallocateFile: true, deleteOnClose: true);
+            store = new(new()
+            {
+                IndexSize = 1L << 13,
+                LogDevice = log,
+                LogMemorySize = 1L << 29
+            }, StoreFunctions.Create(comparer, SpanByteRecordTriggers.Instance)
+                , (allocatorSettings, storeFunctions) => new(allocatorSettings, storeFunctions)
+                );
+        }
+
+        [TearDown]
+        public void TearDown()
+        {
+            store?.Dispose();
+            store = null;
+            log?.Dispose();
+            log = null;
+            OnTearDown(waitForDelete: true);
+        }
+
+        const int NumRecords = 1000;
+
+        static KeyStruct NewKeyStruct(int key) => new() { kfield1 = key, kfield2 = key + NumRecords * 10 };
+        static ValueStruct NewValueStruct(int key) => new() { vfield1 = key, vfield2 = key + NumRecords * 10 };
+
+        static InputStruct NewInputStruct(int key) => new() { ifield1 = key + NumRecords * 30, ifield2 = key + NumRecords * 40 };
+        static ContextStruct NewContextStruct(int key) => new() { cfield1 = key + NumRecords * 50, cfield2 = key + NumRecords * 60 };
+
+        static void VerifyStructs(int key, in KeyStruct keyStruct, in InputStruct inputStruct, ref OutputStruct outputStruct, ref ContextStruct contextStruct, bool useRMW)
+        {
+            ClassicAssert.AreEqual(key, keyStruct.kfield1);
+            ClassicAssert.AreEqual(key + NumRecords * 10, keyStruct.kfield2);
+            ClassicAssert.AreEqual(key + NumRecords * 30, inputStruct.ifield1);
+            ClassicAssert.AreEqual(key + NumRecords * 40, inputStruct.ifield2);
+
+            // RMW causes the InPlaceUpdater to be called, which adds input fields to the value.
+            ClassicAssert.AreEqual(key + (useRMW ? inputStruct.ifield1 : 0), outputStruct.value.vfield1);
+            ClassicAssert.AreEqual(key + NumRecords * 10 + (useRMW ? inputStruct.ifield2 : 0), outputStruct.value.vfield2);
+            ClassicAssert.AreEqual(key + NumRecords * 50, contextStruct.cfield1);
+            ClassicAssert.AreEqual(key + NumRecords * 60, contextStruct.cfield2);
+        }
+
+        class ProcessPending
+        {
+            // Get the first chunk of outputs as a group, testing realloc.
+            private int deferredPendingMax = CompletedOutputIterator<InputStruct, OutputStruct, ContextStruct>.kInitialAlloc + 1;
+            private int deferredPending = 0;
+            internal Dictionary<int, long> keyAddressDict = [];
+            private bool isFirst = true;
+
+            internal bool IsFirst()
+            {
+                var temp = isFirst;
+                isFirst = false;
+                return temp;
+            }
+
+            internal bool DeferPending()
+            {
+                if (deferredPending < deferredPendingMax)
+                {
+                    ++deferredPending;
+                    return true;
+                }
+                return false;
+            }
+
+            internal void Process(CompletedOutputIterator<InputStruct, OutputStruct, ContextStruct> completedOutputs, List<(KeyStruct, long)> rmwCopyUpdatedAddresses)
+            {
+                var useRMW = rmwCopyUpdatedAddresses is not null;
+                ClassicAssert.AreEqual(CompletedOutputIterator<InputStruct, OutputStruct, ContextStruct>.kInitialAlloc *
+                                CompletedOutputIterator<InputStruct, OutputStruct, ContextStruct>.kReallocMultuple, completedOutputs.vector.Length);
+                ClassicAssert.AreEqual(deferredPending, completedOutputs.maxIndex);
+                ClassicAssert.AreEqual(-1, completedOutputs.currentIndex);
+
+                var count = 0;
+                for (; completedOutputs.Next(); ++count)
+                {
+                    ref var result = ref completedOutputs.Current;
+                    VerifyStructs((int)result.Key.KeyBytes.AsRef<KeyStruct>().kfield1, in result.Key.KeyBytes.AsRef<KeyStruct>(), in result.Input, ref result.Output, ref result.Context, useRMW);
+                    if (!useRMW)
+                        ClassicAssert.AreEqual(keyAddressDict[(int)result.Key.KeyBytes.AsRef<KeyStruct>().kfield1], result.RecordMetadata.Address);
+                    else if (keyAddressDict[(int)result.Key.KeyBytes.AsRef<KeyStruct>().kfield1] != result.RecordMetadata.Address)
+                        rmwCopyUpdatedAddresses.Add((result.Key.KeyBytes.AsRef<KeyStruct>(), result.RecordMetadata.Address));
+                }
+                completedOutputs.Dispose();
+                ClassicAssert.AreEqual(deferredPending + 1, count);
+                ClassicAssert.AreEqual(-1, completedOutputs.maxIndex);
+                ClassicAssert.AreEqual(-1, completedOutputs.currentIndex);
+
+                deferredPending = 0;
+                deferredPendingMax /= 2;
+            }
+
+            internal void VerifyNoDeferredPending()
+            {
+                ClassicAssert.AreEqual(0, deferredPendingMax);  // This implicitly does a null check as well as ensures processing actually happened
+                ClassicAssert.AreEqual(0, deferredPending);
+            }
+
+            internal static void VerifyOneNotFound(CompletedOutputIterator<InputStruct, OutputStruct, ContextStruct> completedOutputs, ref KeyStruct keyStruct)
+            {
+                ClassicAssert.IsTrue(completedOutputs.Next());
+                ClassicAssert.IsFalse(completedOutputs.Current.Status.Found);
+                ClassicAssert.AreEqual(keyStruct, completedOutputs.Current.Key.KeyBytes.AsRef<KeyStruct>());
+                ClassicAssert.IsFalse(completedOutputs.Next());
+                completedOutputs.Dispose();
+            }
+        }
+
+        [Test]
+        [Category("TsavoriteKV")]
+        public async ValueTask ReadAndCompleteWithPendingOutput([Values] bool useRMW)
+        {
+            using var session = store.NewSession<KeyStruct, InputStruct, OutputStruct, ContextStruct, FunctionsWithContext<ContextStruct>>(new FunctionsWithContext<ContextStruct>());
+            var bContext = session.BasicContext;
+            ClassicAssert.IsNull(session.completedOutputs);    // Do not instantiate until we need it
+
+            ProcessPending processPending = new();
+
+            // Locals in an async method can be moved by the GC, so the value must live in pinned storage
+            var valueStructs = GC.AllocateArray<ValueStruct>(1, pinned: true);
+
+            for (var key = 0; key < NumRecords; ++key)
+            {
+                var keyStruct = NewKeyStruct(key);
+                valueStructs[0] = NewValueStruct(key);
+                processPending.keyAddressDict[key] = store.Log.TailAddress;
+                _ = bContext.Upsert(keyStruct, SpanByte.FromPinnedVariable(ref valueStructs[0]));
+            }
+
+            // Flush to make reads or RMWs go pending.
+            store.Log.FlushAndEvict(wait: true);
+
+            List<(KeyStruct key, long address)> rmwCopyUpdatedAddresses = [];
+
+            for (var key = 0; key < NumRecords; ++key)
+            {
+                var keyStruct = NewKeyStruct(key);
+                var inputStruct = NewInputStruct(key);
+                var contextStruct = NewContextStruct(key);
+                OutputStruct outputStruct = default;
+
+                if ((key % (NumRecords / 10)) == 0)
+                {
+                    var ksUnfound = keyStruct;
+                    ksUnfound.kfield1 += NumRecords * 10;
+                    if (bContext.Read(ksUnfound, ref inputStruct, ref outputStruct, contextStruct).IsPending)
+                    {
+                        CompletedOutputIterator<InputStruct, OutputStruct, ContextStruct> completedOutputs;
+                        if ((key & 1) == 0)
+                            completedOutputs = await bContext.CompletePendingWithOutputsAsync().ConfigureAwait(false);
+                        else
+                            _ = bContext.CompletePendingWithOutputs(out completedOutputs, wait: true);
+                        ProcessPending.VerifyOneNotFound(completedOutputs, ref ksUnfound);
+                    }
+                }
+
+                // We don't use context (though we verify it), and Read does not use input.
+                var status = useRMW
+                    ? bContext.RMW(keyStruct, ref inputStruct, ref outputStruct, contextStruct)
+                    : bContext.Read(keyStruct, ref inputStruct, ref outputStruct, contextStruct);
+                if (status.IsPending)
+                {
+                    if (processPending.IsFirst())
+                    {
+                        _ = bContext.CompletePending(wait: true);        // Test that this does not instantiate CompletedOutputIterator
+                        ClassicAssert.IsNull(session.completedOutputs);    // Do not instantiate until we need it
+                        continue;
+                    }
+
+                    if (!processPending.DeferPending())
+                    {
+                        CompletedOutputIterator<InputStruct, OutputStruct, ContextStruct> completedOutputs;
+                        if ((key & 1) == 0)
+                            completedOutputs = await bContext.CompletePendingWithOutputsAsync().ConfigureAwait(false);
+                        else
+                            _ = bContext.CompletePendingWithOutputs(out completedOutputs, wait: true);
+                        processPending.Process(completedOutputs, useRMW ? rmwCopyUpdatedAddresses : null);
+                    }
+                    continue;
+                }
+                ClassicAssert.IsTrue(status.Found);
+            }
+            processPending.VerifyNoDeferredPending();
+
+            // If we are using RMW, then all records were pending and updated their addresses, and we skipped the first one in the loop above.
+            if (useRMW)
+                ClassicAssert.AreEqual(NumRecords - 1, rmwCopyUpdatedAddresses.Count);
+
+            foreach (var (key, address) in rmwCopyUpdatedAddresses)
+            {
+                // Reader does not verify the input struct.
+                InputStruct inputStruct = default;
+                OutputStruct outputStruct = default;
+                ReadOptions readOptions = default;
+
+                // This should not be pending since we've not flushed.
+                var localKey = key;
+                var status = bContext.Read(localKey, ref inputStruct, ref outputStruct, ref readOptions, out RecordMetadata recordMetadata);
+                ClassicAssert.IsFalse(status.IsPending);
+                ClassicAssert.AreEqual(address, recordMetadata.Address);
+            }
+        }
+        public class PendingReadFunctions<TContext> : SessionFunctionsBase<InputStruct, OutputStruct, Empty>
+        {
+            public override void ReadCompletionCallback(ref DiskLogRecord diskLogRecord, ref InputStruct input, ref OutputStruct output, Empty ctx, Status status, RecordMetadata recordMetadata)
+            {
+                ClassicAssert.IsTrue(status.Found);
+                ClassicAssert.AreEqual(diskLogRecord.Key.AsRef<KeyStruct>().kfield1, output.value.vfield1);
+                // Do not compare field2; that's our updated value, and the key won't be found if we change kfield2
+            }
+
+            // Read functions
+            public override bool Reader<TSourceLogRecord>(in TSourceLogRecord srcLogRecord, ref InputStruct input, ref OutputStruct output, ref ReadInfo readInfo)
+            {
+                ClassicAssert.IsFalse(srcLogRecord.Info.IsNull);
+                output.value = srcLogRecord.ValueSpan.AsRef<ValueStruct>();
+                return true;
+            }
+        }
+
+        [Test]
+        [Category("FasterKV")]
+        public void ReadPendingWithNewSameKey([Values(FlushMode.NoFlush, FlushMode.OnDisk)] FlushMode secondRecordFlushMode)
+        {
+            const int valueMult = 1000;
+
+            using var session = store.NewSession<KeyStruct, InputStruct, OutputStruct, Empty, PendingReadFunctions<ContextStruct>>(new PendingReadFunctions<ContextStruct>());
+            var bContext = session.BasicContext;
+
+            // Insert first record
+            var firstValue = 0; // same as key
+            var keyStruct = new KeyStruct { kfield1 = firstValue, kfield2 = firstValue * valueMult };
+            var valueStruct = new ValueStruct { vfield1 = firstValue, vfield2 = firstValue * valueMult };
+            _ = bContext.Upsert(keyStruct, SpanByte.FromPinnedVariable(ref valueStruct));
+
+            // Flush to make the Read() go pending.
+            store.Log.FlushAndEvict(wait: true);
+
+            var (status, _ /*outputStruct*/) = bContext.Read(keyStruct);
+            ClassicAssert.IsTrue(status.IsPending, $"Expected status.IsPending: {status}");
+
+            // Insert next record with the same key and flush this too if requested.
+            var secondValue = firstValue + 1;
+            valueStruct.vfield2 = secondValue * valueMult;
+            _ = bContext.Upsert(keyStruct, SpanByte.FromPinnedVariable(ref valueStruct));
+            if (secondRecordFlushMode == FlushMode.OnDisk)
+                store.Log.FlushAndEvict(wait: true);
+
+            (status, var outputStruct) = bContext.GetSinglePendingResult();
+            ClassicAssert.AreEqual(secondValue * valueMult, outputStruct.value.vfield2, "Should have returned second value");
+        }
+
+        [Test]
+        [Category("FasterKV")]
+        public void ReadPendingWithNewDifferentKeyInChain([Values(FlushMode.NoFlush, FlushMode.OnDisk)] FlushMode secondRecordFlushMode)
+        {
+            const int valueMult = 1000;
+
+            using var session = store.NewSession<KeyStruct, InputStruct, OutputStruct, Empty, PendingReadFunctions<ContextStruct>>(new PendingReadFunctions<ContextStruct>());
+            var bContext = session.BasicContext;
+
+            // Insert first record
+            var firstValue = 0; // same as key
+            var keyStruct = new KeyStruct { kfield1 = firstValue, kfield2 = firstValue * valueMult };
+            var valueStruct = new ValueStruct { vfield1 = firstValue, vfield2 = firstValue * valueMult };
+            _ = bContext.Upsert(keyStruct, SpanByte.FromPinnedVariable(ref valueStruct));
+
+            // Force collisions to test having another key in the chain
+            comparer.forceCollisionHash = comparer.GetHashCode64(keyStruct);
+
+            // Flush to make the Read() go pending.
+            store.Log.FlushAndEvict(wait: true);
+
+            var (status, _ /*outputStruct*/) = bContext.Read(keyStruct);
+            ClassicAssert.IsTrue(status.IsPending, $"Expected status.IsPending: {status}");
+
+            // Insert next record with a different key and flush this too if requested.
+            var secondValue = firstValue + 1;
+            keyStruct = new() { kfield1 = secondValue, kfield2 = secondValue * valueMult };
+            valueStruct = new() { vfield1 = secondValue, vfield2 = secondValue * valueMult };
+            _ = bContext.Upsert(keyStruct, SpanByte.FromPinnedVariable(ref valueStruct));
+            if (secondRecordFlushMode == FlushMode.OnDisk)
+                store.Log.FlushAndEvict(wait: true);
+
+            (status, var outputStruct) = bContext.GetSinglePendingResult();
+            ClassicAssert.AreEqual(firstValue * valueMult, outputStruct.value.vfield2, "Should have returned first value");
+        }
+
+        [Test]
+        [Category("FasterKV")]
+        public void ReadPendingWithNoNewKey()
+        {
+            // Basic test of pending read
+            const int valueMult = 1000;
+
+            using var session = store.NewSession<KeyStruct, InputStruct, OutputStruct, Empty, PendingReadFunctions<ContextStruct>>(new PendingReadFunctions<ContextStruct>());
+            var bContext = session.BasicContext;
+
+            // Insert first record
+            var firstValue = 0; // same as key
+            var keyStruct = new KeyStruct { kfield1 = firstValue, kfield2 = firstValue * valueMult };
+            var valueStruct = new ValueStruct { vfield1 = firstValue, vfield2 = firstValue * valueMult };
+            _ = bContext.Upsert(keyStruct, SpanByte.FromPinnedVariable(ref valueStruct));
+
+            // Flush to make the Read() go pending.
+            store.Log.FlushAndEvict(wait: true);
+
+            var (status, _ /*outputStruct*/) = bContext.Read(keyStruct);
+            ClassicAssert.IsTrue(status.IsPending, $"Expected status.IsPending: {status}");
+
+            (status, var outputStruct) = bContext.GetSinglePendingResult();
+            ClassicAssert.IsTrue(status.Found, $"Expected status.Found: {status}");
+            ClassicAssert.AreEqual(firstValue * valueMult, outputStruct.value.vfield2, "Should have returned first value");
+        }
+
+        /// <summary>
+        /// Wraps a device to report it throttled for <see cref="throttledCallsRemaining"/> calls to <see cref="Throttle"/>,
+        /// recording how many of those calls came from a thread holding the store's epoch.
+        /// </summary>
+        sealed class ThrottlingDevice : StorageDeviceBase
+        {
+            readonly IDevice underlying;
+            internal int throttledCallsRemaining, throttledCalls, protectedThrottledCalls;
+
+            internal ThrottlingDevice(IDevice underlying) : base(underlying.FileName, underlying.SectorSize, underlying.Capacity)
+                => this.underlying = underlying;
+
+            public override void Initialize(long segmentSize, LightEpoch epoch = null, bool omitSegmentIdFromFilename = false)
+            {
+                base.Initialize(segmentSize, epoch, omitSegmentIdFromFilename);
+                underlying.Initialize(segmentSize, epoch, omitSegmentIdFromFilename);
+            }
+
+            public override bool Throttle()
+            {
+                if (throttledCallsRemaining == 0)
+                    return false;
+                throttledCallsRemaining--;
+                throttledCalls++;
+                if (epoch.ThisInstanceProtected())
+                    protectedThrottledCalls++;
+                return true;
+            }
+
+            public override void RemoveSegmentAsync(int segment, AsyncCallback callback, IAsyncResult result)
+                => underlying.RemoveSegmentAsync(segment, callback, result);
+            public override void WriteAsync(IntPtr sourceAddress, int segmentId, ulong destinationAddress, uint numBytesToWrite, DeviceIOCompletionCallback callback, object context)
+                => underlying.WriteAsync(sourceAddress, segmentId, destinationAddress, numBytesToWrite, callback, context);
+            public override void ReadAsync(int segmentId, ulong sourceAddress, IntPtr destinationAddress, uint readLength, DeviceIOCompletionCallback callback, object context)
+                => underlying.ReadAsync(segmentId, sourceAddress, destinationAddress, readLength, callback, context);
+            public override bool TryComplete() => underlying.TryComplete();
+            public override bool TryCompleteMine() => underlying.TryCompleteMine();
+            public override long GetFileSize(int segment) => underlying.GetFileSize(segment);
+            public override void Dispose() => underlying.Dispose();
+        }
+
+        [Test]
+        [Category("FasterKV")]
+        public void ThrottledPendingReadWaitsWithoutHoldingTheEpoch()
+        {
+            // The throttle wait must not hold an epoch entry: the epoch table is sized to the core count, so waiters
+            // would keep other threads out of the store.
+            const int ThrottledCalls = 3;
+
+            store.Dispose();
+            log.Dispose();
+            var device = new ThrottlingDevice(Devices.CreateLogDevice(Path.Join(MethodTestDir, "Throttled.log"), deleteOnClose: true));
+            log = device;
+            store = new(new()
+            {
+                IndexSize = 1L << 13,
+                LogDevice = device,
+                LogMemorySize = 1L << 29
+            }, StoreFunctions.Create(comparer, SpanByteRecordTriggers.Instance)
+                , (allocatorSettings, storeFunctions) => new(allocatorSettings, storeFunctions)
+                );
+
+            using var session = store.NewSession<KeyStruct, InputStruct, OutputStruct, Empty, PendingReadFunctions<ContextStruct>>(new PendingReadFunctions<ContextStruct>());
+            var bContext = session.BasicContext;
+
+            var keyStruct = new KeyStruct { kfield1 = 1, kfield2 = 2 };
+            var valueStruct = new ValueStruct { vfield1 = 1, vfield2 = 2 };
+            _ = bContext.Upsert(keyStruct, SpanByte.FromPinnedVariable(ref valueStruct));
+            store.Log.FlushAndEvict(wait: true);
+
+            device.throttledCallsRemaining = ThrottledCalls;
+            var (status, _) = bContext.Read(keyStruct);
+            ClassicAssert.IsTrue(status.IsPending, $"Expected status.IsPending: {status}");
+            ClassicAssert.AreEqual(ThrottledCalls, device.throttledCalls, "the read must wait out the throttle before it is issued");
+            ClassicAssert.AreEqual(1, device.protectedThrottledCalls, "only the check that enters the wait may hold the epoch");
+
+            (status, var outputStruct) = bContext.GetSinglePendingResult();
+            ClassicAssert.IsTrue(status.Found, $"Expected status.Found: {status}");
+            ClassicAssert.AreEqual(valueStruct.vfield2, outputStruct.value.vfield2);
+        }
+    }
+}

@@ -1,0 +1,424 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Runtime.InteropServices;
+using Garnet.common;
+using Tsavorite.core;
+
+namespace Garnet.server
+{
+    /// <summary>
+    /// Callback functions for main store
+    /// </summary>
+    public readonly unsafe partial struct MainSessionFunctions : ISessionFunctions<StringInput, StringOutput, long>
+    {
+        /// <summary>
+        /// Parse ASCII byte array into long and validate that only contains ASCII decimal characters
+        /// </summary>
+        /// <param name="source">Source string to evaluate</param>
+        /// <param name="val">Parsed long value</param>
+        /// <returns>True if input contained only ASCII decimal characters, otherwise false</returns>
+        static bool IsValidNumber(ReadOnlySpan<byte> source, out long val)
+        {
+            try
+            {
+                // Check for valid number
+                return NumUtils.TryReadInt64(source, out val);
+            }
+            catch
+            {
+                // Signal value is not a valid number
+                val = 0;
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Parse ASCII byte array into long and validate that only contains ASCII decimal characters
+        /// </summary>
+        /// <param name="source">Source string to evaluate</param>
+        /// <param name="val">Parsed long value</param>
+        /// <returns>True if input contained only ASCII decimal characters, otherwise false</returns>
+        static bool IsValidNumber(byte* source, int sourceLen, out long val)
+        {
+            try
+            {
+                // Check for valid number
+                return NumUtils.TryReadInt64(sourceLen, source, out val);
+            }
+            catch
+            {
+                // Signal value is not a valid number
+                val = 0;
+                return false;
+            }
+        }
+
+        /// <summary>
+        /// Parse ASCII byte array into a finite double, applying the same validation as the update itself
+        /// </summary>
+        /// <param name="source">Source string to evaluate</param>
+        /// <param name="val">Parsed double value</param>
+        /// <returns>True if input is a valid finite double, otherwise false</returns>
+        static bool IsValidDouble(ReadOnlySpan<byte> source, out double val)
+            => NumUtils.TryParseWithInfinity(source, out val) && double.IsFinite(val);
+
+        /// <summary>
+        /// Parse ASCII byte array into a finite double, applying the same validation as the update itself
+        /// </summary>
+        /// <param name="source">Source string to evaluate</param>
+        /// <param name="sourceLen">Length of source string</param>
+        /// <param name="val">Parsed double value</param>
+        /// <returns>True if input is a valid finite double, otherwise false</returns>
+        static bool IsValidDouble(byte* source, int sourceLen, out double val)
+            => IsValidDouble(new ReadOnlySpan<byte>(source, sourceLen), out val);
+
+        /// <inheritdoc/>
+        public RecordFieldInfo GetRMWInitialFieldInfo<TKey>(TKey key, ref StringInput input)
+            where TKey : IKey, allows ref struct
+        {
+            // We know namespaces aren't present in string functions, so don't populate
+            var cmd = input.header.cmd;
+            var fieldInfo = new RecordFieldInfo()
+            {
+                KeySize = key.KeyBytes.Length,
+                ValueSize = 0,
+                HasETag = false
+            };
+
+            switch (cmd)
+            {
+                case RespCommand.SETBIT:
+                    var bOffset = input.arg1;
+                    fieldInfo.ValueSize = BitmapManager.Length(bOffset);
+                    return fieldInfo;
+                case RespCommand.BITFIELD:
+                    var bitFieldArgs = GetBitFieldArguments(ref input);
+                    fieldInfo.ValueSize = BitmapManager.LengthFromType(bitFieldArgs);
+                    return fieldInfo;
+                case RespCommand.PFADD:
+                    fieldInfo.ValueSize = HyperLogLog.DefaultHLL.SparseInitialLength(ref input);
+                    return fieldInfo;
+                case RespCommand.PFMERGE:
+                    fieldInfo.ValueSize = input.parseState.GetArgSliceByRef(0).Length;
+                    return fieldInfo;
+
+                case RespCommand.SETIFGREATER:
+                case RespCommand.SETIFMATCH:
+                case RespCommand.SETWITHETAG:
+                    fieldInfo.ValueSize = input.parseState.GetArgSliceByRef(0).Length;
+                    fieldInfo.HasETag = true;
+                    fieldInfo.HasExpiration = input.arg1 != 0;
+                    return fieldInfo;
+
+                case RespCommand.SET:
+                case RespCommand.SETEXNX:
+                    fieldInfo.ValueSize = input.parseState.GetArgSliceByRef(0).Length;
+                    fieldInfo.HasExpiration = input.arg1 != 0;
+                    return fieldInfo;
+
+                case RespCommand.SETKEEPTTL:
+                    // Copy input to value; do not change expiration
+                    fieldInfo.ValueSize = input.parseState.GetArgSliceByRef(0).Length;
+                    return fieldInfo;
+                case RespCommand.SETRANGE:
+                    var offset = input.parseState.GetInt(0);
+                    var newValue = input.parseState.GetArgSliceByRef(1);
+                    fieldInfo.ValueSize = newValue.Length + offset;
+                    return fieldInfo;
+
+                case RespCommand.APPEND:
+                    var valueLength = input.parseState.GetArgSliceByRef(0).Length;
+                    fieldInfo.ValueSize = valueLength;
+                    return fieldInfo;
+
+                case RespCommand.INCR:
+                    fieldInfo.ValueSize = 1; // # of digits in "1"
+                    return fieldInfo;
+
+                case RespCommand.DECR:
+                    fieldInfo.ValueSize = 2; // # of digits in "-1"
+                    return fieldInfo;
+
+                case RespCommand.INCRBY:
+                    var ndigits = NumUtils.CountDigits(input.arg1, out var isNegative);
+
+                    fieldInfo.ValueSize = ndigits + (isNegative ? 1 : 0);
+                    return fieldInfo;
+
+                case RespCommand.DECRBY:
+                    ndigits = NumUtils.CountDigits(-input.arg1, out isNegative);
+
+                    fieldInfo.ValueSize = ndigits + (isNegative ? 1 : 0);
+                    return fieldInfo;
+
+                case RespCommand.INCRBYFLOAT:
+                    var incrByFloat = BitConverter.Int64BitsToDouble(input.arg1);
+                    fieldInfo.ValueSize = NumUtils.CountCharsInDouble(incrByFloat, out var _, out var _, out var _);
+                    return fieldInfo;
+
+                case RespCommand.RICREATE:
+                case RespCommand.RIPROMOTE:
+                case RespCommand.RIRESTORE:
+                    fieldInfo.ValueSize = RangeIndexManager.IndexSizeBytes;
+                    return fieldInfo;
+
+                case RespCommand.VADD:
+                    fieldInfo.ValueSize = VectorManager.IndexSizeBytes;
+                    fieldInfo.RecordType = VectorManager.RecordType;
+                    fieldInfo.HasExpiration = input.parseState.Count >= 13 && MemoryMarshal.Read<long>(input.parseState.GetArgSliceByRef(12).Span) != 0;
+                    return fieldInfo;
+
+                default:
+                    if (cmd > RespCommandExtensions.LastValidCommand)
+                    {
+                        var functions = functionsState.GetCustomCommandFunctions((ushort)cmd);
+                        fieldInfo.ValueSize = functions.GetInitialLength(ref input);
+
+                        // Only a positive expiration is set; -1 (remove) and 0 (keep) leave a new record without one
+                        fieldInfo.HasExpiration = input.arg1 > 0;
+                        return fieldInfo;
+                    }
+                    fieldInfo.ValueSize = input.parseState.GetArgSliceByRef(0).Length;
+                    fieldInfo.HasExpiration = input.arg1 != 0;
+                    return fieldInfo;
+            }
+        }
+
+        /// <inheritdoc/>
+        public RecordFieldInfo GetRMWModifiedFieldInfo<TSourceLogRecord>(in TSourceLogRecord srcLogRecord, ref StringInput input)
+            where TSourceLogRecord : ISourceLogRecord
+        {
+            var fieldInfo = new RecordFieldInfo()
+            {
+                KeySize = srcLogRecord.Key.Length,
+                ValueSize = 0,
+                HasETag = false,
+                HasExpiration = srcLogRecord.DataHeader.HasExpiration,
+                RecordType = srcLogRecord.RecordType,
+            };
+
+            if (input.header.cmd != RespCommand.NONE)
+            {
+                var cmd = input.header.cmd;
+
+                switch (cmd)
+                {
+                    case RespCommand.INCR:
+                    case RespCommand.INCRBY:
+                        var incrByValue = input.header.cmd == RespCommand.INCRBY ? input.arg1 : 1;
+
+                        var value = srcLogRecord.ValueSpan;
+
+                        // A value that is not a number is copied to the new record unchanged
+                        fieldInfo.ValueSize = value.Length;
+                        // TODO set error as in PrivateMethods.IsValidNumber and test in caller, to avoid the log record allocation. This would require 'output'
+                        if (srcLogRecord.IsPinnedValue ? IsValidNumber(srcLogRecord.PinnedValuePointer, value.Length, out var curr) : IsValidNumber(value, out curr))
+                        {
+                            // TODO Consider adding a way to cache curr/next for the IPU call
+                            var next = curr + incrByValue;
+                            fieldInfo.ValueSize = NumUtils.CountDigits(next, out var isNegative) + (isNegative ? 1 : 0);
+                        }
+                        return fieldInfo;
+
+                    case RespCommand.DECR:
+                    case RespCommand.DECRBY:
+                        var decrByValue = input.header.cmd == RespCommand.DECRBY ? input.arg1 : 1;
+
+                        value = srcLogRecord.ValueSpan;
+
+                        // A value that is not a number is copied to the new record unchanged
+                        fieldInfo.ValueSize = value.Length;
+                        if (srcLogRecord.IsPinnedValue ? IsValidNumber(srcLogRecord.PinnedValuePointer, value.Length, out curr) : IsValidNumber(value, out curr))
+                        {
+                            // TODO Consider adding a way to cache curr/next for the IPU call
+                            var next = curr - decrByValue;
+                            fieldInfo.ValueSize = NumUtils.CountDigits(next, out var isNegative) + (isNegative ? 1 : 0);
+                        }
+                        return fieldInfo;
+                    case RespCommand.INCRBYFLOAT:
+                        var incrByFloat = BitConverter.Int64BitsToDouble(input.arg1);
+
+                        value = srcLogRecord.ValueSpan;
+
+                        // A value that is not a number is copied to the new record unchanged
+                        fieldInfo.ValueSize = value.Length;
+                        if (srcLogRecord.IsPinnedValue ? IsValidDouble(srcLogRecord.PinnedValuePointer, value.Length, out var currVal) : IsValidDouble(value, out currVal))
+                        {
+                            // TODO Consider adding a way to cache currVal/nextVal for the IPU call
+                            var nextVal = currVal + incrByFloat;
+
+                            // A non-finite result is rejected by the update, which then writes nothing
+                            if (double.IsFinite(nextVal))
+                                fieldInfo.ValueSize = NumUtils.CountCharsInDouble(nextVal, out _, out _, out _);
+                        }
+                        return fieldInfo;
+
+                    case RespCommand.SETBIT:
+                        var bOffset = input.arg1;
+                        fieldInfo.ValueSize = BitmapManager.NewBlockAllocLength(srcLogRecord.ValueSpan.Length, bOffset);
+                        return fieldInfo;
+
+                    case RespCommand.BITFIELD:
+                        var bitFieldArgs = GetBitFieldArguments(ref input);
+                        fieldInfo.ValueSize = BitmapManager.NewBlockAllocLengthFromType(bitFieldArgs, srcLogRecord.ValueSpan.Length);
+                        return fieldInfo;
+
+                    case RespCommand.PFADD:
+                        // TODO: call HyperLogLog.DefaultHLL.IsValidHYLL and check error return per RMWMethods. This would require 'output'. Also carry this result through to RMWMethods.
+                        if (srcLogRecord.IsPinnedValue)
+                            fieldInfo.ValueSize = HyperLogLog.DefaultHLL.UpdateGrow(ref input, srcLogRecord.PinnedValuePointer);
+                        else
+                            fixed (byte* valuePtr = srcLogRecord.ValueSpan)
+                                fieldInfo.ValueSize = HyperLogLog.DefaultHLL.UpdateGrow(ref input, valuePtr);
+                        return fieldInfo;
+
+                    case RespCommand.PFMERGE:
+                        // TODO: call HyperLogLog.DefaultHLL.IsValidHYLL and check error return per RMWMethods. This would require 'output'. Also carry this result through to RMWMethods.
+                        var srcHLL = input.parseState.GetArgSliceByRef(0).ToPointer();
+                        if (srcLogRecord.IsPinnedValue)
+                            fieldInfo.ValueSize = HyperLogLog.DefaultHLL.MergeGrow(srcHLL, srcLogRecord.PinnedValuePointer);
+                        else
+                            fixed (byte* dstHLL = srcLogRecord.ValueSpan)
+                                fieldInfo.ValueSize = HyperLogLog.DefaultHLL.MergeGrow(srcHLL, dstHLL);
+                        return fieldInfo;
+
+                    case RespCommand.SETKEEPTTLXX:
+                    case RespCommand.SETKEEPTTL:
+                        fieldInfo.ValueSize = input.parseState.GetArgSliceByRef(0).Length;
+                        fieldInfo.HasExpiration = srcLogRecord.DataHeader.HasExpiration;
+                        return fieldInfo;
+
+                    case RespCommand.SET:
+                    case RespCommand.SETEXXX:
+                    case RespCommand.SETEXNX:
+                        fieldInfo.ValueSize = input.parseState.GetArgSliceByRef(0).Length;
+                        fieldInfo.HasExpiration = input.arg1 != 0;
+                        return fieldInfo;
+
+                    case RespCommand.SETIFGREATER:
+                    case RespCommand.SETIFMATCH:
+                        fieldInfo.ValueSize = input.parseState.GetArgSliceByRef(0).Length;
+                        fieldInfo.HasETag = true;
+                        fieldInfo.HasExpiration = input.arg1 != 0 || srcLogRecord.DataHeader.HasExpiration;
+                        return fieldInfo;
+
+                    case RespCommand.SETWITHETAG:
+                        fieldInfo.ValueSize = input.parseState.GetArgSliceByRef(0).Length;
+                        fieldInfo.HasETag = true;
+                        fieldInfo.HasExpiration = input.arg1 != 0;
+                        return fieldInfo;
+
+                    case RespCommand.SETRANGE:
+                        var offset = input.parseState.GetInt(0);
+                        var newValue = input.parseState.GetArgSliceByRef(1);
+
+                        fieldInfo.ValueSize = newValue.Length + offset;
+                        if (fieldInfo.ValueSize < srcLogRecord.ValueSpan.Length)
+                            fieldInfo.ValueSize = srcLogRecord.ValueSpan.Length;
+                        return fieldInfo;
+
+                    case RespCommand.GETEX:
+                        fieldInfo.ValueSize = srcLogRecord.ValueSpan.Length;
+
+                        // If both EX and PERSIST were specified, EX wins
+                        if (input.arg1 > 0)
+                            fieldInfo.HasExpiration = true;
+                        else if (input.parseState.Count > 0)
+                        {
+                            if (input.parseState.GetArgSliceByRef(0).ReadOnlySpan.EqualsUpperCaseSpanIgnoringCase(CmdStrings.PERSIST))
+                                fieldInfo.HasExpiration = false;
+                        }
+
+                        return fieldInfo;
+
+                    case RespCommand.APPEND:
+                        fieldInfo.ValueSize = srcLogRecord.ValueSpan.Length + input.parseState.GetArgSliceByRef(0).Length;
+                        return fieldInfo;
+
+                    case RespCommand.GETDEL:
+                    case RespCommand.DELIFGREATER:
+                        // Min allocation (only metadata) needed since this is going to be used for tombstoning anyway.
+                        return fieldInfo;
+
+                    case RespCommand.RICREATE:
+                    case RespCommand.RIPROMOTE:
+                    case RespCommand.RIRESTORE:
+                        fieldInfo.ValueSize = RangeIndexManager.IndexSizeBytes;
+                        return fieldInfo;
+
+                    case RespCommand.XVCREATE:
+                    case RespCommand.XVIMPORT:
+                        fieldInfo.ValueSize = VectorManager.IndexSize;
+                        return fieldInfo;
+
+                    case RespCommand.VADD:
+                    case RespCommand.VREM:
+                    case RespCommand.VSETATTR:
+                        if (input.arg1 is VectorManager.VADDAppendLogArg or VectorManager.VREMAppendLogArg or VectorManager.RecreateIndexArg or VectorManager.VADDSetFlagsArg or VectorManager.VSETATTRAppendLogArg or VectorManager.SetImportStateArg)
+                        {
+                            // A copy-update of the index key copies the whole index value to the new record: this is
+                            // triggered when a CU is forced on the index record - during replication (VADD/VREM append
+                            // log args) or when the index record is read back from disk and the native index must be
+                            // recreated (RecreateIndexArg, e.g. after eviction or recovery). Size the destination for it.
+                            fieldInfo.ValueSize = VectorManager.IndexSize;
+                        }
+
+                        return fieldInfo;
+
+                    default:
+                        if (cmd > RespCommandExtensions.LastValidCommand)
+                        {
+                            var functions = functionsState.GetCustomCommandFunctions((ushort)cmd);
+                            fieldInfo.ValueSize = functions.GetLength(srcLogRecord.ValueSpan, ref input);
+
+                            // A positive expiration sets it, 0 keeps the existing one, and -1 removes it
+                            fieldInfo.HasExpiration = input.arg1 > 0 || (input.arg1 == 0 && srcLogRecord.DataHeader.HasExpiration);
+                            return fieldInfo;
+                        }
+                        throw new GarnetException("Unsupported operation on input");
+                }
+            }
+
+            fieldInfo.ValueSize = input.parseState.GetArgSliceByRef(0).Length;
+            fieldInfo.HasExpiration = input.arg1 != 0;
+            return fieldInfo;
+        }
+
+        public RecordFieldInfo GetUpsertFieldInfo<TKey>(TKey key, ReadOnlySpan<byte> value, ref StringInput input)
+            where TKey : IKey, allows ref struct
+        {
+            // We know namespaces aren't present in string functions, so don't populate
+            var fieldInfo = new RecordFieldInfo()
+            {
+                KeySize = key.KeyBytes.Length,
+                ValueSize = value.Length,
+                HasETag = input.HasEtag && input.arg2 != LogRecord.NoETag
+            };
+
+            switch (input.header.cmd)
+            {
+                case RespCommand.SET:
+                case RespCommand.SETEX:
+                case RespCommand.APPEND:
+                    fieldInfo.HasExpiration = input.arg1 != 0;
+                    break;
+            }
+            return fieldInfo;
+        }
+
+        public RecordFieldInfo GetUpsertFieldInfo<TKey>(TKey key, IHeapObject value, ref StringInput input)
+            where TKey : IKey, allows ref struct
+            => throw new GarnetException("String store should not be called with IHeapObject");
+
+        public RecordFieldInfo GetUpsertFieldInfo<TKey, TSourceLogRecord>(TKey key, in TSourceLogRecord inputLogRecord, ref StringInput input)
+            where TKey : IKey, allows ref struct
+            where TSourceLogRecord : ISourceLogRecord
+        {
+            if (inputLogRecord.DataHeader.ValueIsObject)
+                throw new GarnetException("String store should not be called with IHeapObject");
+            return inputLogRecord.GetRecordFieldInfo();
+        }
+    }
+}

@@ -1,0 +1,27 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <None Include="..\..\test\testcerts\testcert.pfx" />
+  </ItemGroup>
+
+  <ItemGroup>
+  </ItemGroup>
+
+  <ItemGroup>
+    <None Update="..\..\test\testcerts\testcert.pfx" Link="testcert.pfx">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </None>
+  </ItemGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\..\test\cluster\Garnet.test.cluster\Garnet.test.cluster.csproj" />
+    <ProjectReference Include="..\..\test\cluster\Garnet.test.cluster.migrate\Garnet.test.cluster.migrate.csproj" />
+    <ProjectReference Include="..\..\test\cluster\Garnet.test.cluster.replication\Garnet.test.cluster.replication.csproj" />
+    <ProjectReference Include="..\..\test\standalone\Garnet.test\Garnet.test.csproj" />
+  </ItemGroup>
+
+</Project>

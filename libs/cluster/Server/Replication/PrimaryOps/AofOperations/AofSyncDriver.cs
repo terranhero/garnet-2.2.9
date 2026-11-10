@@ -1,0 +1,221 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Linq;
+using System.Net;
+using System.Threading;
+using System.Threading.Tasks;
+using Garnet.client;
+using Garnet.common;
+using Garnet.server;
+using Microsoft.Extensions.Logging;
+
+namespace Garnet.cluster
+{
+    internal sealed partial class AofSyncDriver : IDisposable
+    {
+        readonly ClusterProvider clusterProvider;
+        readonly AofSyncDriverStore aofSyncDriverStore;
+        readonly string localNodeId;
+        readonly string remoteNodeId;
+        readonly ILogger logger;
+        readonly CancellationTokenSource cts;
+
+        readonly AofSyncTask[] aofSyncTasks;
+
+        /// <summary>
+        /// Check if client connection is healthy
+        /// </summary>
+        public bool IsConnected
+            => aofSyncTasks.Select(x => x.IsConnected ? 1 : 0).Sum() == aofSyncTasks.Length;
+
+        /// <summary>
+        /// Node-id associated with this AofSyncTask
+        /// </summary>
+        public string RemoteNodeId => remoteNodeId;
+
+        /// <summary>
+        /// Active worker monitor for AofSyncDriver tasks
+        /// </summary>
+        readonly ActiveWorkerMonitor activeWorkerMonitor = new();
+
+        /// <summary>
+        /// Return start address for underlying AofSyncTask
+        /// </summary>
+        public AofAddress StartAddress
+        {
+            get
+            {
+                var startAddress = AofAddress.Create(aofSyncTasks.Length, 0);
+                for (var i = 0; i < aofSyncTasks.Length; i++)
+                    startAddress[i] = aofSyncTasks[i].StartAddress;
+                return startAddress;
+            }
+        }
+
+        /// <summary>
+        /// Return previous address for underlying AofSyncTask
+        /// </summary>
+        public AofAddress PreviousAddress
+        {
+            get
+            {
+                var previousAddress = AofAddress.Create(aofSyncTasks.Length, 0);
+                for (var i = 0; i < aofSyncTasks.Length; i++)
+                    previousAddress[i] = aofSyncTasks[i].PreviousAddress;
+                return previousAddress;
+            }
+        }
+
+        /// <summary>
+        /// Return previous address for a specific sublog without copying the full AofAddress struct.
+        /// This is the address actually shipped (Consume'd) to the replica, used to bound AOF
+        /// truncation conservatively.
+        /// </summary>
+        /// <param name="physicalSublogIdx">Index of the physical sublog.</param>
+        /// <returns>The previous address of the specified sublog's sync task.</returns>
+        public long GetPreviousAddress(int physicalSublogIdx) => aofSyncTasks[physicalSublogIdx].PreviousAddress;
+
+        /// <summary>
+        /// Return the shipped watermark address for a specific sublog (the monotonic high-water this
+        /// replica's sync task has shipped/scanned past), used to drive the backpressure gate.
+        /// </summary>
+        /// <param name="physicalSublogIdx">Index of the physical sublog.</param>
+        /// <returns>The shipped watermark address of the specified sublog's sync task.</returns>
+        public long GetShippedWatermarkAddress(int physicalSublogIdx) => aofSyncTasks[physicalSublogIdx].ShippedWatermarkAddress;
+
+        /// <summary>
+        /// Return start address for a specific sublog without copying the full AofAddress struct
+        /// </summary>
+        /// <param name="physicalSublogIdx">Index of the physical sublog.</param>
+        /// <returns>The start address of the specified sublog's sync task.</returns>
+        public long GetStartAddress(int physicalSublogIdx) => aofSyncTasks[physicalSublogIdx].StartAddress;
+
+        public AofSyncDriver(
+            ClusterProvider clusterProvider,
+            AofSyncDriverStore aofSyncDriverStore,
+            string localNodeId,
+            string remoteNodeId,
+            IPEndPoint endPoint,
+            ref AofAddress startAddress,
+            ILogger logger)
+        {
+            this.clusterProvider = clusterProvider;
+            this.aofSyncDriverStore = aofSyncDriverStore;
+            this.localNodeId = localNodeId;
+            this.remoteNodeId = remoteNodeId;
+            cts = new();
+            this.logger = logger;
+
+            aofSyncTasks = new AofSyncTask[clusterProvider.serverOptions.AofPhysicalSublogCount];
+            for (var physicalSublogIdx = 0; physicalSublogIdx < aofSyncTasks.Length; physicalSublogIdx++)
+                aofSyncTasks[physicalSublogIdx] = new AofSyncTask(clusterProvider, aofSyncDriverStore, physicalSublogIdx, endPoint, startAddress[physicalSublogIdx], localNodeId, remoteNodeId, cts, logger);
+        }
+
+        /// <summary>
+        /// Dispose AofSyncDriver
+        /// </summary>
+        public void Dispose()
+        {
+            // Cancel cts
+            cts?.Cancel();
+
+            // Break the connections so a task blocked on a send fails fast. The client sessions are
+            // deliberately not disposed here: they expect mono-threaded access, and a task may still
+            // be writing through one. Disposing it from this thread races that write and can strand
+            // the send buffer the task rented, which leaves the replication buffer pool's dispose
+            // spinning forever and the whole server stuck in shutdown holding its port.
+            foreach (var aofSyncTask in aofSyncTasks)
+                aofSyncTask?.CloseConnection();
+
+            // Wait for tasks to exit; each disposes its own client before leaving the monitor
+            activeWorkerMonitor.Dispose();
+
+            // Dispose sync tasks, now that no task is running
+            foreach (var aofSyncTask in aofSyncTasks)
+                aofSyncTask?.Dispose();
+
+            // Finally, dispose the cts
+            cts?.Dispose();
+        }
+
+        /// <summary>
+        /// Dispose alls clients associated with this aof sync driver
+        /// </summary>
+        public void DisposeClient()
+        {
+            foreach (var aofSyncTask in aofSyncTasks)
+                aofSyncTask.garnetClient?.Dispose();
+        }
+
+        /// <summary>
+        /// Main replica aof sync task.
+        /// </summary>
+        public async Task RunAsync()
+        {
+            logger?.LogInformation("Starting ReplicationManager.ReplicaSyncTask for remote node {remoteNodeId} starting from address {address}", remoteNodeId, StartAddress);
+
+            try
+            {
+                if (clusterProvider.serverOptions.AofPhysicalSublogCount == 1)
+                {
+                    await aofSyncTasks[0].RunAofSyncTaskAsync(this).ConfigureAwait(false);
+                }
+                else
+                {
+                    var tasks = new Task[aofSyncTasks.Length];
+                    for (var i = 0; i < aofSyncTasks.Length; i++)
+                        tasks[i] = aofSyncTasks[i].RunAofSyncTaskAsync(this);
+
+                    _ = await Task.WhenAny(tasks).ConfigureAwait(false);
+                }
+            }
+            catch (Exception ex)
+            {
+                logger?.LogWarning(ex, "An exception occurred at ReplicationManager.ReplicaSyncTask - terminating");
+            }
+            finally
+            {
+                var (address, port) = clusterProvider.clusterManager.CurrentConfig.GetWorkerAddressFromNodeId(remoteNodeId);
+                logger?.LogWarning("AofSyncDriver terminated for remote node replicaId:{remoteNodeId} [{address}:{port}] startAddress: {startAddress}, previousAddress:{previousAddress}", remoteNodeId, address, port, StartAddress, PreviousAddress);
+
+                if (!aofSyncDriverStore.TryRemove(this))
+                    logger?.LogError("Unable to remove {remoteNodeId} from aofTaskStore at end of ReplicaSyncTask", remoteNodeId);
+            }
+        }
+
+        #region DisklesSyncInterface
+        public async Task ConnectClientsAsync()
+        {
+            if (!IsConnected)
+                foreach (var aofSyncTask in aofSyncTasks)
+                    await aofSyncTask.garnetClient.ConnectAsync((int)clusterProvider.serverOptions.ReplicaSyncTimeout.TotalMilliseconds, cts.Token).ConfigureAwait(false);
+        }
+
+        public Task<string> IssuesFlushAllAsync()
+            => aofSyncTasks[0].garnetClient.ExecuteAsync(["CLUSTER", "FLUSHALL"]);
+
+        public void InitializeIterationBuffer()
+            => aofSyncTasks[0].garnetClient.InitializeIterationBuffer(clusterProvider.storeWrapper.loggingFrequency);
+
+        public void InitializeIfNeeded()
+        {
+            if (aofSyncTasks[0].garnetClient.NeedsInitialization)
+                aofSyncTasks[0].garnetClient.SetClusterSyncHeader(clusterProvider.clusterManager.CurrentConfig.LocalNodeId);
+        }
+
+        public Task<string> ExecuteAttachSyncAsync(SyncMetadata syncMetadata)
+            => aofSyncTasks[0].garnetClient.ExecuteClusterAttachSync(syncMetadata.ToByteArray());
+
+        public bool TryWriteRecordSpan(ReadOnlySpan<byte> recordSpan, MigrationRecordSpanType type, out Task<string> task)
+            => aofSyncTasks[0].garnetClient.TryWriteRecordSpan(recordSpan, type, out task);
+
+        public bool TryWriteChunkedRecordSpan(ReadOnlySpan<byte> chunk, bool moreChunksFollow, out Task<string> task)
+            => aofSyncTasks[0].garnetClient.TryWriteChunkedRecordSpan(chunk, moreChunksFollow, out task);
+
+        public Task<string> SendAndResetIterationBufferAsync()
+            => aofSyncTasks[0].garnetClient.SendAndResetIterationBuffer();
+        #endregion
+    }
+}

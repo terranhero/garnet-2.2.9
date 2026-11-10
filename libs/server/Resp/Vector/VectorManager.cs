@@ -1,0 +1,1917 @@
+﻿// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Buffers;
+using System.Buffers.Binary;
+using System.Collections.Concurrent;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Numerics;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading.Channels;
+using System.Threading.Tasks;
+using Garnet.common;
+using Garnet.networking;
+using Microsoft.Extensions.Logging;
+using Tsavorite.core;
+
+namespace Garnet.server
+{
+    public enum VectorManagerResult
+    {
+        Invalid = 0,
+
+        OK,
+        BadParams,
+        Duplicate,
+        MissingElement,
+
+        ImportingPending,
+    }
+
+    /// <summary>
+    /// Methods for managing an implementation of various vector operations.
+    /// </summary>
+    public sealed partial class VectorManager : IDisposable
+    {
+        // MUST BE A POWER OF 2
+        public const ulong ContextStep = 8;
+
+        // We reserve the first 7 namespaces (we can't use 0, so it's off limits) for store-wide metadata about Vector Sets
+        internal const byte MetadataNamespace = 1;
+
+        internal const int IndexSizeBytes = Index.Size;
+
+        // VADD/VREM overload StringInput.arg1 with a sentinel identifying special RMW operations.
+        //   - AOF: YES (replicated/recoverable) / NO (never logged).
+        //   - InitialUpdater: YES/NO. whether this arg can create a new record in Tsavorite if one doesn't exist at the moment (NeedInitialUpdate).
+        //     this must be thought through when creating new args to ensure a stub doesn't gets ressurected in case of concurrent DEL.
+        internal const long VADDAppendLogArg = long.MinValue; // User VADD element insert, replayed on replicas. AOF: YES. InitialUpdater: NO.
+        // DeleteAfterDropArg used to be here
+        internal const long RecreateIndexArg = VADDAppendLogArg + 2; // Native index rebuild for a local stub. AOF: NO. InitialUpdater: NO.
+        internal const long VREMAppendLogArg = RecreateIndexArg + 1; // User VREM element removal, replayed on replicas. AOF: YES. InitialUpdater: NO.
+        internal const long MigrateElementKeyLogArg = VREMAppendLogArg + 1; // AOF: YES. InitialUpdater: YES (empty dummy key).
+        internal const long MigrateIndexKeyLogArg = MigrateElementKeyLogArg + 1; // AOF: YES. InitialUpdater: YES (empty dummy key).
+        internal const long VADDSetFlagsArg = MigrateIndexKeyLogArg + 1; // AOF: YES. InitialUpdater: NO (record must exist).
+        internal const long CreateIndexArg = VADDSetFlagsArg + 1; // New stub record creation. AOF: NO. InitialUpdater: YES.
+        internal const long VSETATTRAppendLogArg = CreateIndexArg + 1; // User VSETATTR update, replayed on replicas. AOF: Yes. InitialUpdater: NO.
+        internal const long SetImportStateArg = VSETATTRAppendLogArg + 1; // Import lifecycle flags. AOF: NO. InitialUpdater: NO (record must exist).
+        internal const long XVImportFailedArg = SetImportStateArg + 1; // Replication / replay for failed imports.  AOF: Yes.  InitialUpdater: No.
+
+        /// <summary>
+        /// Byte stored on log records to distinguish the INDEX key as a Vector Set
+        /// Element keys are tracked in separate namespaces and are not marked with a special RecordType
+        /// </summary>
+        public const byte RecordType = 1;
+
+        /// <summary>
+        /// Minimum size of an id is assumed to be at least 8 bytes + a length prefix.
+        /// </summary>
+        private const int MinimumSpacePerId = sizeof(int) + 8;
+
+        /// <summary>
+        /// Maximum number of dimensions a vector can have.
+        /// Matches Redis's VSET_MAX_VECTOR_DIM (65,536).
+        /// </summary>
+        internal const int MaxVectorDimensions = 1 << 16;
+
+        /// <summary>
+        /// Maximum number of results that can be requested in a single VSIM query.
+        /// Practical limit to prevent integer overflow when computing buffer sizes
+        /// (e.g. retrieveCount * MinimumSpacePerId) and to avoid excessive allocations
+        /// from a single command (at 100M: ~400 MB for distances + ~1.2 GB for ids).
+        /// </summary>
+        internal const int MaxRetrieveCount = 100_000_000;
+
+        /// <summary>
+        /// Maximum scale factor for adaptive-L inline filtering.
+        /// </summary>
+        internal const int MaxFilteringScaleFactor = 256;
+
+        /// <summary>
+        /// Maximum exploration factor (EF) for build and search operations.
+        /// Matches Redis's hardcoded limit of 1,000,000.
+        /// </summary>
+        internal const int MaxExplorationFactor = 1_000_000;
+
+        /// <summary>
+        /// Beam width default for SearchXXX methods.
+        /// </summary>
+        internal const int DefaultBeamWidth = 4;
+
+        /// <summary>
+        /// Minimum (inclusive) value for M in VADD (or similar).
+        /// </summary>
+        internal const int MinNumLinks = 4;
+
+        /// <summary>
+        /// Maximum (inclusive) value for M in VADD (or similar).
+        /// </summary>
+        internal const int MaxNumLinks = 4096;
+
+        /// <summary>
+        /// Ensures the VSIM distance output buffer has at least <paramref name="retrieveCount"/> * sizeof(float) bytes.
+        /// Rents from <see cref="MemoryPool{T}"/> if the current buffer is too small.
+        /// </summary>
+        private static void EnsureDistanceBufferSize(ref SpanByteAndMemory buffer, int retrieveCount)
+        {
+            // Verify no overflow: checked() ensures MaxRetrieveCount * sizeof(float) fits in int32
+            Debug.Assert(retrieveCount <= MaxRetrieveCount && checked(MaxRetrieveCount * sizeof(float)) > 0);
+            var sizeBytes = retrieveCount * sizeof(float);
+            if (sizeBytes > buffer.Length)
+            {
+                if (!buffer.IsSpanByte)
+                {
+                    buffer.Memory.Dispose();
+                }
+
+                buffer = new SpanByteAndMemory(MemoryPool<byte>.Shared.Rent(sizeBytes), sizeBytes);
+            }
+
+            buffer.Length = sizeBytes;
+        }
+
+        /// <summary>
+        /// Ensures the VSIM id output buffer has at least <paramref name="retrieveCount"/> * <see cref="MinimumSpacePerId"/> bytes.
+        /// Rents from <see cref="MemoryPool{T}"/> if the current buffer is too small.
+        /// If we're still wrong, we'll end up using continuation callbacks which have more overhead.
+        /// </summary>
+        private static void EnsureIdBufferSize(ref SpanByteAndMemory buffer, int retrieveCount)
+        {
+            // Verify no overflow: checked() ensures MaxRetrieveCount * MinimumSpacePerId fits in int32
+            Debug.Assert(retrieveCount <= MaxRetrieveCount && checked(MaxRetrieveCount * MinimumSpacePerId) > 0);
+            var sizeBytes = retrieveCount * MinimumSpacePerId;
+            if (sizeBytes > buffer.Length)
+            {
+                if (!buffer.IsSpanByte)
+                {
+                    buffer.Memory.Dispose();
+                }
+
+                buffer = new SpanByteAndMemory(MemoryPool<byte>.Shared.Rent(sizeBytes), sizeBytes);
+            }
+        }
+
+        /// <summary>
+        /// Ensures the VSIM filter bitmap buffer has at least one bit per result
+        /// (<paramref name="resultCount"/> bits, rounded up to whole bytes).
+        /// Rents from <see cref="MemoryPool{T}"/> if the current buffer is too small.
+        /// </summary>
+        private static void EnsureFilterBitmapSize(ref SpanByteAndMemory buffer, int resultCount)
+        {
+            var sizeBytes = (resultCount + 7) >> 3;
+            if (sizeBytes > buffer.Length)
+            {
+                buffer.Memory?.Dispose();
+
+                buffer = new SpanByteAndMemory(MemoryPool<byte>.Shared.Rent(sizeBytes), sizeBytes);
+            }
+
+            buffer.Length = sizeBytes;
+        }
+
+        /// <summary>
+        /// This managers instance of <see cref="DiskANNService"/>.
+        /// 
+        /// We could probably share these, but its not a big loss to scope to the <see cref="VectorManager"/> instance.
+        /// </summary>
+        internal DiskANNService Service { get; } = new DiskANNService();
+
+        /// <summary>
+        /// Whether or not Vector Set preview is enabled.
+        /// 
+        /// TODO: This goes away once we're stable.
+        /// </summary>
+        public bool IsEnabled { get; }
+
+        private bool initialized;
+
+        private readonly ILogger logger;
+
+        private readonly int dbId;
+
+        /// <summary>
+        /// Context of each Vector Set index record found during recovery, mapped to the hash slot of the key
+        /// that owns it. <see cref="ReconcileRecoveredState"/> restores the reservation for each of these
+        /// contexts, and needs the hash slot recorded here because the record itself is not retained.
+        /// </summary>
+        private ConcurrentDictionary<ulong, ushort> recoveredIndexes;
+
+        /// <summary>
+        /// Newest context metadata recovered for each index into <c>contextMetadatas</c>. A snapshot holds
+        /// every version of a record written in the range it covers, so the same index is presented more than
+        /// once; entries are kept by <c>ContextMetadata.Version</c> and trimmed by
+        /// <see cref="ReconcileRecoveredState"/>.
+        /// </summary>
+        private ConcurrentDictionary<int, ContextMetadata> recoveredMetadata;
+
+        public VectorManager(int dbId, GarnetServerOptions serverOptions, Func<IMessageConsumer> getTempSession, ILoggerFactory loggerFactory)
+        {
+            this.dbId = dbId;
+
+            IsEnabled = serverOptions.EnableVectorSetPreview;
+
+            // Destination for copying the small graph "stub" records back into memory on disk read (see
+            // VectorReadBatch.ReadCopyOptions): the read cache when it is enabled (keeps the writable main log
+            // clean), otherwise the main-log tail (still memory-resident, but occupies writable log space).
+            stubReadCopyTo = serverOptions.EnableReadCache ? ReadCopyTo.ReadCache : ReadCopyTo.MainLog;
+
+            // Include DB and id so we correlate to what's actually stored in the log
+            logger = loggerFactory?.CreateLogger($"{nameof(VectorManager)}:{dbId}");
+
+            replicationBlockEvent = CountingEventSlim.Create();
+
+            if (serverOptions.VectorSetReplayTaskCount < 0 || serverOptions.VectorSetReplayTaskCount > Environment.ProcessorCount)
+                throw new GarnetException($"VectorSetReplayTaskCount should be in range [0,{Environment.ProcessorCount}]!");
+            var vectorSetReplayCount = serverOptions.VectorSetReplayTaskCount == 0 ? Environment.ProcessorCount : serverOptions.VectorSetReplayTaskCount;
+
+            replicationReplayChannels = new Channel<VectorSetReplicationState>[vectorSetReplayCount];
+            replicationReplayTasks = new Task[vectorSetReplayCount];
+
+            for (var i = 0; i < replicationReplayTasks.Length; i++)
+            {
+                replicationReplayTasks[i] = Task.CompletedTask;
+
+                // NOTE: for multi-log we need to disable single writer since multiple AOF replay tasks may append to this common channel.
+                replicationReplayChannels[i] = Channel.CreateUnbounded<VectorSetReplicationState>(new() { SingleWriter = !serverOptions.MultiLogEnabled, SingleReader = false, AllowSynchronousContinuations = false });
+            }
+
+            vectorSetLocks = new(vectorSetReplayCount);
+
+            this.getTempSession = getTempSession;
+            cleanupTaskChannel = VectorSetCleanupWorkChannel<object>.CreateSingleReaderMultiWriter();
+            requestCleanupTaskChannel = VectorSetCleanupWorkChannel<ulong>.CreateSingleReaderMultiWriter();
+            requestDropTaskChannel = VectorSetCleanupWorkChannel<object>.CreateSingleReaderMultiWriter();
+
+            cleanupTask = RunCleanupTaskAsync();
+            requestCleanupTask = RunRequestCleanupTaskAsync();
+            requestDropTask = RunRequestDropTaskAsync();
+
+            requestedDrops = new();
+
+            potentiallyDeleted = [];
+
+            recoveredIndexes = new();
+            recoveredMetadata = new();
+
+            quantizationChannel = VectorSetCleanupWorkChannel<QuantizationState>.CreateMultiReaderMultiWriter();
+
+            if (serverOptions.VectorSetQuantizationTaskCount < 0 || serverOptions.VectorSetQuantizationTaskCount > Environment.ProcessorCount)
+                throw new GarnetException($"VectorSetQuantizationTaskCount should be in range [0,{Environment.ProcessorCount}]!");
+            quantizationTaskCount = serverOptions.VectorSetQuantizationTaskCount == 0 ? Environment.ProcessorCount : serverOptions.VectorSetQuantizationTaskCount;
+            quantizationTasks = new Task[quantizationTaskCount];
+
+            // So Dispose's Task.WhenAll is safe even if StartQuantizationTasks never ran.
+            Array.Fill(quantizationTasks, Task.CompletedTask);
+
+            // Exclusive locks for potential updates to Vector Set data
+            var unroundedElementSetSize = Math.Min(Environment.ProcessorCount, 192) * 2; // 192 cores is a reasonable maximum number of cores to expect - so impose as an upper bound for now
+            unroundedElementSetSize *= unroundedElementSetSize;
+            unroundedElementSetSize *= 2;
+            vectorSetElementSelectMask = (int)BitOperations.RoundUpToPowerOf2((uint)unroundedElementSetSize) - 1;
+            if (vectorSetElementSelectMask < 0)
+            {
+                logger?.LogWarning("Vector Set element lock set size overflowed due to high CPU count: {processorCount}", Environment.ProcessorCount);
+
+                // Large power-of-two < Array.MaxLength, then -1
+                vectorSetElementSelectMask = 0x4000_0000 - 1;
+            }
+
+            vectorSetElementUpdateLocks = new int[vectorSetElementSelectMask + 1];
+
+            logger?.LogInformation("Created VectorManager");
+        }
+
+        /// <summary>
+        /// Load state necessary for VectorManager from main store.
+        /// </summary>
+        public void Initialize()
+        {
+            if (!IsEnabled || initialized) return;
+
+            initialized = true;
+
+            // Come up empty, with one ContextMetadata
+            lock (this)
+            {
+                contextMetadatas = new ContextMetadata[1];
+                dirtyContextMetadatas = [];
+            }
+
+            // Spin up quantization and import handling tasks
+            StartQuantizationTasks();
+        }
+
+        /// <summary>
+        /// Apply the bookkeeping accumulated during recovery.
+        /// </summary>
+        /// <param name="requireNoReservedContexts">
+        /// When true, throw instead of rebuilding if any context is currently reserved. The rebuild
+        /// reassigns <c>contextMetadatas</c> from the recovered records, so a context still reserved
+        /// at that point is forgotten without being marked for cleanup, leaking its records and index.
+        /// </param>
+        public void ReconcileRecoveredState(bool requireNoReservedContexts = false)
+        {
+            if (!IsEnabled) return;
+
+            // TODO: this doesn't work with non-RESP impls... which maybe we don't care about?
+            using var session = (RespServerSession)getTempSession();
+            if (session.activeDbId != dbId && !session.TrySwitchActiveDatabaseSession(dbId))
+            {
+                throw new GarnetException($"Could not switch VectorManager resume session to {dbId}, initialization failed");
+            }
+
+            ref var ctx = ref session.storageSession.vectorBasicContext;
+
+            // recoveredIndexes only holds the index records the store reported while ingesting a checkpoint
+            // snapshot, which covers a single range of the log - anything already flushed to the main log
+            // before the checkpoint is recovered without being reported. Liveness below is decided by
+            // absence, so completing the set from the recovered store is what keeps a live Vector Set from
+            // being mistaken for an abandoned context and having its element records deleted.
+            RecoveredIndexScanFunctions indexScan = new(this);
+            _ = session.storageSession.stringBasicContext.Session.IterateLookupSnapshot(ref indexScan);
+
+            var needsUpdated = false;
+
+            lock (this)
+            {
+                if (requireNoReservedContexts)
+                {
+                    for (var i = 0; i < contextMetadatas.Length; i++)
+                    {
+                        if (!contextMetadatas[i].IsEmpty)
+                        {
+                            logger?.LogCritical("Vector Set context reservation was not empty at index {index} when rebuilding after a full store replacement; expected the preceding flush to have cleared it", i);
+                            throw new GarnetException($"Vector Set context reservation was not empty at index {i} when rebuilding after a full store replacement");
+                        }
+                    }
+                }
+
+                // Any ContextMetadatas we found need to be restored
+                //
+                // The array must also span every recovered index, because the reservation for a context is
+                // restored below through contextMetadatas[contextIndex] - the metadata record holding that
+                // context can be missing when the index record is not.
+                var maxIndex = -1;
+                foreach (var (index, metadata) in recoveredMetadata)
+                {
+                    if (!metadata.IsEmpty && index > maxIndex)
+                    {
+                        maxIndex = index;
+                    }
+                }
+
+                foreach (var context in recoveredIndexes.Keys)
+                {
+                    var (contextIndex, _) = ContextMetadata.DecomposeContext(context);
+                    if (contextIndex > maxIndex)
+                    {
+                        maxIndex = contextIndex;
+                    }
+                }
+
+                if (maxIndex >= 0)
+                {
+                    var priorMetadatas = contextMetadatas;
+
+                    contextMetadatas = new ContextMetadata[maxIndex + 1];
+
+                    for (var i = 0; i < contextMetadatas.Length; i++)
+                    {
+                        if (!recoveredMetadata.TryGetValue(i, out contextMetadatas[i]) || contextMetadatas[i].IsEmpty)
+                        {
+                            // Nothing was recovered for this index, so keep whatever is already in memory rather
+                            // than defaulting it. A cluster node with AOF enabled reconciles twice while starting
+                            // up - once from RecoverCheckpointAndAOFAsync and again from StoreWrapper - and the
+                            // first pass consumes recoveredMetadata, so the second has only the index records to
+                            // go on. Defaulting here would drop a reservation that has no index record instead of
+                            // marking it for cleanup below, leaving that context free to hand to the next Vector
+                            // Set while the data behind it is still present, and would reset the persisted
+                            // version so that later metadata writes are cancelled as stale.
+                            contextMetadatas[i] = i < priorMetadatas.Length ? priorMetadatas[i] : new();
+                        }
+                    }
+                }
+
+                recoveredMetadata.Clear();
+
+                // Rebuilding contextMetadatas invalidates any migration remapping built against the old array.
+                // An interrupted migration is treated as failed below - its context is marked for cleanup - so
+                // a surviving entry would steer the retried migration into a context being torn down.
+                ClearMigratedContextRemap();
+
+                // If we come up and contexts are marked for migration, that means the migration FAILED
+                // and we'd like those contexts back ASAP
+                for (var i = 0; i < contextMetadatas.Length; i++)
+                {
+                    var abandonedMigrations = contextMetadatas[i].GetMigrating();
+
+                    if (abandonedMigrations != null)
+                    {
+                        foreach (var abandoned in abandonedMigrations)
+                        {
+                            contextMetadatas[i].MarkMigrationComplete(i != 0, abandoned, ushort.MaxValue);
+                            contextMetadatas[i].MarkCleaningUp(i != 0, abandoned);
+                        }
+
+                        _ = dirtyContextMetadatas.Add(i);
+
+                        needsUpdated = true;
+                    }
+                }
+
+                // Any non-deleted records we recovered for contexts being deleted, we need to undo that
+                foreach (var (context, hashSlot) in recoveredIndexes)
+                {
+                    var (contextIndex, contextValue) = ContextMetadata.DecomposeContext(context);
+
+                    // The index record is written before the context metadata that reserves its context, so a
+                    // recovery boundary between the two leaves a live index record pointing at a free context.
+                    // Reserving it here keeps the context from being handed to a different Vector Set.
+                    if (!contextMetadatas[contextIndex].IsInUse(contextIndex != 0, contextValue))
+                    {
+                        contextMetadatas[contextIndex].MarkInUse(contextIndex != 0, contextValue, hashSlot);
+
+                        _ = dirtyContextMetadatas.Add(contextIndex);
+
+                        needsUpdated = true;
+                    }
+
+                    if (contextMetadatas[contextIndex].IsCleaningUp(contextIndex != 0, contextValue))
+                    {
+                        contextMetadatas[contextIndex].ClearIsCleaningUp(contextIndex != 0, contextValue);
+
+                        _ = dirtyContextMetadatas.Add(contextIndex);
+
+                        needsUpdated = true;
+                    }
+                }
+
+                // Any indexes still marked in use that we _didn't_ recover should be marked for cleanup
+                for (var i = 0; i < contextMetadatas.Length; i++)
+                {
+                    var offset = ContextMetadata.OffsetForContextMetadata(i);
+
+                    for (ulong j = 0; j < 64; j++)
+                    {
+                        var context = offset + (j * ContextStep);
+
+                        // Skip context 0, it's illegal to use
+                        if (context == 0)
+                        {
+
+                            continue;
+                        }
+
+                        // Index was recovered, nothing to do
+                        if (recoveredIndexes.ContainsKey(context))
+                        {
+                            continue;
+                        }
+
+                        var (_, contextValue) = ContextMetadata.DecomposeContext(context);
+
+                        // In use, but not recovered, cleanup any data and get the context back
+                        if (contextMetadatas[i].IsInUse(i != 0, contextValue) && !contextMetadatas[i].IsCleaningUp(i != 0, contextValue))
+                        {
+                            contextMetadatas[i].MarkCleaningUp(i != 0, contextValue);
+                            _ = dirtyContextMetadatas.Add(i);
+                        }
+                    }
+                }
+
+                recoveredIndexes.Clear();
+            }
+
+            if (needsUpdated)
+            {
+                UpdateContextMetadata(ref ctx);
+            }
+
+            // Resume any cleanups we didn't complete before recovery
+            if (!cleanupTaskChannel.TryPublish())
+            {
+                logger?.LogCritical("VectorManager cleanup channel rejected a recovery cleanup request");
+                Debug.Assert(false, "VectorManager cleanup channel should never drop a request");
+            }
+        }
+
+        /// <summary>
+        /// Collects every live Vector Set index record in the store into <see cref="recoveredIndexes"/>.
+        /// </summary>
+        private sealed class RecoveredIndexScanFunctions : IScanIteratorFunctions
+        {
+            private readonly VectorManager manager;
+
+            internal RecoveredIndexScanFunctions(VectorManager manager)
+            {
+                this.manager = manager;
+            }
+
+            public void OnException(Exception exception, long numberOfRecords) { }
+            public bool OnStart(long beginAddress, long endAddress) => true;
+            public void OnStop(bool completed, long numberOfRecords) { }
+
+            /// <inheritdoc/>
+            public bool Reader<TSourceLogRecord>(in TSourceLogRecord logRecord, RecordMetadata recordMetadata, long numberOfRecords, out CursorRecordResult cursorRecordResult)
+                where TSourceLogRecord : ISourceLogRecord
+            {
+                cursorRecordResult = CursorRecordResult.Skip;
+
+                if (logRecord.HasNamespace || logRecord.RecordType != RecordType || logRecord.ValueSpan.Length != IndexSize)
+                {
+                    return true;
+                }
+
+                ReadIndex(logRecord.ValueSpan, out var context, out _, out _, out _, out _, out _, out _, out _, out _);
+                manager.recoveredIndexes[context] = HashSlotUtils.HashSlot(logRecord.Key);
+
+                cursorRecordResult = CursorRecordResult.Accept;
+                return true;
+            }
+        }
+
+        /// <summary>
+        /// Called during recovery for each Vector Set index key.
+        /// </summary>
+        public void RecoveredVectorSetIndexKey<TSourceLogRecord>(ref TSourceLogRecord record) where TSourceLogRecord : ISourceLogRecord
+        {
+            if (record.ValueSpan.Length != IndexSize)
+            {
+                return;
+            }
+
+            ReadIndex(record.ValueSpan, out var context, out _, out _, out _, out _, out _, out _, out _, out _);
+
+            // The hash slot is needed to restore the context reservation in ReconcileRecoveredState, which
+            // has only this map to work from - the record itself is not retained past this call
+            recoveredIndexes[context] = HashSlotUtils.HashSlot(record.Key);
+        }
+
+        /// <summary>
+        /// Called during recovery for each ContextMetadata record.
+        /// </summary>
+        public void RecoveredContextMetadata<TSourceLogRecord>(ref TSourceLogRecord record) where TSourceLogRecord : ISourceLogRecord
+        {
+            if (record.ValueSpan.Length != ContextMetadata.Size || record.Key.Length != sizeof(int))
+            {
+                return;
+            }
+
+            var index = BinaryPrimitives.ReadInt32LittleEndian(record.Key);
+            var metadata = MemoryMarshal.Cast<byte, ContextMetadata>(record.ValueSpan)[0];
+
+            // A snapshot covers a range of the log, so it holds every version of a record written in that
+            // range - the same index is legitimately presented more than once, newest version last only if
+            // each update was copied to the tail. ContextMetadata.Version orders them, and only the newest
+            // describes the state to restore.
+            //
+            // Empty entries are kept here and trimmed in ReconcileRecoveredState, so that a newest version
+            // which released its last context still supersedes the older non-empty versions.
+            lock (recoveredMetadata)
+            {
+                if (!recoveredMetadata.TryGetValue(index, out var existing) || metadata.Version >= existing.Version)
+                {
+                    recoveredMetadata[index] = metadata;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Sanitizes and routes a record that entered the store as raw bytes, either from a checkpoint
+        /// snapshot or a diskless full sync. Later, <see cref="ReconcileRecoveredState"/> should be called to
+        /// rebuild the context reservation.
+        /// </summary>
+        public void SanitizeAndTrackIngestedRecordIfApplicable<TSourceLogRecord>(ref TSourceLogRecord record) where TSourceLogRecord : ISourceLogRecord
+        {
+            if (record.Info.Tombstone)
+            {
+                return;
+            }
+
+            // ContextMetadata records are identified by their namespace, index records by their record type
+            if (record.HasNamespace)
+            {
+                var ns = record.NamespaceBytes;
+                if (IsEnabled && ns.Length == 1 && ns[0] == MetadataNamespace)
+                {
+                    // Context metadata load needs to be saved off
+                    RecoveredContextMetadata(ref record);
+                }
+            }
+            else if (record.RecordType == RecordType)
+            {
+                // The handle belongs to whichever process wrote the record, so clear it even where Vector Sets
+                // are disabled - otherwise enabling them later would follow a pointer into a dead address space
+                ClearIndexPointer(record.ValueSpan);
+
+                if (IsEnabled)
+                {
+                    RecoveredVectorSetIndexKey(ref record);
+                }
+            }
+        }
+
+        /// <inheritdoc/>
+        public void Dispose()
+        {
+            if (!IsEnabled)
+            {
+                replicationBlockEvent.Dispose();
+
+                return;
+            }
+
+            // We must drain all these before disposing, otherwise we'll leave replicationBlockEvent unset
+            foreach (var channel in replicationReplayChannels)
+            {
+                _ = channel.Writer.TryComplete();
+                AsyncUtils.BlockingWait(channel.Reader.Completion);
+            }
+
+            AsyncUtils.BlockingWait(Task.WhenAll(replicationReplayTasks));
+
+            replicationBlockEvent.Dispose();
+
+            // Wait for any _drops_ in progress to finish
+            requestDropTaskChannel.CompleteAndWaitForConsumerTask(requestDropTask);
+
+            // Complete all quantization or import tasks - this MIGHT queue something into requestCleanupTaskChannel, so wait for it first
+            quantizationChannel.CompleteAndWaitForConsumerTask(Task.WhenAll(quantizationTasks));
+
+            // Wait for any _marking_ of cleanup state to finish. PauseCleanupAsync callers MUST
+            // have called ResumeCleanup before reaching here, otherwise the cleanup task
+            // is permanently blocked on cleanupGate.WaitAsync() and Dispose will hang.
+            requestCleanupTaskChannel.CompleteAndWaitForConsumerTask(requestCleanupTask);
+
+            // Wait for any in progress cleanup to finish. PauseCleanupAsync callers MUST
+            // have called ResumeCleanup before reaching here, otherwise the cleanup task
+            // is permanently blocked on cleanupGate.WaitAsync() and Dispose will hang.
+            cleanupTaskChannel.CompleteAndWaitForConsumerTask(cleanupTask);
+
+            // Cleanup task has fully drained, so nothing else can take this gate.
+            cleanupGate.Dispose();
+        }
+
+        private static void CompletePending(ref Status status, ref VectorOutput output, ref VectorBasicContext ctx)
+        {
+            _ = ctx.CompletePendingWithOutputs(out var completedOutputs, wait: true);
+            var more = completedOutputs.Next();
+            Debug.Assert(more);
+            status = completedOutputs.Current.Status;
+            output = completedOutputs.Current.Output;
+            Debug.Assert(!completedOutputs.Next());
+            completedOutputs.Dispose();
+        }
+
+        /// <summary>
+        /// As <see cref="CompletePending(ref Status, ref VectorOutput, ref VectorBasicContext)"/>, but also propagates the
+        /// completed <paramref name="input"/> back to the caller.
+        ///
+        /// This is required for the unknown-size read path (<see cref="ReadSizeUnknown"/>): the Reader records the actual
+        /// value size on <see cref="VectorInput.ReadDesiredSize"/>, and on the pending (disk) path that update lives on the
+        /// pending context's copy of the input. Without propagating it back the caller keeps its stale value and skips the
+        /// grow-and-retry, returning a truncated/uninitialized buffer.
+        /// </summary>
+        private static void CompletePending(ref Status status, ref VectorInput input, ref VectorOutput output, ref VectorBasicContext ctx)
+        {
+            _ = ctx.CompletePendingWithOutputs(out var completedOutputs, wait: true);
+            var more = completedOutputs.Next();
+            Debug.Assert(more);
+            status = completedOutputs.Current.Status;
+            output = completedOutputs.Current.Output;
+            input = completedOutputs.Current.Input;
+            Debug.Assert(!completedOutputs.Next());
+            completedOutputs.Dispose();
+        }
+
+        private static void CompletePending<TContext>(ref Status status, ref TContext ctx)
+            where TContext : ITsavoriteContext<FixedSpanByteKey, StringInput, StringOutput, long, MainSessionFunctions, StoreFunctions<GarnetKeyComparer, GarnetRecordTriggers>, ObjectAllocator<StoreFunctions<GarnetKeyComparer, GarnetRecordTriggers>>>
+        {
+            _ = ctx.CompletePendingWithOutputs(out var completedOutputs, wait: true);
+            var more = completedOutputs.Next();
+            Debug.Assert(more);
+            status = completedOutputs.Current.Status;
+            Debug.Assert(!completedOutputs.Next());
+            completedOutputs.Dispose();
+        }
+
+        /// <summary>
+        /// Add a vector to a vector set encoded by <paramref name="indexValue"/>.
+        /// 
+        /// Assumes that the index is locked in the Tsavorite store.
+        /// </summary>
+        /// <returns>Result of the operation.</returns>
+        internal VectorManagerResult TryAdd(
+            scoped ReadOnlySpan<byte> key,
+            scoped ReadOnlySpan<byte> indexValue,
+            ReadOnlySpan<byte> element,
+            VectorValueType valueType,
+            ReadOnlySpan<byte> values,
+            ReadOnlySpan<byte> attributes,
+            uint providedReduceDims,
+            VectorQuantType providedQuantType,
+            uint providedBuildExplorationFactor,
+            uint providedNumLinks,
+            VectorDistanceMetricType providedDistanceMetric,
+            out ReadOnlySpan<byte> errorMsg
+        )
+        {
+            AssertHaveStorageSession();
+
+            errorMsg = default;
+
+            ReadIndex(indexValue, out var context, out var dimensions, out var reduceDims, out var quantType, out _, out var numLinks, out var distanceMetric, out _, out var indexPtr);
+
+            if (providedReduceDims != 0 && providedReduceDims != reduceDims)
+            {
+                errorMsg = "ERR Provided REDUCE does not match Vector Set definition"u8;
+                return VectorManagerResult.BadParams;
+            }
+
+            if (providedQuantType != VectorQuantType.Invalid && providedQuantType != quantType)
+            {
+                errorMsg = "ERR asked quantization mismatch with existing vector set"u8;
+                return VectorManagerResult.BadParams;
+            }
+
+            if (providedDistanceMetric != VectorDistanceMetricType.Invalid && providedDistanceMetric != distanceMetric)
+            {
+                errorMsg = Encoding.ASCII.GetBytes($"ERR Distance metric mismatch - got {providedDistanceMetric} but set has {distanceMetric}");
+                return VectorManagerResult.BadParams;
+            }
+
+            if (providedNumLinks != numLinks)
+            {
+                // Matching Redis behavior
+                errorMsg = "ERR asked M value mismatch with existing vector set"u8;
+                return VectorManagerResult.BadParams;
+            }
+
+            DiskANNService.InsertResult insert;
+            bool needsQuantization;
+            using (var vectorData = PrepareVectorData(quantType, valueType, values, out errorMsg))
+            {
+                if (!errorMsg.IsEmpty)
+                {
+                    return VectorManagerResult.BadParams;
+                }
+
+                if (vectorData.ElementCount != dimensions)
+                {
+                    errorMsg = Encoding.ASCII.GetBytes($"ERR Vector dimension mismatch - got {vectorData.ElementCount} but set has {dimensions}");
+                    return VectorManagerResult.BadParams;
+                }
+
+                if (providedReduceDims == 0 && reduceDims != 0)
+                {
+                    // Matching Redis behavior, which is definitely a bit weird here
+                    errorMsg = Encoding.ASCII.GetBytes($"ERR Vector dimension mismatch - got {vectorData.ElementCount} but set has {reduceDims}");
+                    return VectorManagerResult.BadParams;
+                }
+
+                insert =
+                    Service.Insert(
+                        context,
+                        indexPtr,
+                        element,
+                        vectorData.ReadOnlySpan,
+                        vectorData.ElementCount,
+                        attributes,
+                        out needsQuantization
+                    );
+            }
+
+            if (insert == DiskANNService.InsertResult.SuccessInsert)
+            {
+                if (needsQuantization)
+                {
+                    EnqueueQuantization(new(key.ToArray(), QuantizationStep.BuildQuantizationTable, 0));
+                }
+
+                return VectorManagerResult.OK;
+            }
+            else if (insert == DiskANNService.InsertResult.SuccessUpdate)
+            {
+                return VectorManagerResult.Duplicate;
+            }
+
+            errorMsg = "ERR DiskANN result does not indicate success"u8;
+            return VectorManagerResult.BadParams;
+        }
+
+        /// <summary>
+        /// Try to remove a vector (and associated attributes) from a Vector Set, as identified by element key.
+        /// </summary>
+        internal VectorManagerResult TryRemove(ReadOnlySpan<byte> indexValue, ReadOnlySpan<byte> element)
+        {
+            AssertHaveStorageSession();
+
+            ReadIndex(indexValue, out var context, out _, out _, out _, out _, out _, out _, out _, out var indexPtr);
+
+            var del = Service.Remove(context, indexPtr, element);
+
+            return del ? VectorManagerResult.OK : VectorManagerResult.MissingElement;
+        }
+
+        internal bool TrySetAttribute(ReadOnlySpan<byte> indexValue, ReadOnlySpan<byte> element, ReadOnlySpan<byte> attribute)
+        {
+            AssertHaveStorageSession();
+
+            ReadIndex(indexValue, out var context, out _, out _, out _, out _, out _, out _, out _, out var indexPtr);
+
+            return Service.SetAttribute(context, indexPtr, element, attribute);
+        }
+
+        /// <summary>
+        /// Request deletion of a Vector Set given the VALUE of the index key.
+        /// </summary>
+        internal void RequestDeletion(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+        {
+            if (value.Length != IndexSize)
+            {
+                logger?.LogWarning($"Ignored Vector Set deletion due to size mismatch");
+                return;
+            }
+
+            ExceptionInjectionHelper.TriggerException(ExceptionInjectionType.VectorSet_Interrupt_Delete_0);
+
+            ReadIndex(value, out var context, out _, out _, out _, out _, out _, out _, out var flags, out var indexPtr);
+
+            // Ignore any deletion requested for an index that has the SuppressCleanup flag
+            //
+            // This typically indicates a rename is in progress
+            if (flags.HasFlag(VectorSetFlags.SuppressCleanup))
+            {
+                return;
+            }
+
+            if (!requestCleanupTaskChannel.TryPublish(context))
+            {
+                logger?.LogCritical("VectorManager request cleanup channel rejected a delete request");
+                Debug.Fail("VectorManager request cleanup channel should never drop a request");
+                throw new GarnetException("Could not submit request for Vector Set cleanup, aborting delete");
+            }
+
+            // Tell DiskANN to clean itself up
+            DropIndex(value);
+        }
+
+        /// <summary>
+        /// Request that the DiskANN side of an index be dropped.
+        /// 
+        /// This happens when a record is evicted to disk.
+        /// 
+        /// There's subtlety here because the DiskANN index might be in use (on the current or other threads)
+        /// and we can't allow the index to be recreated until any requested drops are processed.
+        /// </summary>
+        internal void RequestDropInMemoryIndex(ReadOnlySpan<byte> key, ReadOnlySpan<byte> value)
+        {
+            if (value.Length != IndexSize)
+            {
+                logger?.LogWarning($"Ignored Vector Set drop index due to size mismatch");
+                return;
+            }
+
+            ReadIndex(value, out var context, out _, out _, out _, out _, out _, out _, out var flags, out var indexPtr);
+
+            // Ignore any drop requested for an index that has the SuppressCleanup flag
+            //
+            // This typically indicates a rename is in progress, and thus there's another owner of the index pointer
+            if (flags.HasFlag(VectorSetFlags.SuppressCleanup))
+            {
+                return;
+            }
+
+            // It's possible for an index to be recovered from disk but never initialized, which means we need no drop
+            if (indexPtr != 0)
+            {
+                if (!requestedDrops.TryAdd(key.ToArray(), (context, indexPtr)))
+                {
+                    throw new GarnetException($"Drop triggered multiple times for same index: {SpanByte.ToShortString(key)}");
+                }
+
+                if (!requestDropTaskChannel.TryPublish())
+                {
+                    logger?.LogCritical("VectorManager request drop channel rejected an index drop");
+                    Debug.Assert(false, "VectorManager request drop channel should never drop a request");
+                }
+            }
+        }
+
+        /// <summary>
+        /// Ask DiskANN to drop its index.
+        /// </summary>
+        private void DropInMemoryIndex(ReadOnlySpan<byte> value)
+        {
+            if (value.Length != IndexSize)
+            {
+                logger?.LogWarning($"Ignored Vector Set drop index due to size mismatch");
+                return;
+            }
+
+            ReadIndex(value, out var context, out _, out _, out _, out _, out _, out _, out _, out var indexPtr);
+
+            Service.DropIndex(context, indexPtr);
+        }
+
+        /// <summary>
+        /// Clear out the index pointer stored in this record value.
+        /// 
+        /// Next time the record is touched, we'll recreate the index.
+        /// </summary>
+        internal static void ClearIndexPointer(Span<byte> value)
+        {
+            if (value.Length != IndexSize)
+            {
+                return;
+            }
+
+            ref var index = ref MemoryMarshal.Cast<byte, Index>(value)[0];
+            index.IndexPtr = 0;
+        }
+
+        /// <summary>
+        /// Perform a similarity search given a vector to compare against.
+        /// </summary>
+        internal VectorManagerResult ValueSimilarity(
+            scoped ReadOnlySpan<byte> indexValue,
+            VectorValueType valueType,
+            scoped ReadOnlySpan<byte> values,
+            int count,
+            float delta,
+            int searchExplorationFactor,
+            scoped ReadOnlySpan<byte> filter,
+            int maxFilteringEffort,
+            bool includeAttributes,
+            ref SpanByteAndMemory outputIds,
+            out VectorIdFormat outputIdFormat,
+            scoped out ReadOnlySpan<byte> errorMsg,
+            ref SpanByteAndMemory outputDistances,
+            ref SpanByteAndMemory outputAttributes,
+            ref SpanByteAndMemory filterBitmap
+        )
+        {
+            AssertHaveStorageSession();
+
+            ReadIndex(indexValue, out var context, out var dimensions, out var reduceDims, out var quantType, out _, out var numLinks, out _, out _, out var indexPtr);
+
+            var effectiveEF = Math.Max(searchExplorationFactor, count);
+
+            EnsureDistanceBufferSize(ref outputDistances, count);
+            EnsureIdBufferSize(ref outputIds, count);
+
+            int found;
+            nint continuation;
+            using (var vectorData = PrepareVectorData(quantType, valueType, values, out var tempErrorMsg))
+            {
+                if (!tempErrorMsg.IsEmpty)
+                {
+                    // Have to copy for scoping reasons - it's an error path, so we'll just eat the perf hit for now
+                    errorMsg = tempErrorMsg.ToArray();
+                    outputIdFormat = VectorIdFormat.Invalid;
+                    return VectorManagerResult.BadParams;
+                }
+
+                if (dimensions != vectorData.ElementCount)
+                {
+                    outputIdFormat = VectorIdFormat.Invalid;
+                    errorMsg = "ERR Dimensions provided do not match Vector Set dimensions"u8;
+                    return VectorManagerResult.BadParams;
+                }
+
+                if (!filter.IsEmpty)
+                {
+                    // ── Inline filtered search path ─────────
+                    // Compile the filter, set up callback state, and let Rust
+                    // evaluate per-candidate via InlineFilterCandidateCallbackImpl.
+                    // Only passing candidates are written to the output buffer,
+                    // so we size it for the desired count, not the overfetch.
+
+                    // Borrow scratch space for compiled filter program
+                    var bufferSlice = ActiveThreadSession.scratchBufferBuilder.CreateArgSlice(
+                        TotalPoolTokens * ExprToken.Size + MaxSelectors * 2 * sizeof(int));
+                    var span = MemoryMarshal.Cast<byte, ExprToken>(bufferSlice.Span);
+                    var selectorBuf = MemoryMarshal.Cast<byte, (int Start, int Length)>(
+                        bufferSlice.Span.Slice(TotalPoolTokens * ExprToken.Size));
+
+                    try
+                    {
+                        span.Clear();
+
+                        var offset = 0;
+                        var instrBuf = span.Slice(offset, MaxInstructions); offset += MaxInstructions;
+                        var tuplePoolBuf = span.Slice(offset, MaxTuplePool); offset += MaxTuplePool;
+                        var tokensBuf = span.Slice(offset, MaxInstructions); offset += MaxInstructions;
+                        var opsStackBuf = span.Slice(offset, MaxInstructions); offset += MaxInstructions;
+                        var runtimePoolBuf = span.Slice(offset, MaxRuntimePool); offset += MaxRuntimePool;
+                        var extractedFields = span.Slice(offset, MaxSelectors); offset += MaxSelectors;
+                        var stackBuf = span.Slice(offset, StackCapacity);
+
+                        var instrCount = ExprCompiler.TryCompile(filter, instrBuf, tuplePoolBuf, tokensBuf, opsStackBuf, out var tupleCount, out _);
+                        if (instrCount < 0)
+                        {
+                            // Compile failed — return zero results
+                            outputDistances.Length = 0;
+                            filterBitmap.Length = 0;
+                            outputIdFormat = VectorIdFormat.I32LengthPrefixed;
+                            errorMsg = "ERR Compiling filter failed"u8;
+                            return VectorManagerResult.BadParams;
+                        }
+
+                        var selectorCount = GetSelectorRanges(instrBuf[..instrCount], instrCount, filter, selectorBuf);
+
+                        var filterState = new InlineFilterState
+                        {
+                            InstrBuf = instrBuf[..instrCount],
+                            TuplePoolBuf = tuplePoolBuf[..tupleCount],
+                            RuntimePoolBuf = runtimePoolBuf,
+                            ExtractedFields = extractedFields[..Math.Max(selectorCount, 1)],
+                            StackBuf = stackBuf,
+                            SelectorRanges = selectorBuf[..selectorCount],
+                            FilterBytes = filter,
+                        };
+
+                        // InlineFilterState is a ref struct, so will remain on stack for the SearchVector call.
+                        //
+                        // Save a pointer off so it's easy to grab InlineFilterState in callbacks.
+                        unsafe
+                        {
+#pragma warning disable CS8500 // InlineFilterState only contains unmanaged types or spans of pinned arrays, this is safe
+                            InlineFilterStatePtr = &filterState;
+#pragma warning restore CS8500
+                        }
+
+                        found = Service.SearchVector(
+                            context,
+                            indexPtr,
+                            vectorData.ReadOnlySpan,
+                            vectorData.ElementCount,
+                            delta,
+                            effectiveEF,
+                            filter,
+                            maxFilteringEffort,
+                            outputIds,
+                            outputDistances,
+                            DefaultBeamWidth,
+                            out continuation
+                        );
+
+                        if (found >= 0)
+                        {
+                            while (continuation != 0)
+                            {
+                                var additionalResults = ContinueSearch(context, indexPtr, continuation, found, ref outputIds, ref outputDistances, out continuation);
+
+                                if (additionalResults < 0)
+                                {
+                                    found = additionalResults;
+                                    break;
+                                }
+
+                                found += additionalResults;
+                            }
+                        }
+                    }
+                    finally
+                    {
+                        _ = ActiveThreadSession.scratchBufferBuilder.RewindScratchBuffer(bufferSlice);
+
+                        unsafe
+                        {
+                            InlineFilterStatePtr = null;
+                        }
+                    }
+                }
+                else
+                {
+                    found =
+                        Service.SearchVector(
+                            context,
+                            indexPtr,
+                            vectorData.ReadOnlySpan,
+                            vectorData.ElementCount,
+                            delta,
+                            effectiveEF,
+                            filter,
+                            maxFilteringEffort,
+                            outputIds,
+                            outputDistances,
+                            DefaultBeamWidth,
+                            out continuation
+                        );
+
+                    if (found >= 0)
+                    {
+                        while (continuation != 0)
+                        {
+                            var additionalResults = ContinueSearch(context, indexPtr, continuation, found, ref outputIds, ref outputDistances, out continuation);
+
+                            if (additionalResults < 0)
+                            {
+                                found = additionalResults;
+                                break;
+                            }
+
+                            found += additionalResults;
+                        }
+                    }
+                }
+            }
+
+            if (found < 0)
+            {
+                logger?.LogWarning("Error indicating response from vector service {found}", found);
+                outputIdFormat = VectorIdFormat.Invalid;
+                errorMsg = Encoding.ASCII.GetBytes($"ERR Error indicating response from vector service {found}");
+                return VectorManagerResult.BadParams;
+            }
+
+            if (includeAttributes || !filter.IsEmpty)
+            {
+                FetchVectorElementAttributes(context, found, outputIds, ref outputAttributes);
+            }
+
+            // Apply post-filtering if filter is specified
+            if (!filter.IsEmpty)
+            {
+                EnsureFilterBitmapSize(ref filterBitmap, found);
+
+                _ = ApplyPostFilter(filter, found, outputAttributes.ReadOnlySpan, filterBitmap.Span, ActiveThreadSession.scratchBufferBuilder);
+            }
+
+            outputDistances.Length = sizeof(float) * found;
+
+            // Default assumption is length prefixed
+            outputIdFormat = VectorIdFormat.I32LengthPrefixed;
+
+            errorMsg = default;
+            return VectorManagerResult.OK;
+        }
+
+        /// <summary>
+        /// Perform a similarity search given a vector to compare against.
+        /// </summary>
+        internal VectorManagerResult ElementSimilarity(
+            ReadOnlySpan<byte> indexValue,
+            ReadOnlySpan<byte> element,
+            int count,
+            float delta,
+            int searchExplorationFactor,
+            ReadOnlySpan<byte> filter,
+            int maxFilteringEffort,
+            bool includeAttributes,
+            ref SpanByteAndMemory outputIds,
+            out VectorIdFormat outputIdFormat,
+            ref SpanByteAndMemory outputDistances,
+            ref SpanByteAndMemory outputAttributes,
+            ref SpanByteAndMemory filterBitmap
+        )
+        {
+            AssertHaveStorageSession();
+
+            ReadIndex(indexValue, out var context, out var dimensions, out var reduceDims, out var quantType, out _, out var numLinks, out _, out _, out var indexPtr);
+
+            var effectiveEF = Math.Max(searchExplorationFactor, count);
+
+            EnsureDistanceBufferSize(ref outputDistances, count);
+            EnsureIdBufferSize(ref outputIds, count);
+
+            int found;
+            nint continuation;
+
+            if (!filter.IsEmpty)
+            {
+                // ── Inline-filtered search path ──────────────────────────
+                // Size output buffers for desired result count
+                EnsureDistanceBufferSize(ref outputDistances, count);
+                EnsureIdBufferSize(ref outputIds, count);
+
+                // Borrow scratch space for compiled filter program
+                var bufferSlice = ActiveThreadSession.scratchBufferBuilder.CreateArgSlice(
+                    TotalPoolTokens * ExprToken.Size + MaxSelectors * 2 * sizeof(int));
+                var span = MemoryMarshal.Cast<byte, ExprToken>(bufferSlice.Span);
+                var selectorBuf = MemoryMarshal.Cast<byte, (int Start, int Length)>(
+                    bufferSlice.Span.Slice(TotalPoolTokens * ExprToken.Size));
+
+                try
+                {
+                    span.Clear();
+
+                    var offset = 0;
+                    var instrBuf = span.Slice(offset, MaxInstructions); offset += MaxInstructions;
+                    var tuplePoolBuf = span.Slice(offset, MaxTuplePool); offset += MaxTuplePool;
+                    var tokensBuf = span.Slice(offset, MaxInstructions); offset += MaxInstructions;
+                    var opsStackBuf = span.Slice(offset, MaxInstructions); offset += MaxInstructions;
+                    var runtimePoolBuf = span.Slice(offset, MaxRuntimePool); offset += MaxRuntimePool;
+                    var extractedFields = span.Slice(offset, MaxSelectors); offset += MaxSelectors;
+                    var stackBuf = span.Slice(offset, StackCapacity);
+
+                    var instrCount = ExprCompiler.TryCompile(filter, instrBuf, tuplePoolBuf, tokensBuf, opsStackBuf, out var tupleCount, out _);
+                    if (instrCount < 0)
+                    {
+                        outputDistances.Length = 0;
+                        filterBitmap.Length = 0;
+                        outputIdFormat = VectorIdFormat.I32LengthPrefixed;
+                        return VectorManagerResult.BadParams;
+                    }
+
+                    var selectorCount = GetSelectorRanges(instrBuf[..instrCount], instrCount, filter, selectorBuf);
+
+                    var filterState = new InlineFilterState
+                    {
+                        InstrBuf = instrBuf[..instrCount],
+                        TuplePoolBuf = tuplePoolBuf[..tupleCount],
+                        RuntimePoolBuf = runtimePoolBuf,
+                        ExtractedFields = extractedFields[..Math.Max(selectorCount, 1)],
+                        StackBuf = stackBuf,
+                        SelectorRanges = selectorBuf[..selectorCount],
+                        FilterBytes = filter,
+                    };
+
+                    // InlineFilterState is a ref struct, so will remain on stack for the SearchVector call.
+                    //
+                    // Save a pointer off so it's easy to grab InlineFilterState in callbacks.
+                    unsafe
+                    {
+#pragma warning disable CS8500 // InlineFilterState only contains unmanaged types or spans of pinned arrays, this is safe
+                        InlineFilterStatePtr = &filterState;
+#pragma warning restore CS8500
+                    }
+
+                    found = Service.SearchElement(
+                        context,
+                        indexPtr,
+                        element,
+                        delta,
+                        effectiveEF,
+                        filter,
+                        maxFilteringEffort,
+                        outputIds,
+                        outputDistances,
+                        DefaultBeamWidth,
+                        out continuation
+                    );
+
+                    if (found >= 0)
+                    {
+                        while (continuation != 0)
+                        {
+                            var additionalResults = ContinueSearch(context, indexPtr, continuation, found, ref outputIds, ref outputDistances, out continuation);
+
+                            if (additionalResults < 0)
+                            {
+                                found = additionalResults;
+                                break;
+                            }
+
+                            found += additionalResults;
+                        }
+                    }
+
+                }
+                finally
+                {
+                    ActiveThreadSession.scratchBufferBuilder.RewindScratchBuffer(bufferSlice);
+
+                    unsafe
+                    {
+                        InlineFilterStatePtr = null;
+                    }
+                }
+            }
+            else
+            {
+                found =
+                    Service.SearchElement(
+                    context,
+                    indexPtr,
+                    element,
+                    delta,
+                    effectiveEF,
+                    filter,
+                    maxFilteringEffort,
+                    outputIds,
+                    outputDistances,
+                    DefaultBeamWidth,
+                    out continuation
+                );
+
+                if (found >= 0)
+                {
+                    while (continuation != 0)
+                    {
+                        var additionalResults = ContinueSearch(context, indexPtr, continuation, found, ref outputIds, ref outputDistances, out continuation);
+
+                        if (additionalResults < 0)
+                        {
+                            found = additionalResults;
+                            break;
+                        }
+
+                        found += additionalResults;
+                    }
+                }
+            }
+
+            if (found < 0)
+            {
+                logger?.LogWarning("Error indicating response from vector service {found}", found);
+                outputIdFormat = VectorIdFormat.Invalid;
+                return VectorManagerResult.BadParams;
+            }
+
+            if (includeAttributes || !filter.IsEmpty)
+            {
+                FetchVectorElementAttributes(context, found, outputIds, ref outputAttributes);
+            }
+
+            // Apply post-filtering if filter is specified
+            if (!filter.IsEmpty)
+            {
+                EnsureFilterBitmapSize(ref filterBitmap, found);
+
+                _ = ApplyPostFilter(filter, found, outputAttributes.ReadOnlySpan, filterBitmap.Span, ActiveThreadSession.scratchBufferBuilder);
+            }
+
+            outputDistances.Length = sizeof(float) * found;
+
+            // Default assumption is length prefixed
+            outputIdFormat = VectorIdFormat.I32LengthPrefixed;
+
+            return VectorManagerResult.OK;
+        }
+
+        /// <summary>
+        /// Continue a search that previously produced partial results.
+        /// 
+        /// All search_xxx methods continue in the same way, so this method is held in common.
+        /// 
+        /// Returns number of new results fetched, and sets <paramref name="continuation"/> to a non-0 value if additional calls are necessary.
+        /// </summary>
+        internal int ContinueSearch(ulong context, nint indexPtr, nint oldContinuation, int foundSoFar, ref SpanByteAndMemory outputIds, ref SpanByteAndMemory outputDistances, out nint continuation)
+        {
+            Debug.Assert(oldContinuation != 0, "Expected non-zero continuation");
+
+            // Only ids can grow, so double them each time
+            var newIdSpace = MemoryPool<byte>.Shared.Rent(outputIds.Span.Length * 2);
+            outputIds.ReadOnlySpan.CopyTo(newIdSpace.Memory.Span);
+
+            // TODO: Could remember this offset?  It's a relatively rare occurrence so maybe not worth optimizing
+            var writeIdsInto = newIdSpace.Memory.Span;
+            for (var i = 0; i < foundSoFar; i++)
+            {
+                var skip = BinaryPrimitives.ReadInt32LittleEndian(writeIdsInto);
+                writeIdsInto = writeIdsInto[(sizeof(int) + skip)..];
+            }
+
+            var writeDistancesInto = outputDistances.Span[(sizeof(float) * foundSoFar)..];
+            Debug.Assert(!writeDistancesInto.IsEmpty, "Expected space for remaining distances");
+
+            int count;
+            unsafe
+            {
+                // Guarantee these are pinned
+                fixed (byte* idPtr = writeIdsInto)
+                fixed (byte* distancePtr = writeDistancesInto)
+                {
+                    count = Service.ContinueSearch(context, indexPtr, oldContinuation, writeIdsInto, writeDistancesInto, out continuation);
+                }
+            }
+
+            // Error case, terminate 
+            if (count < 0)
+            {
+                Debug.Assert(continuation == 0, "Expected no additional continuations on error result");
+                return count;
+            }
+
+            // Update ids on success
+            outputIds.Memory?.Dispose();
+            outputIds = new(newIdSpace, newIdSpace.Memory.Length);
+            return count;
+        }
+
+        /// <summary>
+        /// Fetch attributes for a single element id.
+        /// 
+        /// This must only be called while holding locks which prevent the Vector Set from being dropped.
+        /// 
+        /// IMPORTANT: outputAttributes may be replaced with an allocated memory, so the caller needs to check
+        /// if the buffer is stack-based or heap-based, and dispose if it's the latter.
+        /// </summary>
+        internal VectorManagerResult FetchSingleVectorElementAttributes(ReadOnlySpan<byte> indexValue, PinnedSpanByte element, ref SpanByteAndMemory outputAttributes)
+        {
+            AssertHaveStorageSession();
+            ReadIndex(indexValue, out var context, out _, out _, out _, out _, out _, out _, out _, out _);
+
+            Span<byte> internalId = stackalloc byte[sizeof(int)];
+            var internalIdBytes = SpanByteAndMemory.FromPinnedSpan(internalId);
+            var foundInternalId = ReadSizeUnknown(context | DiskANNService.InternalIdMap, element, ref internalIdBytes);
+
+            if (!foundInternalId)
+            {
+                internalIdBytes.Dispose();
+                return VectorManagerResult.MissingElement;
+            }
+
+            var foundAttribute = ReadSizeUnknown(context | DiskANNService.Attributes, internalIdBytes.ReadOnlySpan, ref outputAttributes);
+            return foundAttribute ? VectorManagerResult.OK : VectorManagerResult.MissingElement;
+        }
+
+        /// <summary>
+        /// Fetch attributes for a given set of element ids.
+        /// 
+        /// This must only be called while holding locks which prevent the Vector Set from being dropped.
+        /// </summary>
+        private void FetchVectorElementAttributes(ulong context, int numIds, SpanByteAndMemory ids, ref SpanByteAndMemory attributes)
+        {
+            var remainingIds = ids.ReadOnlySpan;
+
+            var attributesNextIx = 0;
+
+            Span<byte> attributeFull = stackalloc byte[32];
+            var attributeMem = SpanByteAndMemory.FromPinnedSpan(attributeFull);
+
+            Span<byte> internalId = stackalloc byte[sizeof(int)];
+            var internalIdMem = SpanByteAndMemory.FromPinnedSpan(internalId);
+
+            try
+            {
+                // TODO: we could scatter/gather this like MGET - doesn't matter when everything is in memory,
+                //       but if anything is on disk it'd help perf
+                for (var i = 0; i < numIds; i++)
+                {
+                    var externalIdLen = BinaryPrimitives.ReadInt32LittleEndian(remainingIds);
+                    if (externalIdLen + sizeof(int) > remainingIds.Length)
+                    {
+                        throw new GarnetException($"Malformed ids, {externalIdLen} + {sizeof(int)} > {remainingIds.Length}");
+                    }
+
+                    var externalId = remainingIds.Slice(sizeof(int), externalIdLen);
+
+                    if (attributeMem.Memory != null)
+                    {
+                        attributeMem.Length = attributeMem.Memory.Memory.Length;
+                    }
+                    else
+                    {
+                        attributeMem.Length = attributeMem.SpanByte.Length;
+                    }
+
+                    var foundInternalId = ReadSizeUnknown(context | DiskANNService.InternalIdMap, externalId, ref internalIdMem);
+
+                    bool foundAttr;
+                    if (foundInternalId)
+                    {
+                        foundAttr = ReadSizeUnknown(context | DiskANNService.Attributes, internalIdMem.Span, ref attributeMem);
+                    }
+                    else
+                    {
+                        foundAttr = false;
+                        attributeMem.Length = 0;
+                    }
+
+                    // Copy attribute into output buffer, length prefixed, resizing as necessary
+                    var neededSpace = 4 + (foundAttr ? attributeMem.Length : 0);
+
+                    var destSpan = attributes.Span[attributesNextIx..];
+                    if (destSpan.Length < neededSpace)
+                    {
+                        var newAttrArr = MemoryPool<byte>.Shared.Rent(attributes.Length + neededSpace);
+                        attributes.ReadOnlySpan.CopyTo(newAttrArr.Memory.Span);
+
+                        attributes.Memory?.Dispose();
+
+                        attributes = new SpanByteAndMemory(newAttrArr, newAttrArr.Memory.Length);
+                        destSpan = attributes.Span[attributesNextIx..];
+                    }
+
+                    BinaryPrimitives.WriteInt32LittleEndian(destSpan, attributeMem.Length);
+                    attributeMem.ReadOnlySpan.CopyTo(destSpan[sizeof(int)..]);
+
+                    attributesNextIx += neededSpace;
+
+                    remainingIds = remainingIds[(sizeof(int) + externalIdLen)..];
+                }
+
+                attributes.Length = attributesNextIx;
+            }
+            finally
+            {
+                attributeMem.Dispose();
+                internalIdMem.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Try to read the associated dimensions for an element out of a Vector Set.
+        /// </summary>
+        internal bool TryGetEmbedding(ReadOnlySpan<byte> indexValue, ReadOnlySpan<byte> element, ref SpanByteAndMemory outputDistances)
+        {
+            AssertHaveStorageSession();
+
+            ReadIndex(indexValue, out var context, out var dimensions, out _, out var quantType, out _, out _, out _, out _, out var indexPtr);
+
+            // Make sure enough space in distances for requested count
+            if (dimensions * sizeof(float) > outputDistances.Length)
+            {
+                if (!outputDistances.IsSpanByte)
+                {
+                    outputDistances.Memory.Dispose();
+                }
+
+                outputDistances = new SpanByteAndMemory(MemoryPool<byte>.Shared.Rent((int)dimensions * sizeof(float)), (int)dimensions * sizeof(float));
+            }
+            else
+            {
+                outputDistances.Length = (int)dimensions * sizeof(float);
+            }
+
+            Span<byte> internalId = stackalloc byte[sizeof(int)];
+            var internalIdBytes = SpanByteAndMemory.FromPinnedSpan(internalId);
+            try
+            {
+                if (!ReadSizeUnknown(context | DiskANNService.InternalIdMap, element, ref internalIdBytes))
+                {
+                    return false;
+                }
+
+                Debug.Assert(internalIdBytes.IsSpanByte, "Internal Id should always be of known size");
+            }
+            finally
+            {
+                internalIdBytes.Memory?.Dispose();
+            }
+
+            Span<byte> asBytesSpan = stackalloc byte[1024];
+            var asBytes = SpanByteAndMemory.FromPinnedSpan(asBytesSpan);
+            try
+            {
+                if (!ReadSizeUnknown(context | DiskANNService.FullVector, internalId, ref asBytes))
+                {
+                    return false;
+                }
+
+                var into = MemoryMarshal.Cast<byte, float>(outputDistances.Span);
+                var from = asBytes.ReadOnlySpan;
+
+                // Internal vector format differs depend on the selected quantizer, so do that mapping as needed
+                switch (quantType)
+                {
+                    // All Redis quantizers store F32s
+                    case VectorQuantType.Bin:
+                    case VectorQuantType.Q8:
+                    case VectorQuantType.NoQuant:
+                        MemoryMarshal.Cast<byte, float>(from).CopyTo(into);
+                        break;
+
+                    // XNoQuant_I8 & XBin_I8 stores _signed_ bytes
+                    case VectorQuantType.XNoQuant_I8:
+                    case VectorQuantType.XBin_I8:
+                        for (var i = 0; i < from.Length; i++)
+                        {
+                            into[i] = (sbyte)from[i];
+                        }
+                        break;
+
+                    // XNoQuant_I8 & NoQuant_U8 stores unsigned bytes
+                    case VectorQuantType.XNoQuant_U8:
+                    case VectorQuantType.XBin_U8:
+                        for (var i = 0; i < from.Length; i++)
+                        {
+                            into[i] = from[i];
+                        }
+                        break;
+
+                    case VectorQuantType.Invalid:
+                    default:
+                        throw new InvalidOperationException($"Unexpected VectorQuantType: {quantType}");
+                }
+
+                // Vector might have been deleted, so check that after getting data
+                return Service.CheckInternalIdValid(context, indexPtr, internalId);
+            }
+            finally
+            {
+                asBytes.Memory?.Dispose();
+            }
+        }
+
+        /// <summary>
+        /// Try to read the associated raw quantization data for an element out of a Vector Set.
+        /// </summary>
+        internal bool TryGetRawEmbedding(ReadOnlySpan<byte> indexValue, ReadOnlySpan<byte> element, ref SpanByteAndMemory quantizedValues, out VectorQuantType quantType, out double norm, out double? range)
+        {
+            AssertHaveStorageSession();
+
+            ReadIndex(indexValue, out var context, out _, out _, out quantType, out _, out _, out _, out _, out _);
+
+            // Get internal id for the given element
+            Span<byte> internalId = stackalloc byte[sizeof(int)];
+            var internalIdBytes = SpanByteAndMemory.FromPinnedSpan(internalId);
+            try
+            {
+                if (!ReadSizeUnknown(context | DiskANNService.InternalIdMap, element, ref internalIdBytes))
+                {
+                    norm = double.NaN;
+                    range = null;
+                    return false;
+                }
+
+                Debug.Assert(internalIdBytes.IsSpanByte, "Internal Id should always be of known size");
+            }
+            finally
+            {
+                internalIdBytes.Memory?.Dispose();
+            }
+
+            // NoQuant-ish quantizers won't have a quantized vector in the steady state
+            var readContext = context;
+            if (quantType is VectorQuantType.NoQuant or VectorQuantType.XNoQuant_U8 or VectorQuantType.XNoQuant_I8)
+            {
+                readContext |= DiskANNService.FullVector;
+            }
+            else
+            {
+                readContext |= DiskANNService.QuantizedVector;
+            }
+
+            // Get the RAW view - we're leaking DiskANN internal details here but that's _kind of_ the point
+            while (true)
+            {
+                if (ReadSizeUnknown(readContext, internalId, ref quantizedValues))
+                {
+                    break;
+                }
+
+                // If read fails, that _might_ mean that quantization hasn't happened yet, so try and fetch the full vector
+                if (readContext == (context | DiskANNService.QuantizedVector))
+                {
+                    readContext = context | DiskANNService.FullVector;
+                    continue;
+                }
+
+                norm = double.NaN;
+                range = null;
+                return false;
+            }
+
+            // TODO: These values are nonsense, but is there an equivalent we can pull out for DiskANN?
+            norm = 1.0;
+            range = quantType == VectorQuantType.Q8 ? 1.0 : null;
+
+            return true;
+        }
+
+        /// <summary>
+        /// Determine if the given element is a member of the vector set.
+        /// </summary>
+        internal bool IsMember(ReadOnlySpan<byte> indexSpan, ReadOnlySpan<byte> element)
+        {
+            ReadIndex(indexSpan, out var context, out _, out _, out _, out _, out _, out _, out _, out _);
+
+            Span<byte> internalId = stackalloc byte[sizeof(int)];
+            var internalIdBytes = SpanByteAndMemory.FromPinnedSpan(internalId);
+            var foundInternalId = ReadSizeUnknown(context | DiskANNService.InternalIdMap, element, ref internalIdBytes);
+            if (foundInternalId)
+            {
+                Debug.Assert(internalIdBytes.IsSpanByte, "Shouldn't have allocated for this op");
+                return true;
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Get up to <paramref name="count"/> random elements from a vector set.
+        /// </summary>
+        internal VectorManagerResult RandomMembers(ReadOnlySpan<byte> indexSpan, int count, bool allowDuplicates, ref SpanByteAndMemory ids, out int finalCount)
+        {
+            // Limit the number of times we'll try to get new random members
+            const int MaximumAttempts = 5;
+
+            ReadIndex(indexSpan, out var context, out _, out _, out _, out _, out _, out _, out _, out var indexPtr);
+
+            GCHandle? idsPin = null;
+
+            var remainingCount = count;
+            var remainingIds = ids.Span;
+            var attempts = 0;
+
+            try
+            {
+                while (true)
+                {
+                    // Guarantee we'll read negative values while processing results
+                    remainingIds.Fill(255);
+
+                    if (!ids.IsSpanByte)
+                    {
+                        var getRes = MemoryMarshal.TryGetArray<byte>(ids.Memory.Memory, out var arrSeg);
+                        Debug.Assert(getRes, "Should always be able to get array to pin");
+
+                        idsPin?.Free();
+                        idsPin = GCHandle.Alloc(arrSeg.Array, GCHandleType.Pinned);
+                    }
+                    else
+                    {
+                        idsPin = null;
+                    }
+
+                    if (!Service.RandomMembers(context, indexPtr, remainingCount, remainingIds))
+                    {
+                        logger?.LogError("RandomMembers failed for context {context}", context);
+                        finalCount = 0;
+                        return VectorManagerResult.BadParams;
+                    }
+
+                    // Handle Redis-isms by deduplicating if and stopping if needed
+                    ProcessResults(ids.Span, allowDuplicates, out var actualCount, out var validIdsLength);
+
+                    attempts++;
+
+                    if (actualCount == count)
+                    {
+                        // Got all the results we need, stop
+
+                        finalCount = actualCount;
+                        ids.Length = validIdsLength;
+                        break;
+                    }
+
+                    var newRemainingCount = count - actualCount;
+
+                    if (newRemainingCount == remainingCount || attempts == MaximumAttempts)
+                    {
+                        // No progress was made, give up and return what we have
+
+                        finalCount = actualCount;
+                        ids.Length = validIdsLength;
+                        break;
+                    }
+
+                    remainingCount = newRemainingCount;
+                    remainingIds = remainingIds[validIdsLength..];
+
+                    // Grow size of output buffer to hold more results
+                    if (remainingIds.Length < (remainingCount * MinimumSpacePerId))
+                    {
+                        idsPin?.Free();
+                        idsPin = null;
+
+                        var newIds = MemoryPool<byte>.Shared.Rent(ids.Length * 2);
+                        ids.Span.CopyTo(newIds.Memory.Span);
+
+                        ids.Memory?.Dispose();
+                        ids = new(newIds, newIds.Memory.Length);
+
+                        remainingIds = ids.Span;
+                        for (var i = 0; i < (count - remainingCount); i++)
+                        {
+                            var idLen = BinaryPrimitives.ReadInt32LittleEndian(remainingIds);
+                            if (idLen < 0)
+                            {
+                                break;
+                            }
+
+                            remainingIds = remainingIds[(sizeof(int) + idLen)..];
+                        }
+                    }
+                }
+
+                return VectorManagerResult.OK;
+            }
+            finally
+            {
+                idsPin?.Free();
+            }
+
+            // Scan over ids and count them - deduplicating if required
+            static void ProcessResults(Span<byte> candidates, bool allowDuplicates, out int actualCount, out int validCandidateLength)
+            {
+                if (allowDuplicates)
+                {
+                    var remaining = candidates;
+
+                    var count = 0;
+                    while (!remaining.IsEmpty)
+                    {
+                        var idLen = BinaryPrimitives.ReadInt32LittleEndian(remaining);
+                        if (idLen < 0)
+                        {
+                            break;
+                        }
+
+                        count++;
+                        remaining = remaining[(sizeof(int) + idLen)..];
+                    }
+
+                    actualCount = count;
+                    validCandidateLength = candidates.Length - remaining.Length;
+                }
+                else
+                {
+                    var dupeTracker = new HashSet<byte[]>(ByteArrayComparer.Instance);
+                    var dupeTrackerLookup = dupeTracker.GetAlternateLookup<ReadOnlySpan<byte>>();
+
+                    var remaining = candidates;
+
+                    var count = 0;
+                    while (!remaining.IsEmpty)
+                    {
+                        var idLen = BinaryPrimitives.ReadInt32LittleEndian(remaining);
+                        if (idLen < 0)
+                        {
+                            break;
+                        }
+
+                        var id = remaining.Slice(sizeof(int), idLen);
+                        byte[] idArr = null;
+                        var isDupe =
+                                dupeTrackerLookup.Contains(id)
+                                ;
+
+                        var afterId = remaining[(sizeof(int) + idLen)..];
+
+                        if (isDupe)
+                        {
+                            afterId.CopyTo(remaining);
+                            afterId[^(sizeof(int) + idLen)..].Fill(255);
+                        }
+                        else
+                        {
+                            idArr ??= id.ToArray();
+                            dupeTracker.Add(idArr);
+
+                            remaining = afterId;
+
+                            count++;
+                        }
+                    }
+
+                    actualCount = count;
+                    validCandidateLength = candidates.Length - remaining.Length;
+                }
+            }
+        }
+
+        /// <summary>
+        /// Get the neighbors of a <paramref name="element"/> in a Vector Set, along with distances to each neighbor.
+        /// </summary>
+        internal VectorManagerResult GetNeighbors(ReadOnlySpan<byte> indexSpan, ReadOnlySpan<byte> element, ref SpanByteAndMemory outputIds, ref SpanByteAndMemory outputDistances)
+        {
+            ReadIndex(indexSpan, out var context, out _, out _, out _, out _, out var numLinks, out _, out _, out var indexPtr);
+
+            if (outputDistances.Length < sizeof(float) * numLinks)
+            {
+                var neededBytes = (int)(sizeof(float) * numLinks);
+                outputDistances.EnsureHeapMemorySize(neededBytes);
+            }
+
+            var found = Service.SearchNeighbors(context, indexPtr, element, outputIds, outputDistances, out var continuation);
+
+            if (found < 0)
+            {
+                Debug.Assert(continuation == 0, "Shouldn't have more results after failure");
+
+                logger?.LogError("GetNeighbors failed with {res} for context {context}", found, context);
+
+                return VectorManagerResult.BadParams;
+            }
+
+            while (continuation != 0)
+            {
+                var additionalResults = ContinueSearch(context, indexPtr, continuation, found, ref outputIds, ref outputDistances, out continuation);
+
+                if (additionalResults < 0)
+                {
+                    Debug.Assert(continuation == 0, "Shouldn't have more results after failure");
+
+                    logger?.LogError("GetNeighbors failed in ContinueSearch with {additionalResults} for context {context}", additionalResults, context);
+
+                    found = additionalResults;
+                    break;
+                }
+
+                found += additionalResults;
+            }
+
+            if (found < 0)
+            {
+                return VectorManagerResult.BadParams;
+            }
+
+            outputDistances.Length = sizeof(float) * found;
+            return VectorManagerResult.OK;
+        }
+
+        [Conditional("DEBUG")]
+        private static void AssertHaveStorageSession()
+        {
+            Debug.Assert(ActiveThreadSession != null, "Should have StorageSession by now");
+        }
+    }
+}

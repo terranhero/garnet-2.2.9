@@ -1,0 +1,341 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Linq;
+using System.Runtime.CompilerServices;
+using System.Threading;
+using System.Threading.Tasks;
+using Garnet.common;
+using Garnet.networking;
+using Garnet.server;
+using Microsoft.Extensions.Logging;
+using Tsavorite.core;
+
+namespace Garnet.cluster
+{
+    /// <summary>
+    /// Replica main replay driver
+    /// </summary>
+    internal sealed class ReplicaReplayDriver : IBulkLogEntryConsumer, IDisposable
+    {
+        internal readonly int physicalSublogIdx;
+        readonly GarnetServerOptions serverOptions;
+        readonly RuntimeServerConfig runtimeConfig;
+        readonly GarnetAppendOnlyFile appendOnlyFile;
+        readonly ReplicationManager replicationManager;
+        readonly CancellationTokenSource cts;
+        readonly INetworkSender respSessionNetworkSender;
+        readonly ILogger logger;
+        TsavoriteLogScanSingleIterator replayIterator;
+
+        readonly ActiveWorkerMonitor activeWorkerMonitor;
+        internal readonly ReplayBatchContext replayBatchContext;
+        readonly ReplicaReplayTask[] replayTasks;
+        readonly TsavoriteLog physicalSublog;
+
+        /// <summary>
+        /// Centralized rendezvous barrier coordinating the replay leader (this driver) and its
+        /// <see cref="ReplicaReplayTask"/> workers. The leader is a participant, so the participant count
+        /// is the number of replay tasks plus one. Null when only a single replay task is used.
+        /// </summary>
+        internal readonly DoubleTurnstileBarrier barrier;
+
+        long pendingPulseSequenceNumber;
+        long appliedPulseSequenceNumber;
+        long stagedPulseSequenceNumber;
+        readonly int directVirtualSublogIdx;
+
+        internal long StagedPulseSequenceNumber => Volatile.Read(ref stagedPulseSequenceNumber);
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool ResumeReplay() => activeWorkerMonitor.TryEnter();
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void SuspendReplay() => _ = activeWorkerMonitor.Exit();
+
+        /// <summary>
+        /// Initializes a new instance of the ReplicaReplayDriver class, setting up replay tasks for a specific physical
+        /// sublog.
+        /// </summary>
+        /// <param name="physicalSublogIdx">The index of the physical sublog to be replayed.</param>
+        /// <param name="clusterProvider">The cluster provider containing server options and storage components.</param>
+        /// <param name="respSessionNetworkSender">The network sender used for response sessions.</param>
+        /// <param name="cts">The cancellation token source for managing task cancellation.</param>
+        /// <param name="logger">The logger instance for logging operations, or null to disable logging.</param>
+        public ReplicaReplayDriver(int physicalSublogIdx, ClusterProvider clusterProvider, INetworkSender respSessionNetworkSender, CancellationTokenSource cts, ILogger logger = null)
+        {
+            this.physicalSublogIdx = physicalSublogIdx;
+            this.respSessionNetworkSender = respSessionNetworkSender;
+            serverOptions = clusterProvider.serverOptions;
+            runtimeConfig = clusterProvider.storeWrapper.runtimeConfig;
+            appendOnlyFile = clusterProvider.storeWrapper.appendOnlyFile;
+            replicationManager = clusterProvider.replicationManager;
+            replayIterator = null;
+            activeWorkerMonitor = new();
+            physicalSublog = appendOnlyFile.Log.GetSubLog(physicalSublogIdx);
+            directVirtualSublogIdx = appendOnlyFile.GetVirtualSublogIdx(physicalSublogIdx, 0);
+            this.cts = cts;
+            this.logger = logger;
+
+            // Initialize background replay tasks for this sublog replay driver
+            var replayTaskCount = serverOptions.AofReplayTaskCount;
+            if (replayTaskCount > 1)
+            {
+                replayBatchContext = new ReplayBatchContext(replayTaskCount);
+                // Leader participates in the barrier alongside every replay task, hence + 1.
+                barrier = new DoubleTurnstileBarrier(replayTaskCount + 1);
+                replayTasks = [.. Enumerable.Range(0, replayTaskCount).Select(i => new ReplicaReplayTask(i, this, clusterProvider, cts, logger))];
+                foreach (var replayTask in replayTasks)
+                    _ = Task.Run(() => replayTask.FullPageBasedBackgroundReplayAsync());
+            }
+        }
+
+        public void Dispose()
+        {
+            activeWorkerMonitor.Dispose();
+            replayIterator?.Dispose();
+            respSessionNetworkSender?.Dispose();
+        }
+
+        #region IBulkLogEntryConsumer
+
+        /// <summary>
+        /// Main bulk consume implementation.
+        /// </summary>
+        /// <param name="record">Pointer to the log entry record to consume.</param>
+        /// <param name="recordLength">Length of the log entry record in bytes.</param>
+        /// <param name="currentAddress">Current address of the log entry in the log.</param>
+        /// <param name="nextAddress">Next address in the log after the current record.</param>
+        /// <param name="isProtected">Indicates whether the log entry is protected.</param>
+        /// <exception cref="GarnetException">Thrown if the background replay operation times out.</exception>
+        public unsafe void Consume(byte* record, int recordLength, long currentAddress, long nextAddress, bool isProtected)
+        {
+            if (serverOptions.AofReplayTaskCount == 1)
+            {
+                ConsumeDirect(record, recordLength, currentAddress, nextAddress, isProtected);
+            }
+            else
+            {
+                ConsumeSchedulePage(record, recordLength, currentAddress, nextAddress, isProtected);
+            }
+        }
+
+        private unsafe void ConsumeSchedulePage(byte* record, int recordLength, long currentAddress, long nextAddress, bool isProtected)
+        {
+            replayBatchContext.Record = record;
+            replayBatchContext.RecordLength = recordLength;
+            replayBatchContext.CurrentAddress = currentAddress;
+            replayBatchContext.NextAddress = nextAddress;
+            replayBatchContext.IsProtected = isProtected;
+
+            // Rendezvous 1 (ready): the page context above is published before the leader arrives, so
+            // once this returns every replay task has met at the barrier and may scan the page.
+            barrier.SignalWorkReadyWait(serverOptions.ReplicaSyncTimeout, cts.Token);
+
+            // Set replication offset currentAddress
+            replicationManager.SetSublogReplicationOffset(physicalSublogIdx, currentAddress);
+
+            // Rendezvous 2 (completed): block until every replay task has finished applying its partition
+            // of the page before advancing. The completion rendezvous guarantees no task is still reading
+            // the shared context when the leader recycles it for the next page.
+            barrier.SignalWorkCompletedWait(serverOptions.ReplicaSyncTimeout, cts.Token);
+
+            // Before updating replication offset, we must wait for any pending Vector Set ops to complete
+            replicationManager.AofProcessor.WaitForVectorOperationsToComplete();
+
+            // Advertise new replication offset after replay completes
+            replicationManager.SetSublogReplicationOffset(physicalSublogIdx, nextAddress);
+        }
+
+        /// <summary>
+        /// Processes record on a single replay task directly.
+        /// </summary>
+        /// <param name="record">Pointer to the start of the log record to process.</param>
+        /// <param name="recordLength">Length in bytes of the log record.</param>
+        /// <param name="currentAddress">Current address in the log for replication.</param>
+        /// <param name="nextAddress">Expected next address in the log after processing.</param>
+        /// <param name="isProtected">Indicates whether the operation should be performed in protected mode.</param>
+        /// <exception cref="GarnetException">Thrown if fast commit is not enabled when a fast commit request is received, or if log integrity validation
+        /// fails.</exception>
+        private unsafe void ConsumeDirect(byte* record, int recordLength, long currentAddress, long nextAddress, bool isProtected)
+        {
+            ValidateSublogIndex(physicalSublogIdx);
+            replicationManager.SetSublogReplicationOffset(physicalSublogIdx, currentAddress);
+            var replicationOffset = currentAddress;
+            // logger?.LogError("[{physicalSublogIdx}] = {currentAddress} -> {nextAddress}", physicalSublogIdx, currentAddress, nextAddress);
+
+            try
+            {
+                var ptr = record;
+                while (ptr < record + recordLength)
+                {
+                    cts.Token.ThrowIfCancellationRequested();
+                    var entryLength = appendOnlyFile.HeaderSize;
+                    var payloadLength = physicalSublog.UnsafeGetLength(ptr);
+                    if (payloadLength > 0)
+                    {
+                        var logAddressSequenceNumber = currentAddress + (ptr - record);
+                        replicationManager.AofProcessor.ProcessAofRecordInternal(physicalSublogIdx, ptr + entryLength, payloadLength, true, out var isCheckpointStart, logAddressSequenceNumber);
+                        // Encountered checkpoint start marker, log the ReplicationCheckpointStartOffset so we know the correct AOF truncation
+                        // point when we take a checkpoint at the checkpoint end marker
+                        if (isCheckpointStart)
+                        {
+                            // This is safe to be updated in parallel given that each sublog replay taks will update its own slot with corresponding address of the checkpoint marker
+                            replicationManager.ReplicationCheckpointStartOffset[physicalSublogIdx] = replicationOffset;
+                        }
+                        entryLength += TsavoriteLog.UnsafeAlign(payloadLength);
+                    }
+                    else if (payloadLength < 0)
+                    {
+                        TsavoriteLogRecoveryInfo info = new();
+                        info.Initialize(new ReadOnlySpan<byte>(ptr + entryLength, -payloadLength));
+                        physicalSublog.UnsafeCommitMetadataOnly(info, isProtected);
+                        entryLength += TsavoriteLog.UnsafeAlign(-payloadLength);
+                    }
+                    ptr += entryLength;
+                    replicationOffset += entryLength;
+                }
+                // logger?.LogError("[{physicalSublogIdx}] = {currentAddress} -> {nextAddress}", physicalSublogIdx, currentAddress, nextAddress);
+            }
+            catch
+            {
+                // If an exception occurrs, be sure to advance ReplicationOffset by the amount of successful work that transpired before the error
+                replicationManager.SetSublogReplicationOffset(physicalSublogIdx, replicationOffset);
+                throw;
+            }
+
+            // Before updating replication offset, we must wait for any pending Vector Set ops to complete
+            replicationManager.AofProcessor.WaitForVectorOperationsToComplete();
+
+            replicationManager.SetSublogReplicationOffset(physicalSublogIdx, replicationOffset);
+
+            if (replicationOffset != nextAddress)
+            {
+                logger?.LogError("ReplicaReplayTask.Consume NextAddress Mismatch sublogIdx: {sublogIdx}; recordLength:{recordLength}; currentAddress:{currentAddress}; nextAddress:{nextAddress}; replicationOffset:{ReplicationOffset}", physicalSublogIdx, recordLength, currentAddress, nextAddress, replicationManager.GetReplicationOffset(physicalSublogIdx));
+                throw new GarnetException("Failed validating integrity of replay", LogLevel.Warning, clientResponse: false);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void Throttle()
+            => TryApplyPendingPulse();
+        #endregion
+
+        public void SignalTimeAdvance(long sequenceNumber)
+        {
+            if (sequenceNumber <= Volatile.Read(ref pendingPulseSequenceNumber))
+                return;
+            Volatile.Write(ref pendingPulseSequenceNumber, sequenceNumber);
+
+            var sessionThreadOwnsReplay = serverOptions.AofReplayMaxLagBytes == 0 || replayIterator == null;
+            if (!sessionThreadOwnsReplay || !ResumeReplay())
+                return;
+
+            try
+            {
+                TryApplyPendingPulse();
+            }
+            finally
+            {
+                SuspendReplay();
+            }
+        }
+
+        void TryApplyPendingPulse()
+        {
+            var pending = Volatile.Read(ref pendingPulseSequenceNumber);
+            if (pending <= appliedPulseSequenceNumber)
+                return;
+            if (replicationManager.GetSublogReplicationOffset(physicalSublogIdx) != physicalSublog.TailAddress)
+                return;
+
+            ApplyPulse(pending);
+            appliedPulseSequenceNumber = pending;
+        }
+
+        unsafe void ApplyPulse(long sequenceNumber)
+        {
+            if (serverOptions.AofReplayTaskCount == 1)
+            {
+                appendOnlyFile.readConsistencyManager.AdvanceVirtualSublogTime(directVirtualSublogIdx, sequenceNumber);
+                return;
+            }
+
+            Volatile.Write(ref stagedPulseSequenceNumber, sequenceNumber);
+            try
+            {
+                replayBatchContext.Record = null;
+                replayBatchContext.RecordLength = 0;
+                replayBatchContext.CurrentAddress = 0;
+                replayBatchContext.NextAddress = 0;
+                replayBatchContext.IsProtected = false;
+                barrier.SignalWorkReadyWait(serverOptions.ReplicaSyncTimeout, cts.Token);
+                barrier.SignalWorkCompletedWait(serverOptions.ReplicaSyncTimeout, cts.Token);
+            }
+            finally
+            {
+                Volatile.Write(ref stagedPulseSequenceNumber, 0);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void ValidateSublogIndex(int physicalSublogIdx)
+        {
+            if (physicalSublogIdx != this.physicalSublogIdx)
+                throw new GarnetException($"PhysicalSublogIdx mismatch; expected:{this.physicalSublogIdx} - received:{physicalSublogIdx}");
+        }
+
+        /// <summary>
+        /// Method to create a background replay task that iterates and consume this replicas physical log
+        /// </summary>
+        /// <param name="startAddress"></param>
+        public void InitializeBackgroundReplayTask(long startAddress)
+        {
+            if (replayIterator == null)
+            {
+                replayIterator = appendOnlyFile.Log.ScanSingle(physicalSublogIdx, startAddress, long.MaxValue, scanUncommitted: true, recover: false, logger: logger);
+                _ = BackgroundReplayTaskAsync();
+            }
+
+            async Task BackgroundReplayTaskAsync()
+            {
+                // Force async
+                await Task.Yield();
+
+                var readLock = ResumeReplay();
+                try
+                {
+                    if (!readLock)
+                        throw new GarnetException("Failed to acquire replayLock");
+
+                    await replayIterator.BulkConsumeAllAsync(
+                        this,
+                        runtimeConfig.GetInt(ServerConfigType.REPLICA_SYNC_DELAY),
+                        maxChunkSize: 1 << 20,
+                        cts.Token).ConfigureAwait(false);
+                }
+                catch (Exception ex)
+                {
+                    logger?.LogWarning(ex, "An exception occurred at ReplicationManager.ReplicaReplayTask - terminating");
+                }
+                finally
+                {
+                    if (readLock)
+                        SuspendReplay();
+                }
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public void ThrottlePrimary()
+        {
+            while (runtimeConfig.GetInt(ServerConfigType.AOF_REPLAY_MAX_LAG_BYTES) is var maxLag && maxLag != -1 && replayIterator != null &&
+                appendOnlyFile.Log.GetTailAddress(physicalSublogIdx) - replicationManager.GetReplicationOffset(physicalSublogIdx) > maxLag)
+            {
+                cts.Token.ThrowIfCancellationRequested();
+                Thread.Yield();
+            }
+        }
+    }
+}

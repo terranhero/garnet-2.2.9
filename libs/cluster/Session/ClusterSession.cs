@@ -1,0 +1,288 @@
+﻿// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System.Runtime.CompilerServices;
+using System.Threading;
+using System.Threading.Tasks;
+using Garnet.common;
+using Garnet.networking;
+using Garnet.server;
+using Garnet.server.ACL;
+using Garnet.server.Auth;
+using Microsoft.Extensions.Logging;
+
+namespace Garnet.cluster
+{
+    internal sealed partial class ClusterSession : IClusterSession
+    {
+        readonly ClusterProvider clusterProvider;
+        readonly TransactionManager txnManager;
+        readonly GarnetSessionMetrics sessionMetrics;
+        BasicGarnetApi basicGarnetApi;
+        readonly INetworkSender networkSender;
+        readonly ILogger logger;
+        ClusterSlotVerificationInput csvi;
+
+        // Authenticator used to validate permissions for cluster commands
+        readonly IGarnetAuthenticator authenticator;
+
+        // User currently authenticated in this session
+        UserHandle userHandle;
+
+        SessionParseState parseState;
+        unsafe byte* dcurr, dend;
+        long localCurrentEpoch = 0;
+
+        public long LocalCurrentEpoch => Volatile.Read(ref localCurrentEpoch);
+
+        bool readOnlySession;
+        bool internalWriteSession;
+
+        public bool ReadOnlySession => readOnlySession;
+        public bool IsInternalWriteSession => internalWriteSession;
+
+        /// <inheritdoc/>
+        public bool IsWritePaused => clusterProvider.failoverManager.IsWritePaused;
+
+        /// <inheritdoc/>
+        public void WaitForWritesToResume()
+        {
+            // Internal replay must keep applying replication data so the replica can catch up and complete failover.
+            if (internalWriteSession || !IsWritePaused ||
+                clusterProvider.clusterManager.CurrentConfig.LocalNodeRole != NodeRole.PRIMARY)
+                return;
+
+            // Failover drains session epochs before releasing the pause.
+            ReleaseCurrentEpoch();
+            try
+            {
+                // Keep short pauses allocation-free; task blocking lets the pool compensate for longer waits.
+                var spinner = ConfiguredSpinWait.CpuLocal();
+                while (IsWritePaused)
+                {
+                    if (!spinner.TryWait())
+                        AsyncUtils.BlockingWait(clusterProvider.failoverManager.WaitForWritesToResumeAsync());
+                }
+            }
+            finally
+            {
+                AcquireCurrentEpoch();
+            }
+        }
+
+        public void SetReadOnlySession() => readOnlySession = true;
+        public void SetReadWriteSession() => readOnlySession = false;
+        public void SetInternalWriteSession() => internalWriteSession = true;
+
+        /// <inheritdoc/>
+        public bool IsReplicating { get; private set; }
+
+        /// <inheritdoc/>
+        public IGarnetServer Server { get; set; }
+
+        private StringBasicContext stringBasicContext;
+        private VectorBasicContext vectorBasicContext;
+
+        /// <summary>
+        /// Streaming state for receiving inbound RangeIndex migration data.
+        /// Unlike regular keys or VectorSet keys (which are each sent as a single record),
+        /// a RangeIndex BfTree snapshot can be large and is transmitted as a sequence of
+        /// chunked <c>SerializedRangeIndexStream</c> records
+        /// spread across multiple <c>CLUSTER MIGRATE</c> commands on this connection.
+        /// The sender serializes all chunks for one key sequentially before moving to the next,
+        /// so per-connection state is sufficient to reassemble them.
+        /// </summary>
+        private readonly RangeIndexMigrationReceiveState rangeIndexMigrationState;
+
+        public ClusterSession(ClusterProvider clusterProvider, TransactionManager txnManager, IGarnetAuthenticator authenticator, UserHandle userHandle, GarnetSessionMetrics sessionMetrics, BasicGarnetApi basicGarnetApi, StringBasicContext stringBasicContext, VectorBasicContext vectorBasicContext, INetworkSender networkSender, ILogger logger = null)
+        {
+            this.clusterProvider = clusterProvider;
+            this.authenticator = authenticator;
+            this.userHandle = userHandle;
+            this.txnManager = txnManager;
+            this.sessionMetrics = sessionMetrics;
+            this.basicGarnetApi = basicGarnetApi;
+            this.stringBasicContext = stringBasicContext;
+            this.vectorBasicContext = vectorBasicContext;
+            this.networkSender = networkSender;
+            this.logger = logger;
+
+            if (clusterProvider.serverOptions.EnableRangeIndexPreview)
+                rangeIndexMigrationState = new RangeIndexMigrationReceiveState(clusterProvider.storeWrapper.DefaultDatabase.RangeIndexManager, clusterProvider.storeWrapper.appendOnlyFile, logger);
+        }
+
+        public unsafe void ProcessClusterCommands(RespCommand command, VectorManager vectorManager, ref SessionParseState parseState, ref byte* dcurr, ref byte* dend)
+        {
+            this.dcurr = dcurr;
+            this.dend = dend;
+            this.parseState = parseState;
+            var invalidParameters = false;
+
+            try
+            {
+                if (command.IsClusterSubCommand())
+                {
+                    if (RespCommandsInfo.TryGetSimpleRespCommandInfo(command, out var cmdInfo) && cmdInfo.KeySpecs?.Length > 0)
+                    {
+                        csvi.keySpecs = cmdInfo.KeySpecs;
+                        csvi.isSubCommand = cmdInfo.IsSubCommand;
+                        csvi.readOnly = command.IsReadOnly();
+                        if (NetworkMultiKeySlotVerifyNoResponse(ref parseState, ref csvi, ref this.dcurr, ref this.dend))
+                            return;
+                    }
+
+                    ProcessClusterCommands(command, vectorManager, out invalidParameters);
+                }
+                else
+                {
+                    _ = command switch
+                    {
+                        RespCommand.MIGRATE => NetworkTryMIGRATE(out invalidParameters),
+                        RespCommand.FAILOVER => TryFAILOVER(),
+                        RespCommand.SECONDARYOF or RespCommand.REPLICAOF => NetworkTryREPLICAOF(out invalidParameters),
+                        _ => false
+                    };
+                }
+
+                if (invalidParameters)
+                {
+                    var cmdName = RespCommandsInfo.GetRespCommandName(command);
+                    var errorMessage = string.Format(CmdStrings.GenericErrWrongNumArgs, cmdName.ToLowerInvariant());
+                    while (!RespWriteUtils.TryWriteError(errorMessage, ref this.dcurr, this.dend))
+                        SendAndReset();
+                }
+            }
+            finally
+            {
+                dcurr = this.dcurr;
+                dend = this.dend;
+
+                // this.parseState is a copy of the caller's struct, so it holds its own reference to the
+                // session's pinned root buffer. Left populated it survives the owning session's shrink and
+                // keeps whatever the widest cluster command ever saw alive for the life of the connection.
+                this.parseState = default;
+            }
+        }
+
+        unsafe void SendAndReset()
+        {
+            byte* d = networkSender.GetResponseObjectHead();
+            if ((int)(dcurr - d) > 0)
+            {
+                Send(d);
+                networkSender.GetResponseObject();
+                dcurr = networkSender.GetResponseObjectHead();
+                dend = networkSender.GetResponseObjectTail();
+            }
+            else
+            {
+                // The buffer is already empty, so retrying the write cannot make progress and the
+                // caller's retry loop would spin forever. The message does not fit the response buffer.
+                GarnetException.Throw("Failed to write to response buffer", LogLevel.Critical);
+            }
+        }
+
+        unsafe void SendAndReset(ref byte* dcurr, ref byte* dend)
+        {
+            byte* d = networkSender.GetResponseObjectHead();
+            if ((int)(dcurr - d) > 0)
+            {
+                Send(d);
+                networkSender.GetResponseObject();
+                dcurr = networkSender.GetResponseObjectHead();
+                dend = networkSender.GetResponseObjectTail();
+            }
+            else
+            {
+                // See SendAndReset() above: an empty buffer means the retry loop cannot progress.
+                GarnetException.Throw("Failed to write to response buffer", LogLevel.Critical);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        unsafe void Send(byte* d)
+        {
+            // #if DEBUG
+            // logger?.LogTrace("SEND: [{send}]", Encoding.UTF8.GetString(new Span<byte>(d, (int)(dcurr - d))).Replace("\n", "|").Replace("\r", ""));
+            // #endif
+
+            if ((int)(dcurr - d) > 0)
+            {
+                // Debug.WriteLine("SEND: [" + Encoding.UTF8.GetString(new Span<byte>(d, (int)(dcurr - d))).Replace("\n", "|").Replace("\r", "!") + "]");
+                if (clusterProvider.storeWrapper.appendOnlyFile != null && clusterProvider.storeWrapper.serverOptions.WaitForCommit)
+                {
+                    var task = clusterProvider.storeWrapper.appendOnlyFile.Log.WaitForCommitAsync();
+                    if (!task.IsCompletedSuccessfully) AsyncUtils.BlockingWait(task);
+                }
+                int sendBytes = (int)(dcurr - d);
+                networkSender.SendResponse((int)(d - networkSender.GetResponseObjectHead()), sendBytes);
+                sessionMetrics?.incr_total_net_output_bytes((ulong)sendBytes);
+            }
+        }
+
+        /// <summary>
+        /// Updates the user currently authenticated in the session.
+        /// </summary>
+        /// <param name="userHandle"><see cref="UserHandle"/> to set as authenticated user.</param>
+        public void SetUserHandle(UserHandle userHandle)
+        {
+            this.userHandle = userHandle;
+        }
+        /// <summary>
+        /// Announces this session as active at a stable current Garnet epoch.
+        /// </summary>
+        public void AcquireCurrentEpoch()
+        {
+            while (true)
+            {
+                var epoch = clusterProvider.garnetEpoch.GetCurrentEpoch();
+                Interlocked.Exchange(ref localCurrentEpoch, epoch);
+                if (epoch == clusterProvider.garnetEpoch.GetCurrentEpoch())
+                    return;
+            }
+        }
+
+        /// <summary>
+        /// Announces this session as idle after all epoch-protected work is complete.
+        /// </summary>
+        public void ReleaseCurrentEpoch() => Volatile.Write(ref localCurrentEpoch, 0);
+
+        /// <summary>
+        /// Release epoch, wait for config transition and re-acquire the epoch
+        /// </summary>
+        public async ValueTask<bool> UnsafeBumpAndWaitForEpochTransitionAsync()
+        {
+            ReleaseCurrentEpoch();
+            var result = await clusterProvider.BumpAndWaitForEpochTransitionAsync().ConfigureAwait(false);
+            AcquireCurrentEpoch();
+            return result;
+        }
+
+        /// <summary>
+        /// NOTE: Unsafe! DO NOT USE, other than benchmarking
+        /// </summary>
+        /// <param name="replicaOf"></param>
+        public void UnsafeSetConfig(string replicaOf = null)
+        {
+            var config = clusterProvider.clusterManager.CurrentConfig;
+            config = config.MakeReplicaOf(replicaOf);
+            clusterProvider.clusterManager.UnsafeSetConfig(config);
+
+            if (replicaOf != null)
+                clusterProvider.replicationManager.ResetReplicaReplayDriverStore();
+        }
+
+        public void Dispose()
+        {
+            rangeIndexMigrationState?.Dispose();
+
+            // A record whose chunks were still arriving when the connection went away holds pooled buffers that no Reset
+            // will reach.
+            chunkedRecordReassembler?.Dispose();
+
+            // Call dispose on ref of this session if this session is a replication task
+            if (IsReplicating)
+                replicaReplayDriverStore?.Dispose();
+        }
+    }
+}

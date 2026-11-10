@@ -1,0 +1,670 @@
+﻿// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.IO;
+using System.Linq;
+using System.Net.Sockets;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Text;
+using System.Threading;
+using Garnet.cluster;
+using Garnet.common;
+using Garnet.networking;
+using Garnet.server;
+using Garnet.server.Auth.Settings;
+using Microsoft.Extensions.Logging;
+using Tsavorite.core;
+
+namespace Garnet
+{
+    /// <summary>
+    /// Implementation Garnet server
+    /// </summary>
+    public class GarnetServer : IDisposable
+    {
+        /// <summary>
+        /// Resp protocol version
+        /// </summary>
+        internal const string RedisProtocolVersion = "7.4.3";
+
+        static readonly string version = GetVersion();
+        static string GetVersion()
+        {
+            var Version = Assembly.GetExecutingAssembly().GetName().Version;
+            return $"{Version.Major}.{Version.Minor}.{Version.Build}";
+        }
+
+        internal GarnetProvider Provider;
+
+        private readonly GarnetServerOptions opts;
+        private IGarnetServer[] servers;
+        private SubscribeBroker subscribeBroker;
+        private INamedDeviceFactory logFactory;
+        private MemoryLogger initLogger;
+        private ILogger logger;
+        private readonly ILoggerFactory loggerFactory;
+        private readonly bool cleanupDir;
+        private bool disposeLoggerFactory;
+        protected readonly LightEpoch storeEpoch, pubSubEpoch;
+
+        /// <summary>
+        /// Store and associated information used by this Garnet server
+        /// </summary>
+        protected StoreWrapper storeWrapper;
+
+        /// <summary>
+        /// Metrics API
+        /// </summary>
+        public MetricsApi Metrics;
+
+        /// <summary>
+        /// Command registration API
+        /// </summary>
+        public RegisterApi Register;
+
+        /// <summary>
+        /// Store API
+        /// </summary>
+        public StoreApi Store;
+
+        /// <summary>
+        /// Create Garnet Server instance using specified command line arguments; use Start to start the server.
+        /// </summary>
+        /// <param name="commandLineArgs">Command line arguments</param>
+        /// <param name="loggerFactory">Logger factory</param>
+        /// <param name="cleanupDir">Clean up directory.</param>
+        /// <param name="authenticationSettingsOverride">Override for custom authentication settings.</param>
+        public GarnetServer(string[] commandLineArgs, ILoggerFactory loggerFactory = null, bool cleanupDir = false, IAuthenticationSettings authenticationSettingsOverride = null)
+        {
+            Trace.Listeners.Add(new ConsoleTraceListener());
+
+            // Set up an initial memory logger to log messages from configuration parser into memory.
+            using (var memLogProvider = new MemoryLoggerProvider())
+            {
+                this.initLogger = (MemoryLogger)memLogProvider.CreateLogger("ArgParser");
+            }
+
+            if (!ServerSettingsManager.TryParseCommandLineArguments(commandLineArgs, out var serverSettings, out _, out _, out var exitGracefully, logger: this.initLogger))
+            {
+                if (exitGracefully)
+                    Environment.Exit(0);
+
+                // Flush logs from memory logger
+                FlushMemoryLogger(this.initLogger, "ArgParser", loggerFactory);
+
+                throw new GarnetException("Encountered an error when initializing Garnet server. Please see log messages above for more details.");
+            }
+
+            if (loggerFactory == null)
+            {
+                // If the main logger factory is created by GarnetServer, it should be disposed when GarnetServer is disposed
+                disposeLoggerFactory = true;
+            }
+            else
+            {
+                this.initLogger.LogWarning(
+                    $"Received an external ILoggerFactory object. The following configuration options are ignored: {nameof(serverSettings.FileLogger)}, {nameof(serverSettings.LogLevel)}, {nameof(serverSettings.DisableConsoleLogger)}.");
+            }
+
+            // If no logger factory is given, set up main logger factory based on parsed configuration values,
+            // otherwise use given logger factory.
+            this.loggerFactory = loggerFactory ?? LoggerFactory.Create(builder =>
+            {
+                if (!serverSettings.DisableConsoleLogger.GetValueOrDefault())
+                {
+                    builder.AddSimpleConsole(options =>
+                    {
+                        options.SingleLine = true;
+                        options.TimestampFormat = "hh::mm::ss ";
+                    });
+                }
+
+                // Optional: Flush log output to file.
+                if (serverSettings.FileLogger != null)
+                    builder.AddFile(serverSettings.FileLogger);
+                builder.SetMinimumLevel(serverSettings.LogLevel);
+            });
+
+            // Assign values to GarnetServerOptions
+            this.opts = serverSettings.GetServerOptions(this.loggerFactory.CreateLogger("Options"));
+            this.opts.AuthSettings = authenticationSettingsOverride ?? this.opts.AuthSettings;
+            this.cleanupDir = cleanupDir;
+            this.storeEpoch = new LightEpoch();
+            if (!this.opts.DisablePubSub)
+                this.pubSubEpoch = new LightEpoch();
+            this.InitializeServer();
+        }
+
+        /// <summary>
+        /// Create Garnet Server instance using GarnetServerOptions instance; use Start to start the server.
+        /// </summary>
+        /// <param name="opts">Server options</param>
+        /// <param name="loggerFactory">Logger factory</param>
+        /// <param name="servers">The IGarnetServer to use. If none is provided, will use a GarnetServerTcp.</param>
+        /// <param name="cleanupDir">Whether to clean up data folders on dispose</param>
+        public GarnetServer(GarnetServerOptions opts, ILoggerFactory loggerFactory = null, IGarnetServer[] servers = null, bool cleanupDir = false)
+        {
+            this.servers = servers;
+            this.opts = opts;
+            this.loggerFactory = loggerFactory;
+            this.cleanupDir = cleanupDir;
+            this.storeEpoch = new LightEpoch();
+            if (!this.opts.DisablePubSub)
+                this.pubSubEpoch = new LightEpoch();
+            try
+            {
+                this.InitializeServer();
+            }
+            catch
+            {
+                storeEpoch?.Dispose();
+                pubSubEpoch?.Dispose();
+                throw;
+            }
+        }
+
+        private void InitializeServer()
+        {
+            Debug.Assert(opts != null);
+
+            if (!opts.QuietMode)
+            {
+                var red = "\u001b[31m";
+                var magenta = "\u001b[35m";
+                var normal = "\u001b[0m";
+
+                Console.WriteLine($"""
+                    {red}    _________
+                       /_||___||_\      {normal}Garnet {version} {(IntPtr.Size == 8 ? "64" : "32")} bit; {(opts.EnableCluster ? "cluster" : "standalone")} mode{red}
+                       '. \   / .'      {normal}Listening on: {(opts.EndPoints.Length > 1 ? opts.EndPoints[0] + $" and {opts.EndPoints.Length - 1} more" : opts.EndPoints[0])}{red}
+                         '.\ /.'        {magenta}https://aka.ms/GetGarnet{red}
+                           '.'
+                    {normal}
+                    """);
+            }
+
+            var clusterFactory = opts.EnableCluster ? new ClusterFactory() : null;
+
+            if (opts.ReplicaDisklessSync && opts.EnableRangeIndexPreview)
+                throw new GarnetException("Range Index (preview) is not supported in cluster diskless mode.");
+
+            this.logger = this.loggerFactory?.CreateLogger("GarnetServer");
+            logger?.LogInformation("Garnet {version} {bits} bit; {clusterMode} mode; Endpoint: [{endpoint}]",
+                version, IntPtr.Size == 8 ? "64" : "32",
+                opts.EnableCluster ? "cluster" : "standalone",
+                string.Join(',', opts.EndPoints.Select(endpoint => endpoint.ToString())));
+            logger?.LogInformation("Environment .NET {netVersion}; {osPlatform}; {processArch}", Environment.Version, Environment.OSVersion.Platform, RuntimeInformation.ProcessArchitecture);
+
+            // Install the native (off-managed-heap) allocator before any store or buffer pool is created.
+            NativeAllocatorInitializer.Initialize(opts.UseNativeAllocator, loggerFactory?.CreateLogger("NativeAllocator"));
+
+            // Select the managed SectorAlignedBufferPool backend before any pool is constructed (each pool captures
+            // this static once at construction). Default is the origin-return (per-thread) pool; the flag
+            // selects the per-level ConcurrentQueue pool instead.
+            SectorAlignedBufferPool.UseOriginReturn = !opts.UseLegacyBufferPool;
+
+            // Set the origin-return pool's managed byte budget before any pool is constructed (ignored in legacy mode).
+            // A budget of zero is an explicit opt-out of buffer caching: route it to the pool's Disabled short-circuit
+            // (honored by both backends) so every Get allocates and every Return drops, rather than paying for shard
+            // and bucket lookups plus a doomed permit reservation on each Get. A negative budget is only reachable by
+            // overflowing ParseSize (e.g. "16000000p"), so it is a misconfiguration rather than an intent; reject it.
+            if (!string.IsNullOrEmpty(opts.BufferPoolMemoryBudget))
+            {
+                var bufferPoolBudgetBytes = opts.GetBufferPoolMemoryBudgetBytes();
+                if (bufferPoolBudgetBytes > 0)
+                    SectorAlignedBufferPool.ManagedBudgetBytes = bufferPoolBudgetBytes;
+                else if (bufferPoolBudgetBytes == 0)
+                {
+                    SectorAlignedBufferPool.Disabled = true;
+                    logger?.LogInformation("Buffer pool caching disabled by --buffer-pool-memory-budget '{budget}': every IO buffer is allocated on demand and freed on return.",
+                        opts.BufferPoolMemoryBudget);
+                }
+                else
+                    logger?.LogWarning("Ignoring --buffer-pool-memory-budget '{budget}': value is out of range. Using {default} bytes.",
+                        opts.BufferPoolMemoryBudget, SectorAlignedBufferPool.ManagedBudgetBytes);
+            }
+
+            // Flush initialization logs from memory logger
+            FlushMemoryLogger(this.initLogger, "ArgParser", this.loggerFactory);
+
+            var customCommandManager = new CustomCommandManager();
+
+            ThreadPool.GetMinThreads(out var minThreads, out var minCPThreads);
+            ThreadPool.GetMaxThreads(out var maxThreads, out var maxCPThreads);
+
+            bool minChanged = false, maxChanged = false;
+            if (opts.ThreadPoolMinThreads > 0)
+            {
+                minThreads = opts.ThreadPoolMinThreads;
+                minChanged = true;
+            }
+            if (opts.ThreadPoolMinIOCompletionThreads > 0)
+            {
+                minCPThreads = opts.ThreadPoolMinIOCompletionThreads;
+                minChanged = true;
+            }
+            if (opts.ThreadPoolMaxThreads > 0)
+            {
+                maxThreads = opts.ThreadPoolMaxThreads;
+                maxChanged = true;
+            }
+            if (opts.ThreadPoolMaxIOCompletionThreads > 0)
+            {
+                maxCPThreads = opts.ThreadPoolMaxIOCompletionThreads;
+                maxChanged = true;
+            }
+
+            // First try to set the max threads
+            var setMax = !maxChanged || ThreadPool.SetMaxThreads(maxThreads, maxCPThreads);
+
+            // Set the min threads
+            if (minChanged && !ThreadPool.SetMinThreads(minThreads, minCPThreads))
+                throw new Exception($"Unable to call ThreadPool.SetMinThreads with {minThreads}, {minCPThreads}");
+
+            // Retry to set max threads if it wasn't set in the earlier step
+            if (!setMax && !ThreadPool.SetMaxThreads(maxThreads, maxCPThreads))
+                throw new Exception($"Unable to call ThreadPool.SetMaxThreads with {maxThreads}, {maxCPThreads}");
+
+            opts.Initialize(loggerFactory);
+            StoreWrapper.DatabaseCreatorDelegate createDatabaseDelegate = (int dbId) =>
+                CreateDatabase(dbId, opts, clusterFactory, customCommandManager);
+
+            if (!opts.DisablePubSub)
+                subscribeBroker = new SubscribeBroker(null, opts.PubSubPageSizeBytes(), pubSubEpoch, startFresh: true, logger);
+
+            logger?.LogTrace("TLS is {tlsEnabled}", opts.TlsOptions == null ? "disabled" : "enabled");
+
+            // Create Garnet TCP server if none was provided.
+            if (servers == null)
+            {
+                servers = new IGarnetServer[opts.EndPoints.Length];
+                // One budget and one settings instance shared by every listener, so the ceiling is
+                // process-wide rather than per-endpoint.
+                var networkBufferSettings = opts.GetNetworkBufferSettings();
+                var networkBufferBudget = opts.GetNetworkBufferBudget();
+                var connectionLimit = new ConnectionLimit(opts.NetworkConnectionLimit);
+                for (var i = 0; i < servers.Length; i++)
+                {
+                    if (opts.EndPoints[i] is UnixDomainSocketEndPoint)
+                    {
+                        ArgumentException.ThrowIfNullOrWhiteSpace(opts.UnixSocketPath, nameof(opts.UnixSocketPath));
+
+                        // Delete existing unix socket file, if it exists.
+                        File.Delete(opts.UnixSocketPath);
+                    }
+                    servers[i] = new GarnetServerTcp(opts.EndPoints[i], 0, opts.TlsOptions, opts.NetworkSendThrottleMax, connectionLimit, opts.UnixSocketPath, opts.UnixSocketPermission,
+                        networkBufferSettings, opts.GetNetworkBufferPoolSize(), networkBufferBudget, logger,
+                        networkSendTimeout: opts.NetworkSendTimeout, tlsHandshakeTimeout: opts.TlsHandshakeTimeout);
+                }
+            }
+
+            storeWrapper = new StoreWrapper(version, RedisProtocolVersion, servers, customCommandManager, opts, subscribeBroker,
+                createDatabaseDelegate: createDatabaseDelegate,
+                clusterFactory: clusterFactory,
+                loggerFactory: loggerFactory);
+
+            if (logger != null)
+            {
+                // Tracker targets include both log pages and heap objects. Without a tracker, use the page-count cap.
+                var mainLogMemoryLimit = storeWrapper.store.Log.LogSizeTracker?.TargetSize ?? storeWrapper.store.Log.MaxMemorySizeBytes;
+                var readCacheMemoryLimit = storeWrapper.store.ReadCache?.LogSizeTracker?.TargetSize ?? storeWrapper.store.ReadCache?.MaxMemorySizeBytes ?? 0;
+                var indexMemoryLimit = opts.IndexMemoryBudgetBytes;
+                var configMemoryLimit = indexMemoryLimit +
+                                        mainLogMemoryLimit +
+                                        readCacheMemoryLimit +
+                                        (storeWrapper.appendOnlyFile?.Log.MaxMemorySizeBytes.AggregateDiff(0) ?? 0);
+                logger.LogInformation("Total configured memory limit: {configMemoryLimit}", configMemoryLimit);
+                logger.LogInformation("Hash index holds one entry per distinct key, including keys whose records are on disk, at ~{bytesPerKey} bytes per key;"
+                    + " the configured index budget of {indexMemoryLimit} bytes covers ~{keyCapacity} keys, beyond which index memory is taken from the log budget",
+                    64.0 / 7, indexMemoryLimit, Math.Max(storeWrapper.store.IndexSize, opts.AdjustedIndexMaxCacheLines) * 7);
+            }
+
+            var maxDatabases = opts.EnableCluster ? 1 : opts.MaxDatabases;
+            logger?.LogInformation("Max number of logical databases allowed on server: {maxDatabases}", maxDatabases);
+
+            if (opts.ExtensionBinPaths?.Length > 0)
+            {
+                logger?.LogTrace("Allowed binary paths for extension loading: {binPaths}", string.Join(",", opts.ExtensionBinPaths));
+                logger?.LogTrace("Unsigned extension libraries {unsignedAllowed}allowed.", opts.ExtensionAllowUnsignedAssemblies ? string.Empty : "not ");
+            }
+
+            // Create session provider for Garnet
+            Provider = new GarnetProvider(storeWrapper, subscribeBroker);
+
+            // Create user facing API endpoints
+            Metrics = new MetricsApi(Provider);
+            Register = new RegisterApi(Provider);
+            Store = new StoreApi(storeWrapper);
+
+            for (var i = 0; i < servers.Length; i++)
+                servers[i].Register(WireFormat.ASCII, Provider);
+
+            LoadModules(customCommandManager);
+
+            // ACL rules are parsed before modules load, so per-name custom-command entries land
+            // on users unresolved. Sweep them now against the registered modules.
+            ValidateCustomCommandACLs(customCommandManager);
+        }
+
+        private void ValidateCustomCommandACLs(CustomCommandManager customCommandManager)
+        {
+            if (opts.AuthSettings is not AclAuthenticationSettings)
+            {
+                return;
+            }
+
+            var acl = storeWrapper.accessControlList;
+            if (acl == null)
+            {
+                return;
+            }
+
+            var unresolved = new List<(string user, string name)>();
+            foreach (var kv in acl.GetUserHandles())
+            {
+                var u = kv.Value.User;
+                foreach (var name in u.CustomCommandsAllowed)
+                {
+                    if (!customCommandManager.IsCustomCommandRegistered(name))
+                    {
+                        unresolved.Add((kv.Key, name));
+                    }
+                }
+                foreach (var name in u.CustomCommandsDenied)
+                {
+                    if (!customCommandManager.IsCustomCommandRegistered(name))
+                    {
+                        unresolved.Add((kv.Key, name));
+                    }
+                }
+            }
+
+            if (unresolved.Count == 0)
+            {
+                return;
+            }
+
+            foreach (var (user, name) in unresolved)
+            {
+                logger?.LogWarning("ACL rule references custom command '{name}' for user '{user}' which is not registered with any loaded module", name, user);
+            }
+
+            if (opts.AclStrictCustomCommands)
+            {
+                // Strict mode: fail closed so operators can't accidentally ship an ACL with typos
+                // that would silently match no command (and therefore deny by default at dispatch).
+                var entries = string.Join(", ", unresolved.Select(t => $"({t.user},{t.name})"));
+                throw new GarnetException($"ACL strict mode: {unresolved.Count} unresolved (user, custom-command) entries in ACL rules: {entries}. Disable acl-strict-custom-commands or load the appropriate module(s).");
+            }
+        }
+
+        private GarnetDatabase CreateDatabase(int dbId, GarnetServerOptions serverOptions, ClusterFactory clusterFactory,
+            CustomCommandManager customCommandManager)
+        {
+            var removeOutdated = !serverOptions.EnableCluster;
+            // Two-roots layout for RangeIndex files:
+            //  riLogRoot — log-tied (working file + per-flush snapshots), co-located with hlog.
+            //              Falls back through LogDir → CheckpointDir → cwd, mirroring Tsavorite's
+            //              CheckpointBaseDirectory chain so RangeIndex works without storage tier.
+            //  cprDir    — checkpoint-tied (per-token snapshots live under <token>/rangeindex/),
+            //              alongside Tsavorite's cpr-checkpoints/<token>/info.dat etc.
+            // Construct the manager only when the feature is enabled. When disabled, the
+            // store wrapper / triggers / functions hold a null reference, and Tsavorite's
+            // record-trigger gates (CallOnFlush etc.) return false → zero per-op overhead.
+            RangeIndexManager rangeIndexManager = null;
+            if (serverOptions.EnableRangeIndexPreview)
+            {
+                var logRootBase = serverOptions.LogDir
+                                  ?? serverOptions.CheckpointDir
+                                  ?? Directory.GetCurrentDirectory();
+                var riLogRoot = Path.Combine(logRootBase ?? string.Empty, "Store", "rangeindex");
+                var cprDir = Path.Combine(serverOptions.GetStoreCheckpointDirectory(dbId), "cpr-checkpoints");
+
+                rangeIndexManager = new RangeIndexManager(
+                    riLogRoot: riLogRoot, cprDir: cprDir,
+                    storeEpoch: storeEpoch,
+                    logger: loggerFactory?.CreateLogger("RangeIndexManager"));
+            }
+            var vectorManager = new VectorManager(
+                dbId,
+                serverOptions,
+                () => Provider.GetSession(WireFormat.ASCII, null),
+                loggerFactory
+            );
+            var store = CreateStore(dbId, clusterFactory, customCommandManager, storeEpoch, rangeIndexManager, vectorManager, out var stateMachineDriver, out var sizeTracker, out var kvSettings);
+            var aof = CreateAOF(dbId);
+
+            return new GarnetDatabase(dbId, store, kvSettings, storeEpoch, stateMachineDriver, sizeTracker, aof, serverOptions.AdjustedIndexMaxCacheLines == 0, vectorManager, rangeIndexManager);
+        }
+
+        private void LoadModules(CustomCommandManager customCommandManager)
+        {
+            if (opts.LoadModuleCS == null)
+                return;
+
+            foreach (var moduleCS in opts.LoadModuleCS)
+            {
+                if (!ModuleUtils.TryParseModuleSpec(moduleCS, out var modulePath, out var moduleArgs))
+                {
+                    if (!string.IsNullOrWhiteSpace(moduleCS))
+                        logger?.LogError("Invalid module specification: {0}", moduleCS);
+                    continue;
+                }
+
+                if (!ModuleUtils.LoadAssemblies([modulePath], null, opts.ExtensionAllowUnsignedAssemblies,
+                        out var loadedAssemblies, out var errorMsg, ignorePathCheckWhenUndefined: true))
+                {
+                    logger?.LogError("Module {0} failed to load with error {1}", modulePath, Encoding.UTF8.GetString(errorMsg));
+                    continue;
+                }
+
+                var assembliesList = loadedAssemblies.ToList();
+                if (assembliesList.Count == 0)
+                {
+                    logger?.LogError("Module {0} failed to load: no assembly was found at the specified path.", modulePath);
+                    continue;
+                }
+
+                if (!ModuleRegistrar.Instance.LoadModule(customCommandManager, assembliesList[0], moduleArgs, logger, out errorMsg))
+                {
+                    logger?.LogError("Module {0} failed to load with error {1}", modulePath, Encoding.UTF8.GetString(errorMsg));
+                }
+            }
+        }
+
+        private TsavoriteKV<StoreFunctions, StoreAllocator> CreateStore(int dbId, IClusterFactory clusterFactory, CustomCommandManager customCommandManager,
+            LightEpoch epoch, RangeIndexManager rangeIndexManager, VectorManager vectorManager, out StateMachineDriver stateMachineDriver, out CacheSizeTracker sizeTracker, out KVSettings kvSettings)
+        {
+            sizeTracker = null;
+
+            stateMachineDriver = new StateMachineDriver(epoch, loggerFactory?.CreateLogger($"StateMachineDriver"));
+
+            kvSettings = opts.GetSettings(loggerFactory, epoch, stateMachineDriver, out logFactory);
+
+            // Run checkpoint on its own thread to control p99
+            kvSettings.ThrottleCheckpointFlushDelayMs = opts.CheckpointThrottleFlushDelayMs;
+
+            var baseName = opts.GetStoreCheckpointDirectory(dbId);
+            var defaultNamingScheme = new DefaultCheckpointNamingScheme(baseName);
+
+            kvSettings.CheckpointManager = opts.EnableCluster ?
+                clusterFactory.CreateCheckpointManager(opts.AofPhysicalSublogCount, opts.DeviceFactoryCreator, defaultNamingScheme, isMainStore: true, logger) :
+                new GarnetCheckpointManager(opts.AofPhysicalSublogCount, opts.DeviceFactoryCreator, defaultNamingScheme, removeOutdated: true);
+
+            // Create cache size tracker before the store. It will be initialized with the store
+            // after creation via Initialize() (late-bind to break circular dependency).
+            var cacheSizeTracker = new CacheSizeTracker();
+
+            var store = new TsavoriteKV<StoreFunctions, StoreAllocator>(kvSettings
+                , Tsavorite.core.StoreFunctions.Create(new GarnetKeyComparer(),
+                    () => new GarnetObjectSerializer(customCommandManager),
+                    new GarnetRecordTriggers(cacheSizeTracker, rangeIndexManager, vectorManager))
+                , (allocatorSettings, storeFunctions) => new(allocatorSettings, storeFunctions));
+
+            // The budget includes the store's overflow-bucket floor, which depends on the sector size of the store's devices.
+            opts.SetIndexMemoryBudget(kvSettings, store.IndexOverflowFloorSizeBytes);
+
+            if (kvSettings.LogMemorySize > 0 || kvSettings.ReadCacheMemorySize > 0)
+            {
+                cacheSizeTracker.Initialize(store, kvSettings.LogMemorySize, kvSettings.ReadCacheMemorySize, this.loggerFactory, opts.IndexMemoryBudgetBytes);
+                sizeTracker = cacheSizeTracker;
+            }
+            return store;
+        }
+
+        private GarnetAppendOnlyFile CreateAOF(int dbId)
+        {
+            if (!opts.EnableAOF)
+            {
+                if (opts.CommitFrequencyMs != 0 || opts.WaitForCommit)
+                    throw new Exception("Cannot use CommitFrequencyMs or CommitWait without EnableAOF");
+                return null;
+            }
+
+            if (opts.FastAofTruncate && opts.CommitFrequencyMs != -1)
+                throw new Exception("Need to set CommitFrequencyMs to -1 (manual commits) with FastAofTruncate");
+
+            opts.GetAofSettings(dbId, out var aofSettings);
+            var appendOnlyFile = new GarnetAppendOnlyFile(opts, aofSettings, logger: this.loggerFactory?.CreateLogger("GarnetLog [aof]"));
+
+            if (opts.CommitFrequencyMs < 0 && opts.WaitForCommit)
+                throw new Exception("Cannot use CommitWait with manual commits");
+            return appendOnlyFile;
+        }
+
+        /// <summary>
+        /// Start server instance
+        /// </summary>
+        public void Start()
+        {
+#pragma warning disable VSTHRD002 // Server startup is synchronous and must complete recovery before accepting connections.
+            Provider.RecoverAsync().AsTask().GetAwaiter().GetResult();
+#pragma warning restore VSTHRD002
+            for (var i = 0; i < servers.Length; i++)
+                servers[i].Start();
+            Provider.Start();
+            if (!opts.QuietMode)
+                Console.WriteLine("* Ready to accept connections");
+        }
+
+        /// <summary>
+        /// Dispose store (including log and checkpoint directory)
+        /// </summary>
+        public void Dispose()
+        {
+            Dispose(cleanupDir);
+        }
+
+        /// <summary>
+        /// Dispose, optionally deleting logs and checkpoints
+        /// </summary>
+        /// <param name="deleteDir">Whether to delete logs and checkpoints</param>
+        public void Dispose(bool deleteDir = true)
+        {
+            InternalDispose();
+            if (deleteDir)
+            {
+                logFactory?.Delete(new FileDescriptor { directoryName = "" });
+                if (opts.CheckpointDir != opts.LogDir && !string.IsNullOrEmpty(opts.CheckpointDir))
+                {
+                    var checkpointDeviceFactory = opts.DeviceFactoryCreator.Create(opts.CheckpointDir);
+                    checkpointDeviceFactory.Delete(new FileDescriptor { directoryName = "" });
+                }
+            }
+        }
+
+        private void InternalDispose()
+        {
+            // A thread parked in a test injection point holds a pooled network buffer, and the drain below
+            // waits for every such buffer to come back. Suspending covers both waiters already parked and
+            // requests that reach an injection point while this runs, so shutdown cannot be blocked by an
+            // injection point whose owner is already gone. Compiled out in Release.
+            ExceptionInjectionHelper.SuspendParking();
+            try
+            {
+                // Phase 1: Stop listening on all servers to free ports immediately.
+                for (var i = 0; i < servers.Length; i++)
+                    servers[i]?.Close();
+
+                // Phase 2: Drain active handlers and clean up remaining resources.
+                for (var i = 0; i < servers.Length; i++)
+                    servers[i]?.Dispose();
+
+                // Phase 3: Dispose the provider (storage engine shutdown — may take time).
+                Provider?.Dispose();
+
+                subscribeBroker?.Dispose();
+                storeEpoch?.Dispose();
+                pubSubEpoch?.Dispose();
+                opts.AuthSettings?.Dispose();
+                if (disposeLoggerFactory)
+                    loggerFactory?.Dispose();
+            }
+            finally
+            {
+                ExceptionInjectionHelper.ResumeParking();
+            }
+        }
+
+        private static void DeleteDirectory(string path)
+        {
+            if (path == null) return;
+
+            // Exceptions may happen due to a handle briefly remaining held after Dispose().
+            try
+            {
+                foreach (string directory in Directory.GetDirectories(path))
+                    DeleteDirectory(directory);
+                Directory.Delete(path, true);
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException)
+            {
+                try
+                {
+                    Directory.Delete(path, true);
+                }
+                catch { }
+            }
+        }
+
+        /// <summary>
+        /// Flushes MemoryLogger entries into a destination logger.
+        /// Destination logger is either created from ILoggerFactory parameter or from a default console logger.
+        /// </summary>
+        /// <param name="memoryLogger">The memory logger</param>
+        /// <param name="categoryName">The category name of the destination logger</param>
+        /// <param name="dstLoggerFactory">Optional logger factory for creating the destination logger</param>
+        private static void FlushMemoryLogger(MemoryLogger memoryLogger, string categoryName, ILoggerFactory dstLoggerFactory = null)
+        {
+            if (memoryLogger == null) return;
+
+            // If no logger factory supplied, create a default console logger
+            var disposeDstLoggerFactory = false;
+            if (dstLoggerFactory == null)
+            {
+                dstLoggerFactory = LoggerFactory.Create(builder => builder.AddSimpleConsole(options =>
+                {
+                    options.SingleLine = true;
+                    options.TimestampFormat = "hh::mm::ss ";
+                }).SetMinimumLevel(LogLevel.Information));
+                disposeDstLoggerFactory = true;
+            }
+
+            // Create the destination logger
+            var dstLogger = dstLoggerFactory.CreateLogger(categoryName);
+
+            // Flush all entries from the memory logger into the destination logger
+            memoryLogger.FlushLogger(dstLogger);
+
+            // If a default console logger factory was created, it is no longer needed
+            if (disposeDstLoggerFactory)
+            {
+                dstLoggerFactory.Dispose();
+            }
+        }
+    }
+}

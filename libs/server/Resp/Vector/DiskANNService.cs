@@ -1,0 +1,744 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Diagnostics;
+using System.Runtime.CompilerServices;
+using System.Runtime.InteropServices;
+using Tsavorite.core;
+
+namespace Garnet.server
+{
+    internal sealed unsafe class DiskANNService
+    {
+        internal enum InsertResult
+        {
+            SuccessInsert,
+            SuccessUpdate,
+            Fail,
+        }
+
+        // Term types.
+        internal const byte FullVector = 0;
+        internal const byte NeighborList = 1;
+        internal const byte QuantizedVector = 2;
+        internal const byte Attributes = 3;
+        internal const byte Metadata = 4;
+        internal const byte InternalIdMap = 5;
+        internal const byte ExternalIdMap = 6;
+
+        /// <summary>
+        /// Redis allows a gigantic EF, but we map this to DiskANN's l_build where such huge values are counter-production.
+        /// 
+        /// We still accept the large EF values for Redis compatibility, but we cap them at an "excessively high" 8K to avoid
+        /// degenerate behavior around allocations and insert performance.
+        /// </summary>
+        private const uint MaxEffectiveBuildExplorationFactor = 8_192;
+
+        /// <summary>
+        /// Similar to <see cref="MaxEffectiveBuildExplorationFactor"/>, Redis allows a quite large M that we map to DiskANN's num_links where such large values are counter-productive.
+        /// 
+        /// We still accept the large M values for compatibility, but we cap to 512 to avoid degenerate behavior.
+        /// </summary>
+        private const uint MaxEffectiveNumLinks = 512;
+
+#if DEBUG
+        /// <summary>
+        /// For testing purposes, in DEBUG builds the count of calls to <see cref="CreateIndex"/> or <see cref="RecreateIndex"/> on this instance.
+        /// </summary>
+        internal int CreateIndexCalls;
+
+        /// <summary>
+        /// For testing purposes, in DEBUG builds the count of calls to <see cref="DropIndex"/> on this instance.
+        /// </summary>
+        internal int DropIndexCalls;
+#endif
+
+        public nint CreateIndex(
+            ulong context,
+            uint dimensions,
+            uint reduceDims,
+            VectorQuantType quantType,
+            uint buildExplorationFactor,
+            uint numLinks,
+            VectorDistanceMetricType distanceMetric,
+            delegate* unmanaged[Cdecl]<ulong, uint, uint, nint, nuint, nint, nint, void> readCallback,
+            delegate* unmanaged[Cdecl]<ulong, nint, nuint, nint, nuint, byte> writeCallback,
+            delegate* unmanaged[Cdecl]<ulong, nint, nuint, byte> deleteCallback,
+            delegate* unmanaged[Cdecl]<ulong, nint, nuint, nuint, nint, nint, byte> readModifyWriteCallback,
+            delegate* unmanaged[Cdecl]<ulong, nint, nuint, byte> filterCallback,
+            delegate* unmanaged[Cdecl]<ulong, nint, nuint, void> logCallback,
+            uint startPointId,
+            out bool quantizationRequested
+        )
+        {
+#if DEBUG
+            System.Threading.Interlocked.Increment(ref CreateIndexCalls);
+#endif
+            unsafe
+            {
+                buildExplorationFactor = Math.Min(buildExplorationFactor, MaxEffectiveBuildExplorationFactor);
+                numLinks = Math.Min(numLinks, MaxEffectiveNumLinks);
+
+                var ret = NativeDiskANNMethods.create_index(context, dimensions, reduceDims, quantType, distanceMetric, buildExplorationFactor, numLinks, startPointId, (nint)readCallback, (nint)writeCallback, (nint)deleteCallback, (nint)readModifyWriteCallback, (nint)filterCallback, (nint)logCallback, out quantizationRequested);
+
+                Debug.Assert(ret != 0, "create_index failed, returning a null pointer - this shouldn't be possible");
+
+                return ret;
+            }
+        }
+
+        public nint RecreateIndex(
+            ulong context,
+            uint dimensions,
+            uint reduceDims,
+            VectorQuantType quantType,
+            uint buildExplorationFactor,
+            uint numLinks,
+            VectorDistanceMetricType distanceMetricType,
+            delegate* unmanaged[Cdecl]<ulong, uint, uint, nint, nuint, nint, nint, void> readCallback,
+            delegate* unmanaged[Cdecl]<ulong, nint, nuint, nint, nuint, byte> writeCallback,
+            delegate* unmanaged[Cdecl]<ulong, nint, nuint, byte> deleteCallback,
+            delegate* unmanaged[Cdecl]<ulong, nint, nuint, nuint, nint, nint, byte> readModifyWriteCallback,
+            delegate* unmanaged[Cdecl]<ulong, nint, nuint, byte> filterCallback,
+            delegate* unmanaged[Cdecl]<ulong, nint, nuint, void> logCallback,
+            uint startPointId,
+            out bool quantizationRequested
+        )
+        => CreateIndex(context, dimensions, reduceDims, quantType, buildExplorationFactor, numLinks, distanceMetricType, readCallback, writeCallback, deleteCallback, readModifyWriteCallback, filterCallback, logCallback, startPointId, out quantizationRequested);
+
+        public void DropIndex(ulong context, nint index)
+        {
+#if DEBUG
+            System.Threading.Interlocked.Increment(ref DropIndexCalls);
+#endif
+
+            NativeDiskANNMethods.drop_index(context, index);
+        }
+
+        public bool SetQuantState(ulong context, nint index, ReadOnlySpan<byte> state)
+        {
+            fixed (byte* stateData = state)
+            {
+                return NativeDiskANNMethods.set_quant_state(context, index, (nint)stateData, (nuint)state.Length) == 1;
+            }
+        }
+
+        /// <summary>
+        /// Returns whether import is enabled in the index.
+        /// </summary>
+        /// <param name="context">Vector set context.</param>
+        /// <param name="index">Native index handle.</param>
+        public bool CanImport(ulong context, nint index)
+            => NativeDiskANNMethods.can_import(context, index) == 1;
+
+        public bool ImportTerm(ulong context, nint index, uint termType, ReadOnlySpan<byte> id, ReadOnlySpan<byte> value)
+        {
+            fixed (byte* idData = id)
+            fixed (byte* valueData = value)
+            {
+                return NativeDiskANNMethods.import_term(context, index, termType, (nint)idData, (nuint)id.Length, (nint)valueData, (nuint)value.Length) == 1;
+            }
+        }
+
+        /// <summary>
+        /// Verifies one import partition and finalizes the index when all partitions succeed.
+        /// </summary>
+        /// <param name="context">Vector set context.</param>
+        /// <param name="index">Native index handle.</param>
+        /// <param name="taskIndex">Zero-based partition index.</param>
+        /// <param name="taskCount">Total number of partitions.</param>
+        /// <returns>Success or failure</returns>
+        public bool VerifyImport(ulong context, nint index, int taskIndex, int taskCount)
+        {
+            return NativeDiskANNMethods.verify_import(context, index, (nuint)taskIndex, (nuint)taskCount) == 1;
+        }
+
+        /// <summary>
+        /// Completes importing an index, allowing it to be used for normal operations.
+        /// </summary>
+        /// <param name="context">Vector set context.</param>
+        /// <param name="index">Native index handle.</param>
+        /// <returns>Success or failure</returns>
+        public bool FinishImport(ulong context, nint index)
+        {
+            return NativeDiskANNMethods.finish_import(context, index) == 1;
+        }
+
+        public InsertResult Insert(ulong context, nint index, ReadOnlySpan<byte> id, ReadOnlySpan<byte> vector, int vectorElementCount, ReadOnlySpan<byte> attributes, out bool needsQuantization)
+        {
+            var id_data = Unsafe.AsPointer(ref MemoryMarshal.GetReference(id));
+            var id_len = id.Length;
+
+            var vector_data = Unsafe.AsPointer(ref MemoryMarshal.GetReference(vector));
+
+            var attributes_data = Unsafe.AsPointer(ref MemoryMarshal.GetReference(attributes));
+            var attributes_len = attributes.Length;
+
+            var res = NativeDiskANNMethods.insert(context, index, (nint)id_data, (nuint)id_len, (nint)vector_data, (nuint)vectorElementCount, (nint)attributes_data, (nuint)attributes_len);
+            if (res == NativeDiskANNMethods.DiskANNInsertResult.Fail)
+            {
+                needsQuantization = false;
+                return InsertResult.Fail;
+            }
+            else if (res == NativeDiskANNMethods.DiskANNInsertResult.SuccessInsert)
+            {
+                needsQuantization = false;
+                return InsertResult.SuccessInsert;
+            }
+            else if (res == NativeDiskANNMethods.DiskANNInsertResult.SuccessUpdate)
+            {
+                needsQuantization = false;
+                return InsertResult.SuccessUpdate;
+            }
+            else
+            {
+                Debug.Assert(res == NativeDiskANNMethods.DiskANNInsertResult.SuccessStartTraining, "Unexpected DiskANNInsertResult");
+
+                needsQuantization = true;
+                return InsertResult.SuccessInsert;
+            }
+        }
+
+        public bool BuildQuantizationTable(ulong context, nint index)
+        {
+            return NativeDiskANNMethods.build_quant_table(context, index) == 1;
+        }
+
+        public bool BackfillQuantizedVectors(ulong context, nint index, int taskIndex, int taskCount)
+        => NativeDiskANNMethods.backfill_quant_vectors(context, index, (nuint)taskIndex, (nuint)taskCount) == 1;
+
+        public bool Remove(ulong context, nint index, ReadOnlySpan<byte> id)
+        {
+            var id_data = Unsafe.AsPointer(ref MemoryMarshal.GetReference(id));
+            var id_len = id.Length;
+
+            return NativeDiskANNMethods.remove(context, index, (nint)id_data, (nuint)id_len) == 1;
+        }
+
+        public int SearchVector(
+            ulong context,
+            nint index,
+            ReadOnlySpan<byte> vector,
+            int vectorElementCount,
+            float delta,
+            int searchExplorationFactor,
+            ReadOnlySpan<byte> filter,
+            int maxFilteringEffort,
+            SpanByteAndMemory outputIds,
+            SpanByteAndMemory outputDistances,
+            int beamWidth,
+            out nint continuation
+        )
+        {
+            var vector_data = Unsafe.AsPointer(ref MemoryMarshal.GetReference(vector));
+
+            var filter_data = Unsafe.AsPointer(ref MemoryMarshal.GetReference(filter));
+            var filter_len = filter.Length;
+
+            void* output_ids;
+            void* output_distances;
+
+            GCHandle? outputIdsHandle = null;
+            GCHandle? outputDistancesHandle = null;
+            try
+            {
+                if (!outputIds.IsSpanByte)
+                {
+                    var getRes = MemoryMarshal.TryGetArray<byte>(outputIds.Memory.Memory, out var arrSeg);
+                    Debug.Assert(getRes, "Should always be able to get array to pin");
+
+                    outputIdsHandle = GCHandle.Alloc(arrSeg.Array, GCHandleType.Pinned);
+                    output_ids = Unsafe.AsPointer(ref MemoryMarshal.GetArrayDataReference(arrSeg.Array));
+                }
+                else
+                {
+                    outputIdsHandle = null;
+                    output_ids = Unsafe.AsPointer(ref MemoryMarshal.GetReference(outputIds.Span));
+                }
+
+                var output_ids_len = outputIds.Length;
+
+                if (!outputDistances.IsSpanByte)
+                {
+                    var getRes = MemoryMarshal.TryGetArray<byte>(outputDistances.Memory.Memory, out var arrSeg);
+                    Debug.Assert(getRes, "Should always be able to get array to pin");
+
+                    outputDistancesHandle = GCHandle.Alloc(arrSeg.Array, GCHandleType.Pinned);
+                    output_distances = Unsafe.AsPointer(ref MemoryMarshal.GetArrayDataReference(arrSeg.Array));
+                }
+                else
+                {
+                    outputDistancesHandle = null;
+                    output_distances = Unsafe.AsPointer(ref MemoryMarshal.GetReference(outputDistances.Span));
+                }
+
+                var output_distances_len = outputDistances.Length / sizeof(float);
+
+                continuation = 0;
+                ref var continuationRef = ref continuation;
+                var continuationAddr = (nint)Unsafe.AsPointer(ref continuationRef);
+
+                return NativeDiskANNMethods.search_vector(
+                    context,
+                    index,
+                    (nint)vector_data,
+                    (nuint)vectorElementCount,
+                    delta,
+                    searchExplorationFactor,
+                    (nint)filter_data,
+                    (nuint)filter_len,
+                    (nuint)maxFilteringEffort,
+                    (nint)output_ids,
+                    (nuint)output_ids_len,
+                    (nint)output_distances,
+                    (nuint)output_distances_len,
+                    (uint)beamWidth,
+                    continuationAddr
+                );
+            }
+            finally
+            {
+                outputIdsHandle?.Free();
+                outputDistancesHandle?.Free();
+            }
+        }
+
+        public int SearchElement(
+            ulong context,
+            nint index,
+            ReadOnlySpan<byte> id,
+            float delta,
+            int searchExplorationFactor,
+            ReadOnlySpan<byte> filter,
+            int maxFilteringEffort,
+            SpanByteAndMemory outputIds,
+            SpanByteAndMemory outputDistances,
+            int beamWidth,
+            out nint continuation
+        )
+        {
+            var id_data = Unsafe.AsPointer(ref MemoryMarshal.GetReference(id));
+            var id_len = id.Length;
+
+            var filter_data = Unsafe.AsPointer(ref MemoryMarshal.GetReference(filter));
+            var filter_len = filter.Length;
+
+            void* output_ids;
+            void* output_distances;
+
+            GCHandle? outputIdsHandle = null;
+            GCHandle? outputDistancesHandle = null;
+            try
+            {
+                if (!outputIds.IsSpanByte)
+                {
+                    var getRes = MemoryMarshal.TryGetArray<byte>(outputIds.Memory.Memory, out var arrSeg);
+                    Debug.Assert(getRes, "Should always be able to get array to pin");
+
+                    outputIdsHandle = GCHandle.Alloc(arrSeg.Array, GCHandleType.Pinned);
+                    output_ids = Unsafe.AsPointer(ref MemoryMarshal.GetArrayDataReference(arrSeg.Array));
+                }
+                else
+                {
+                    outputIdsHandle = null;
+                    output_ids = Unsafe.AsPointer(ref MemoryMarshal.GetReference(outputIds.Span));
+                }
+
+                var output_ids_len = outputIds.Length;
+
+                if (!outputDistances.IsSpanByte)
+                {
+                    var getRes = MemoryMarshal.TryGetArray<byte>(outputDistances.Memory.Memory, out var arrSeg);
+                    Debug.Assert(getRes, "Should always be able to get array to pin");
+
+                    outputDistancesHandle = GCHandle.Alloc(arrSeg.Array, GCHandleType.Pinned);
+                    output_distances = Unsafe.AsPointer(ref MemoryMarshal.GetArrayDataReference(arrSeg.Array));
+                }
+                else
+                {
+                    outputDistancesHandle = null;
+                    output_distances = Unsafe.AsPointer(ref MemoryMarshal.GetReference(outputDistances.Span));
+                }
+
+                var output_distances_len = outputDistances.Length / sizeof(float);
+
+                continuation = 0;
+                ref var continuationRef = ref continuation;
+                var continuationAddr = (nint)Unsafe.AsPointer(ref continuationRef);
+
+                return NativeDiskANNMethods.search_element(
+                    context,
+                    index,
+                    (nint)id_data,
+                    (nuint)id_len,
+                    delta,
+                    (uint)searchExplorationFactor,
+                    (nint)filter_data,
+                    (nuint)filter_len,
+                    (nuint)maxFilteringEffort,
+                    (nint)output_ids,
+                    (nuint)output_ids_len,
+                    (nint)output_distances,
+                    (nuint)output_distances_len,
+                    (uint)beamWidth,
+                    continuationAddr
+                );
+            }
+            finally
+            {
+                outputIdsHandle?.Free();
+                outputDistancesHandle?.Free();
+            }
+        }
+
+        public int SearchNeighbors(
+            ulong context,
+            nint index,
+            ReadOnlySpan<byte> id,
+            SpanByteAndMemory outputIds,
+            SpanByteAndMemory outputDistances,
+            out nint continuation
+        )
+        {
+            var id_data = Unsafe.AsPointer(ref MemoryMarshal.GetReference(id));
+            var id_len = id.Length;
+
+            void* output_ids;
+            void* output_distances;
+
+            GCHandle? outputIdsHandle = null;
+            GCHandle? outputDistancesHandle = null;
+            try
+            {
+                if (!outputIds.IsSpanByte)
+                {
+                    var getRes = MemoryMarshal.TryGetArray<byte>(outputIds.Memory.Memory, out var arrSeg);
+                    Debug.Assert(getRes, "Should always be able to get array to pin");
+
+                    outputIdsHandle = GCHandle.Alloc(arrSeg.Array, GCHandleType.Pinned);
+                    output_ids = Unsafe.AsPointer(ref MemoryMarshal.GetArrayDataReference(arrSeg.Array));
+                }
+                else
+                {
+                    outputIdsHandle = null;
+                    output_ids = Unsafe.AsPointer(ref MemoryMarshal.GetReference(outputIds.Span));
+                }
+
+                var output_ids_len = outputIds.Length;
+
+                if (!outputDistances.IsSpanByte)
+                {
+                    var getRes = MemoryMarshal.TryGetArray<byte>(outputDistances.Memory.Memory, out var arrSeg);
+                    Debug.Assert(getRes, "Should always be able to get array to pin");
+
+                    outputDistancesHandle = GCHandle.Alloc(arrSeg.Array, GCHandleType.Pinned);
+                    output_distances = Unsafe.AsPointer(ref MemoryMarshal.GetArrayDataReference(arrSeg.Array));
+                }
+                else
+                {
+                    outputDistancesHandle = null;
+                    output_distances = Unsafe.AsPointer(ref MemoryMarshal.GetReference(outputDistances.Span));
+                }
+
+                var output_distances_len = outputDistances.Length / sizeof(float);
+
+                continuation = 0;
+                ref var continuationRef = ref continuation;
+                var continuationAddr = (nint)Unsafe.AsPointer(ref continuationRef);
+
+                return NativeDiskANNMethods.search_neighbors(
+                    context,
+                    index,
+                    (nint)id_data,
+                    (nuint)id_len,
+                    (nint)output_ids,
+                    (nuint)output_ids_len,
+                    (nint)output_distances,
+                    (nuint)output_distances_len,
+                    continuationAddr
+                );
+            }
+            finally
+            {
+                outputIdsHandle?.Free();
+                outputDistancesHandle?.Free();
+            }
+        }
+
+        public bool RandomMembers(
+            ulong context,
+            nint index,
+            int count,
+            Span<byte> outputIds
+        )
+        {
+            var output_ids = Unsafe.AsPointer(ref MemoryMarshal.GetReference(outputIds));
+            var output_ids_len = outputIds.Length;
+
+            return NativeDiskANNMethods.random_members(
+                context,
+                index,
+                (uint)count,
+                (nint)output_ids,
+                (nuint)output_ids_len
+            ) == 1;
+        }
+
+        public int ContinueSearch(ulong context, nint index, nint continuation, Span<byte> outputIds, Span<byte> outputDistances, out nint newContinuation)
+        {
+            var output_ids_data = (nint)Unsafe.AsPointer(ref MemoryMarshal.GetReference(outputIds));
+            var output_ids_len = (nuint)outputIds.Length;
+
+            var output_distances_data = (nint)Unsafe.AsPointer(ref MemoryMarshal.GetReference(outputDistances));
+            var output_distances_len = (nuint)outputDistances.Length / sizeof(float);
+
+            newContinuation = 0;
+            var newContinuationPtr = (nint)Unsafe.AsPointer(ref newContinuation);
+
+            return NativeDiskANNMethods.overflow_results(context, index, continuation, output_ids_data, output_ids_len, output_distances_data, output_distances_len, newContinuationPtr);
+        }
+
+        public bool CheckInternalIdValid(ulong context, nint index, ReadOnlySpan<byte> internalId)
+        {
+            var internal_id_data = Unsafe.AsPointer(ref MemoryMarshal.GetReference(internalId));
+            var internal_id_len = internalId.Length;
+
+            return NativeDiskANNMethods.check_internal_id_valid(context, index, (nint)internal_id_data, (nuint)internal_id_len) == 1;
+        }
+
+        public bool CheckExternalIdValid(ulong context, nint index, ReadOnlySpan<byte> externalId)
+        {
+            var external_id_data = Unsafe.AsPointer(ref MemoryMarshal.GetReference(externalId));
+            var external_id_len = externalId.Length;
+
+            return NativeDiskANNMethods.check_external_id_valid(context, index, (nint)external_id_data, (nuint)external_id_len) == 1;
+        }
+
+        public bool SetAttribute(ulong context, nint index, ReadOnlySpan<byte> externalId, ReadOnlySpan<byte> attribute)
+        {
+            var external_id_data = Unsafe.AsPointer(ref MemoryMarshal.GetReference(externalId));
+            var external_id_len = externalId.Length;
+
+            var attribute_data = Unsafe.AsPointer(ref MemoryMarshal.GetReference(attribute));
+            var attribute_len = attribute.Length;
+
+            return NativeDiskANNMethods.set_attribute(context, index, (nint)external_id_data, (nuint)external_id_len, (nint)attribute_data, (nuint)attribute_len) == 1;
+        }
+    }
+
+    public static partial class NativeDiskANNMethods
+    {
+        public enum DiskANNInsertResult : byte
+        {
+            Fail = 0,
+            SuccessInsert = 1,
+            SuccessStartTraining = 2,
+            SuccessUpdate = 3,
+        }
+
+        const string DISKANN_GARNET = "diskann_garnet";
+
+        [LibraryImport(DISKANN_GARNET)]
+        public static partial nint create_index(
+            ulong context,
+            uint dimensions,
+            uint reduceDims,
+            VectorQuantType quantType,
+            VectorDistanceMetricType metricType,
+            uint buildExplorationFactor,
+            uint numLinks,
+            uint startPointId,
+            nint readCallback,
+            nint writeCallback,
+            nint deleteCallback,
+            nint readModifyWriteCallback,
+            nint filterCallback,
+            nint logCallback,
+            [MarshalAs(UnmanagedType.U1)] out bool quantizationNeeded
+        );
+
+        [LibraryImport(DISKANN_GARNET)]
+        public static partial void drop_index(
+            ulong context,
+            nint index
+        );
+
+        [LibraryImport(DISKANN_GARNET)]
+        public static partial byte set_quant_state(
+            ulong context,
+            nint index,
+            nint state,
+            nuint state_len
+        );
+
+        [LibraryImport(DISKANN_GARNET)]
+        public static partial byte can_import(
+            ulong context,
+            nint index
+        );
+
+        [LibraryImport(DISKANN_GARNET)]
+        public static partial byte import_term(
+            ulong context,
+            nint index,
+            uint term_type,
+            nint id_data,
+            nuint id_data_len,
+            nint value_data,
+            nuint value_len
+        );
+
+        [LibraryImport(DISKANN_GARNET)]
+        public static partial byte verify_import(
+            ulong context,
+            nint index,
+            nuint task_index,
+            nuint task_count
+        );
+
+        [LibraryImport(DISKANN_GARNET)]
+        public static partial byte finish_import(
+            ulong context,
+            nint index
+        );
+
+        [LibraryImport(DISKANN_GARNET)]
+        public static partial DiskANNInsertResult insert(
+            ulong context,
+            nint index,
+            nint id_data,
+            nuint id_len,
+            nint vector_data,
+            nuint vector_len,
+            nint attribute_data,
+            nuint attribute_len
+        );
+
+        [LibraryImport(DISKANN_GARNET)]
+        public static partial byte remove(
+            ulong context,
+            nint index,
+            nint id_data,
+            nuint id_len
+        );
+
+        [LibraryImport(DISKANN_GARNET)]
+        public static partial byte set_attribute(
+            ulong context,
+            nint index,
+            nint id_data,
+            nuint id_len,
+            nint attribute_data,
+            nuint attribute_len
+        );
+
+        [LibraryImport(DISKANN_GARNET)]
+        public static partial int search_vector(
+            ulong context,
+            nint index,
+            nint vector_data,
+            nuint vector_len,
+            float delta,
+            int search_exploration_factor,
+            nint filter_data,
+            nuint filter_len,
+            nuint max_filtering_effort,
+            nint output_ids,
+            nuint output_ids_len,
+            nint output_distances,
+            nuint output_distances_len,
+            uint beam_width,
+            nint continuation
+        );
+
+        [LibraryImport(DISKANN_GARNET)]
+        public static partial int search_element(
+            ulong context,
+            nint index,
+            nint id_data,
+            nuint id_len,
+            float delta,
+            uint search_exploration_factor,
+            nint filter_data,
+            nuint filter_len,
+            nuint max_filtering_effort,
+            nint output_ids,
+            nuint output_ids_len,
+            nint output_distances,
+            nuint output_distances_len,
+            uint beam_width,
+            nint continuation
+        );
+
+        [LibraryImport(DISKANN_GARNET)]
+        public static partial int search_neighbors(
+            ulong context,
+            nint index,
+            nint id_data,
+            nuint id_len,
+            nint output_ids,
+            nuint output_ids_len,
+            nint output_distances,
+            nuint output_distances_len,
+            nint continuation
+        );
+
+        [LibraryImport(DISKANN_GARNET)]
+        public static partial int overflow_results(
+            ulong context,
+            nint index,
+            nint continuation,
+            nint output_ids,
+            nuint output_ids_len,
+            nint output_distances,
+            nuint output_distances_len,
+            nint new_continuation
+        );
+
+        [LibraryImport(DISKANN_GARNET)]
+        public static partial ulong card(
+            ulong context,
+            nint index
+        );
+
+        [LibraryImport(DISKANN_GARNET)]
+        public static partial byte check_internal_id_valid(
+            ulong context,
+            nint index,
+            nint internal_id,
+            nuint internal_id_len
+        );
+
+        [LibraryImport(DISKANN_GARNET)]
+        public static partial byte check_external_id_valid(
+            ulong context,
+            nint index,
+            nint external_id,
+            nuint external_id_len
+        );
+
+        [LibraryImport(DISKANN_GARNET)]
+        public static partial byte build_quant_table(
+            ulong context,
+            nint index
+        );
+
+        [LibraryImport(DISKANN_GARNET)]
+        public static partial byte backfill_quant_vectors(
+            ulong context,
+            nint index,
+            nuint task_index,
+            nuint task_count
+        );
+
+        [LibraryImport(DISKANN_GARNET)]
+        public static partial byte random_members(
+            ulong context,
+            nint index,
+            uint count,
+            nint output_ids,
+            nuint output_ids_len
+        );
+    }
+}

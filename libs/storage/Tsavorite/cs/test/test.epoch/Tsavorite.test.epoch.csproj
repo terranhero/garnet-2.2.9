@@ -1,0 +1,28 @@
+<Project Sdk="Microsoft.NET.Sdk">
+
+  <PropertyGroup>
+    <SignAssembly>true</SignAssembly>
+    <AssemblyOriginatorKeyFile>../../../../../../Garnet.snk</AssemblyOriginatorKeyFile>
+    <DelaySign>false</DelaySign>
+    <IsPackable>false</IsPackable>
+    <DefineConstants>$(DefineConstants);EPOCH_RELEASE_WORKLOAD_TESTS</DefineConstants>
+    <NoWarn>1701;1702;1591;IDE0130;IDE0065;IDE0007;IDE0048</NoWarn>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" />
+    <PackageReference Include="NUnit" />
+    <PackageReference Include="NUnit3TestAdapter">
+      <PrivateAssets>all</PrivateAssets>
+      <IncludeAssets>runtime; build; native; contentfiles; analyzers; buildtransitive</IncludeAssets>
+    </PackageReference>
+  </ItemGroup>
+
+  <ItemGroup>
+    <Compile Include="..\..\benchmark\BDN-Tsavorite.Benchmark\EpochReleaseWorkload.cs" Link="helpers\EpochReleaseWorkload.cs" />
+    <Compile Include="..\..\benchmark\BDN-Tsavorite.Benchmark\EpochBenchmarkEnvironment.cs" Link="helpers\EpochBenchmarkEnvironment.cs" />
+    <ProjectReference Include="..\..\src\core\Tsavorite.core.csproj" />
+    <ProjectReference Include="..\Tsavorite.test.csproj" />
+  </ItemGroup>
+
+</Project>

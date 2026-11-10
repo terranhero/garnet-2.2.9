@@ -1,0 +1,376 @@
+﻿// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Buffers;
+using System.Runtime.CompilerServices;
+using System.Text;
+using Garnet.common;
+using Tsavorite.core;
+
+namespace Garnet.server
+{
+    /// <summary>
+    /// RESP server session
+    /// </summary>
+    internal sealed unsafe partial class RespServerSession : ServerSessionBase
+    {
+        /// <summary>
+        /// Writes current output object
+        /// </summary>
+        /// <param name="output"></param>
+        /// <returns></returns>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private unsafe void ProcessOutput(SpanByteAndMemory output)
+        {
+            if (!output.IsSpanByte)
+                SendAndReset(output.Memory, output.Length);
+            else
+                dcurr += output.Length;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteAsciiBulkString(ReadOnlySpan<char> message)
+        {
+            if (RespWriteUtils.TryWriteAsciiBulkString(message, ref dcurr, dend))
+                return;
+
+            WriteAsciiBulkStringSlow(message);
+        }
+
+        /// <summary>
+        /// Cold path for <see cref="WriteAsciiBulkString"/>: flush what is already buffered and retry,
+        /// then chunk a message that cannot fit an empty buffer.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void WriteAsciiBulkStringSlow(ReadOnlySpan<char> message)
+        {
+            if (HasBufferedOutput())
+            {
+                SendAndReset();
+                if (RespWriteUtils.TryWriteAsciiBulkString(message, ref dcurr, dend))
+                    return;
+            }
+
+            var bytes = ArrayPool<byte>.Shared.Rent(Encoding.ASCII.GetByteCount(message));
+            try
+            {
+                var written = Encoding.ASCII.GetBytes(message, bytes);
+                WriteDirectLargeRespString(new ReadOnlySpan<byte>(bytes, 0, written));
+            }
+            finally
+            {
+                ArrayPool<byte>.Shared.Return(bytes);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteAsciiDirect(ReadOnlySpan<char> message)
+        {
+            while (!RespWriteUtils.TryWriteAsciiDirect(message, ref dcurr, dend))
+                SendAndReset();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteArrayLength(int len)
+        {
+            while (!RespWriteUtils.TryWriteArrayLength(len, ref dcurr, dend))
+                SendAndReset();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteBulkString(scoped ReadOnlySpan<byte> message)
+        {
+            if (RespWriteUtils.TryWriteBulkString(message, ref dcurr, dend))
+                return;
+
+            WriteBulkStringSlow(message);
+        }
+
+        /// <summary>
+        /// Cold path for <see cref="WriteBulkString"/>: flush what is already buffered and retry, then
+        /// chunk a message that cannot fit an empty buffer. Flushing is conditional because
+        /// <see cref="SendAndReset()"/> throws when there is nothing to send, which is exactly the case
+        /// where the message is over-sized and the buffer is still empty.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.NoInlining)]
+        private void WriteBulkStringSlow(scoped ReadOnlySpan<byte> message)
+        {
+            if (HasBufferedOutput())
+            {
+                SendAndReset();
+                if (RespWriteUtils.TryWriteBulkString(message, ref dcurr, dend))
+                    return;
+            }
+
+            WriteDirectLargeRespString(message);
+        }
+
+        /// <summary>
+        /// Whether any response bytes are pending in the network buffer.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private bool HasBufferedOutput() => dcurr > networkSender.GetResponseObjectHead();
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteDirectLargeRespString(ReadOnlySpan<byte> message)
+        {
+            while (!RespWriteUtils.TryWriteBulkStringLength(message, ref dcurr, dend))
+                SendAndReset();
+
+            WriteDirectLarge(message);
+
+            while (!RespWriteUtils.TryWriteNewLine(ref dcurr, dend))
+                SendAndReset();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteDirect(scoped ReadOnlySpan<byte> span)
+        {
+            while (!RespWriteUtils.TryWriteDirect(span, ref dcurr, dend))
+                SendAndReset();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteDoubleNumeric(double value)
+        {
+            if (respProtocolVersion >= 3)
+            {
+                while (!RespWriteUtils.TryWriteDoubleNumeric(value, ref dcurr, dend))
+                    SendAndReset();
+            }
+            else
+            {
+                while (!RespWriteUtils.TryWriteDoubleBulkString(value, ref dcurr, dend))
+                    SendAndReset();
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteEmptyArray()
+        {
+            while (!RespWriteUtils.TryWriteEmptyArray(ref dcurr, dend))
+                SendAndReset();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteEmptySet()
+        {
+            if (respProtocolVersion >= 3)
+            {
+                while (!RespWriteUtils.TryWriteEmptySet(ref dcurr, dend))
+                    SendAndReset();
+            }
+            else
+            {
+                while (!RespWriteUtils.TryWriteEmptyArray(ref dcurr, dend))
+                    SendAndReset();
+            }
+        }
+
+        private void WriteError(scoped ReadOnlySpan<byte> errorString)
+        {
+            commandErrorWritten = true;
+            while (!RespWriteUtils.TryWriteError(errorString, ref dcurr, dend))
+                SendAndReset();
+        }
+
+        private void WriteError(ReadOnlySpan<char> errorString)
+        {
+            commandErrorWritten = true;
+            while (!RespWriteUtils.TryWriteError(errorString, ref dcurr, dend))
+                SendAndReset();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteInt32(int value)
+        {
+            while (!RespWriteUtils.TryWriteInt32(value, ref dcurr, dend))
+                SendAndReset();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteBoolean(bool value)
+        {
+            if (respProtocolVersion == 3)
+            {
+                if (value)
+                {
+                    while (!RespWriteUtils.TryWriteTrue(ref dcurr, dend))
+                        SendAndReset();
+                }
+                else
+                {
+                    while (!RespWriteUtils.TryWriteFalse(ref dcurr, dend))
+                        SendAndReset();
+                }
+            }
+            else
+            {
+                WriteInt32(value ? 1 : 0);
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteInt32AsBulkString(int value)
+        {
+            while (!RespWriteUtils.TryWriteInt32AsBulkString(value, ref dcurr, dend))
+                SendAndReset();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteInt64(long value)
+        {
+            while (!RespWriteUtils.TryWriteInt64(value, ref dcurr, dend))
+                SendAndReset();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteInt64AsBulkString(long value)
+        {
+            while (!RespWriteUtils.TryWriteInt64AsBulkString(value, ref dcurr, dend, out _))
+                SendAndReset();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteIntegerFromBytes(ReadOnlySpan<byte> integerBytes)
+        {
+            while (!RespWriteUtils.TryWriteIntegerFromBytes(integerBytes, ref dcurr, dend))
+                SendAndReset();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteMapLength(int count)
+        {
+            if (respProtocolVersion >= 3)
+            {
+                while (!RespWriteUtils.TryWriteMapLength(count, ref dcurr, dend))
+                    SendAndReset();
+            }
+            else
+            {
+                while (!RespWriteUtils.TryWriteArrayLength(count * 2, ref dcurr, dend))
+                    SendAndReset();
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteZero()
+        {
+            while (!RespWriteUtils.TryWriteZero(ref dcurr, dend))
+                SendAndReset();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteOne()
+        {
+            while (!RespWriteUtils.TryWriteOne(ref dcurr, dend))
+                SendAndReset();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteNull()
+        {
+            if (respProtocolVersion >= 3)
+            {
+                while (!RespWriteUtils.TryWriteResp3Null(ref dcurr, dend))
+                    SendAndReset();
+            }
+            else
+            {
+                while (!RespWriteUtils.TryWriteNull(ref dcurr, dend))
+                    SendAndReset();
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteNullArray()
+        {
+            if (respProtocolVersion >= 3)
+            {
+                while (!RespWriteUtils.TryWriteResp3Null(ref dcurr, dend))
+                    SendAndReset();
+            }
+            else
+            {
+                while (!RespWriteUtils.TryWriteNullArray(ref dcurr, dend))
+                    SendAndReset();
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WritePushLength(int count)
+        {
+            if (respProtocolVersion >= 3)
+            {
+                while (!RespWriteUtils.TryWritePushLength(count, ref dcurr, dend))
+                    SendAndReset();
+            }
+            else
+            {
+                while (!RespWriteUtils.TryWriteArrayLength(count, ref dcurr, dend))
+                    SendAndReset();
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteSetLength(int count)
+        {
+            if (respProtocolVersion >= 3)
+            {
+                while (!RespWriteUtils.TryWriteSetLength(count, ref dcurr, dend))
+                    SendAndReset();
+            }
+            else
+            {
+                while (!RespWriteUtils.TryWriteArrayLength(count, ref dcurr, dend))
+                    SendAndReset();
+            }
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteSimpleString(scoped ReadOnlySpan<byte> simpleString)
+        {
+            while (!RespWriteUtils.TryWriteSimpleString(simpleString, ref dcurr, dend))
+                SendAndReset();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteSimpleString(ReadOnlySpan<char> simpleString)
+        {
+            while (!RespWriteUtils.TryWriteSimpleString(simpleString, ref dcurr, dend))
+                SendAndReset();
+        }
+
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteUtf8BulkString(ReadOnlySpan<char> chars)
+        {
+            while (!RespWriteUtils.TryWriteUtf8BulkString(chars, ref dcurr, dend))
+                SendAndReset();
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private void WriteLargeVerbatimString(scoped ReadOnlySpan<byte> item, scoped ReadOnlySpan<byte> ext = default)
+        {
+            if (respProtocolVersion >= 3)
+            {
+                ext = ext.IsEmpty ? RespStrings.VerbatimTxt : ext;
+
+                while (!RespWriteUtils.TryWriteVerbatimStringHeader(item, ext, ref dcurr, dend))
+                    SendAndReset();
+
+                // Write out item
+                WriteDirectLarge(item);
+
+                while (!RespWriteUtils.TryWriteNewLine(ref dcurr, dend))
+                    SendAndReset();
+            }
+            else
+            {
+                // RESP2 just gets a bulk string
+                WriteDirectLargeRespString(item);
+            }
+        }
+    }
+}

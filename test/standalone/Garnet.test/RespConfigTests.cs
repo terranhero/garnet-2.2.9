@@ -1,0 +1,1350 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading;
+using System.Threading.Tasks;
+using Garnet.common;
+using Garnet.server;
+using NUnit.Framework;
+using NUnit.Framework.Legacy;
+using StackExchange.Redis;
+using Tsavorite.core;
+using static Garnet.test.TestUtils;
+using static Tsavorite.core.Utility;
+
+namespace Garnet.test
+{
+    /// <summary>
+    /// Test dynamically changing server configuration using CONFIG SET command.
+    /// </summary>
+    [TestFixture(RevivificationMode.NoReviv)]
+    [TestFixture(RevivificationMode.UseReviv)]
+    public class RespConfigTests : TestBase
+    {
+        GarnetServer server;
+        private readonly string memorySizeStr = "17g";
+        private readonly string indexSizeStr = "64m";
+        private readonly string pageSizeStr = "32m";
+        private readonly bool useReviv;
+
+        // The HLOG will always have at least two pages allocated.
+        internal const int MinLogAllocatedPageCount = 2;
+
+        public RespConfigTests(RevivificationMode revivMode)
+        {
+            this.useReviv = revivMode == RevivificationMode.UseReviv;
+        }
+
+        [SetUp]
+        public void Setup()
+        {
+            TestUtils.DeleteDirectory(TestUtils.MethodTestDir, wait: true);
+            server = TestUtils.CreateGarnetServer(TestUtils.MethodTestDir,
+                memorySize: memorySizeStr,
+                indexSize: indexSizeStr,
+                pageSize: pageSizeStr,
+                useReviv: useReviv);
+            server.Start();
+        }
+
+        [TearDown]
+        public void TearDown()
+        {
+            server.Dispose();
+            TestUtils.OnTearDown();
+        }
+
+        /// <summary>
+        /// This test verifies that dynamically changing the memory size configuration using CONFIG SET memory
+        /// incurs the expected changes in Garnet server metrics, as well as verifies error handling for incorrect inputs.
+        /// </summary>
+        /// <param name="smallerSize">Memory size smaller than the initial size</param>
+        /// <param name="largerSize">Memory size larger than the initial size (within buffer bounds)</param>
+        /// <param name="largerThanBufferSize">Memory size larger than the buffer size</param>
+        /// <param name="malformedSize">Malformed memory size string</param>
+        /// <remarks>Initial memory size for main log is 32GB</remarks>
+        [Test]
+        [TestCase("16g", "32g", "64g", "g4")]
+        [TestCase("9gB", "28GB", "33G", "2gBB")]
+        [TestCase("128m", "256m", "256GB", "3bm")]
+        [TestCase("500m", "1500M", "128GB", "44d")]
+        public void ConfigSetMemorySizeTest(string smallerSize, string largerSize, string largerThanBufferSize, string malformedSize)
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true));
+            var db = redis.GetDatabase(0);
+            var option = "memory";
+            var metricName = "Log.AllocatedPageCount";
+            var metricType = InfoMetricsType.STORE;
+            var initMemorySize = memorySizeStr;
+
+            var store = server.Provider.StoreWrapper.store;
+            var tracker = store.Log.LogSizeTracker;
+            var currMemorySize = ServerOptions.ParseSize(initMemorySize, out _);
+            var pageSize = ServerOptions.ParseSize(pageSizeStr, out _);
+
+            var bufferSizeInBytes = ServerOptions.NextPowerOf2(currMemorySize);
+            Assert.That(bufferSizeInBytes / pageSize, Is.EqualTo(store.Log.BufferSize));
+
+            // expectedMaxAPC does not change after being set in AllocatorBase initialization
+            var expectedMaxAPC = (int)(RoundUp(currMemorySize, pageSize) / pageSize);
+            Assert.That(tracker.logAccessor.allocatorBase.MaxAllocatedPageCount, Is.EqualTo(expectedMaxAPC));
+
+            // Check initial AllocatedPageCount before any changes
+            var metrics = server.Metrics.GetInfoMetrics(metricType);
+            var miAPC = metrics.FirstOrDefault(mi => mi.Name == metricName);
+            ClassicAssert.IsNotNull(miAPC);
+            ClassicAssert.IsTrue(long.TryParse(miAPC.Value, out var allocatedPageCount));
+            long expectedAPC = MinLogAllocatedPageCount;
+            ClassicAssert.AreEqual(expectedAPC, allocatedPageCount);
+            Assert.That(tracker.logAccessor.allocatorBase.MaxAllocatedPageCount, Is.EqualTo(expectedMaxAPC));
+
+            // Try to set memory size to the same value as current
+            var result = db.Execute("CONFIG", "SET", option, initMemorySize);
+            ClassicAssert.AreEqual("OK", result.ToString());
+
+            // miAPC should remain unchanged
+            metrics = server.Metrics.GetInfoMetrics(metricType);
+            miAPC = metrics.FirstOrDefault(mi => mi.Name == metricName);
+            ClassicAssert.IsNotNull(miAPC);
+            ClassicAssert.IsTrue(long.TryParse(miAPC.Value, out allocatedPageCount));
+            // expectedAPC remains unchanged because we didn't add records
+            ClassicAssert.AreEqual(expectedAPC, allocatedPageCount);
+            Assert.That(tracker.logAccessor.allocatorBase.MaxAllocatedPageCount, Is.EqualTo(expectedMaxAPC));
+
+            // Try to set memory size to a smaller value than current
+            result = db.Execute("CONFIG", "SET", option, smallerSize);
+            ClassicAssert.AreEqual("OK", result.ToString());
+
+            // Check that miAPC has changed accordingly
+            currMemorySize = ServerOptions.ParseSize(smallerSize, out _);
+            metrics = server.Metrics.GetInfoMetrics(metricType);
+            miAPC = metrics.FirstOrDefault(mi => mi.Name == metricName);
+            ClassicAssert.IsNotNull(miAPC);
+            ClassicAssert.IsTrue(long.TryParse(miAPC.Value, out allocatedPageCount));
+            // expectedAPC remains unchanged because we didn't add records
+            ClassicAssert.AreEqual(expectedAPC, allocatedPageCount);
+            Assert.That(tracker.logAccessor.allocatorBase.MaxAllocatedPageCount, Is.EqualTo(expectedMaxAPC));
+
+            // Try to set memory size to a larger value than current
+            result = db.Execute("CONFIG", "SET", option, largerSize);
+            ClassicAssert.AreEqual("OK", result.ToString());
+
+            // Check that miAPC has changed accordingly
+            currMemorySize = ServerOptions.ParseSize(largerSize, out _);
+            metrics = server.Metrics.GetInfoMetrics(metricType);
+            miAPC = metrics.FirstOrDefault(mi => mi.Name == metricName);
+            ClassicAssert.IsNotNull(miAPC);
+            ClassicAssert.IsTrue(long.TryParse(miAPC.Value, out allocatedPageCount));
+            // expectedAPC remains unchanged because we didn't add records
+            ClassicAssert.AreEqual(expectedAPC, allocatedPageCount);
+            Assert.That(tracker.logAccessor.allocatorBase.MaxAllocatedPageCount, Is.EqualTo(expectedMaxAPC));
+
+            // Try to set memory size larger than the buffer size - this should fail
+            _ = Assert.Throws<RedisServerException>(() => db.Execute("CONFIG", "SET", option, largerThanBufferSize),
+                string.Format(CmdStrings.GenericErrMemorySizeGreaterThanBuffer, option));
+
+            // Page counts should remain unchanged
+            metrics = server.Metrics.GetInfoMetrics(metricType);
+            miAPC = metrics.FirstOrDefault(mi => mi.Name == metricName);
+            ClassicAssert.IsNotNull(miAPC);
+            ClassicAssert.IsTrue(long.TryParse(miAPC.Value, out allocatedPageCount));
+            ClassicAssert.AreEqual(expectedAPC, allocatedPageCount);
+            Assert.That(tracker.logAccessor.allocatorBase.MaxAllocatedPageCount, Is.EqualTo(expectedMaxAPC));
+
+            // Try to set memory size with a malformed size input - this should fail
+            _ = Assert.Throws<RedisServerException>(() => db.Execute("CONFIG", "SET", option, malformedSize),
+                string.Format(CmdStrings.GenericErrIncorrectSizeFormat, option));
+
+            // Page counts should remain unchanged
+            metrics = server.Metrics.GetInfoMetrics(metricType);
+            miAPC = metrics.FirstOrDefault(mi => mi.Name == metricName);
+            ClassicAssert.IsNotNull(miAPC);
+            ClassicAssert.IsTrue(long.TryParse(miAPC.Value, out allocatedPageCount));
+            ClassicAssert.AreEqual(expectedAPC, allocatedPageCount);
+            Assert.That(tracker.logAccessor.allocatorBase.MaxAllocatedPageCount, Is.EqualTo(expectedMaxAPC));
+        }
+
+        /// <summary>
+        /// This test verifies that dynamically changing the index size configuration using CONFIG SET index / obj-index
+        /// incurs the expected changes in Garnet server metrics, as well as verifies error handling for incorrect inputs.
+        /// </summary>
+        /// <param name="smallerSize">Index size smaller than the initial size</param>
+        /// <param name="largerSize">Index size larger than the initial size</param>
+        /// <param name="illegalSize">Illegal index size (not a power of 2)</param>
+        /// <param name="malformedSize">Malformed index size string</param>
+        /// <remarks>Initial index size for main log is 1MB</remarks>
+        [Test]
+        [TestCase("32m", "128m", "63m", "8d")]
+        [TestCase("16mB", "256MB", "23m", "g8")]
+        [TestCase("2m", "512m", "28m", "m9")]
+        [TestCase("4Mb", "1024mB", "129MB", "0.3gb")]
+        public void ConfigSetIndexSizeTest(string smallerSize, string largerSize, string illegalSize, string malformedSize)
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true));
+            var db = redis.GetDatabase(0);
+            var metricType = InfoMetricsType.STORE;
+            var option = "index";
+            var initIndexSize = indexSizeStr;
+
+            // Check initial index size before any changes
+            var currIndexSize = ServerOptions.ParseSize(initIndexSize, out _);
+            var metrics = server.Metrics.GetInfoMetrics(metricType);
+            var miIndexSize = metrics.FirstOrDefault(mi => mi.Name == "IndexMemorySizeBytes");
+            ClassicAssert.IsNotNull(miIndexSize);
+            ClassicAssert.IsTrue(long.TryParse(miIndexSize.Value, out var actualIndexSize));
+            var expectedIndexSize = currIndexSize;
+            ClassicAssert.AreEqual(expectedIndexSize, actualIndexSize);
+
+            // Try to set index size to the same value as current
+            var result = db.Execute("CONFIG", "SET", option, initIndexSize);
+            ClassicAssert.AreEqual("OK", result.ToString());
+
+            // Index size should remain unchanged
+            metrics = server.Metrics.GetInfoMetrics(metricType);
+            miIndexSize = metrics.FirstOrDefault(mi => mi.Name == "IndexMemorySizeBytes");
+            ClassicAssert.IsNotNull(miIndexSize);
+            ClassicAssert.IsTrue(long.TryParse(miIndexSize.Value, out actualIndexSize));
+            ClassicAssert.AreEqual(expectedIndexSize, actualIndexSize);
+
+            // Try to set index size to a larger value than current
+            result = db.Execute("CONFIG", "SET", option, largerSize);
+            ClassicAssert.AreEqual("OK", result.ToString());
+
+            // Check that index size has changed accordingly
+            currIndexSize = ServerOptions.ParseSize(largerSize, out _);
+            metrics = server.Metrics.GetInfoMetrics(metricType);
+            miIndexSize = metrics.FirstOrDefault(mi => mi.Name == "IndexMemorySizeBytes");
+            ClassicAssert.IsNotNull(miIndexSize);
+            ClassicAssert.IsTrue(long.TryParse(miIndexSize.Value, out actualIndexSize));
+            expectedIndexSize = currIndexSize;
+            ClassicAssert.AreEqual(expectedIndexSize, actualIndexSize);
+
+            // Try to set index size to a smaller value than current - this should fail
+            _ = Assert.Throws<RedisServerException>(() => db.Execute("CONFIG", "SET", option, smallerSize),
+                string.Format(CmdStrings.GenericErrIndexSizeSmallerThanCurrent, option));
+
+            // Try to set index size to a value that is not a power of two - this should fail
+            _ = Assert.Throws<RedisServerException>(() => db.Execute("CONFIG", "SET", option, illegalSize),
+                string.Format(CmdStrings.GenericErrIndexSizePowerOfTwo, option));
+
+            // Try to set index size with a malformed size input - this should fail
+            _ = Assert.Throws<RedisServerException>(() => db.Execute("CONFIG", "SET", option, malformedSize),
+                string.Format(CmdStrings.GenericErrIncorrectSizeFormat, option));
+        }
+    }
+
+
+
+    /// <summary>
+    /// Test memory utilization behavior when dynamically changing the memory size configuration using CONFIG SET memory.
+    /// </summary>
+    [TestFixture(RevivificationMode.NoReviv)]
+    [TestFixture(RevivificationMode.UseReviv)]
+    public class RespConfigUtilizationTests : TestBase
+    {
+        GarnetServer server;
+        private readonly string memorySize = "3m";
+        private readonly string indexSize = "1m";
+        private readonly string pageSize = $"{MinKvLogPageSize}";
+        private readonly bool useReviv;
+
+        public RespConfigUtilizationTests(RevivificationMode revivMode)
+        {
+            this.useReviv = revivMode == RevivificationMode.UseReviv;
+        }
+
+        [SetUp]
+        public void Setup()
+        {
+            TestUtils.DeleteDirectory(TestUtils.MethodTestDir, wait: true);
+            server = TestUtils.CreateGarnetServer(null,
+                memorySize: memorySize,
+                indexSize: indexSize,
+                pageSize: pageSize,
+                useReviv: useReviv);
+            server.Start();
+        }
+
+        [TearDown]
+        public void TearDown()
+        {
+            server.Dispose();
+            TestUtils.OnTearDown();
+        }
+
+        /// <summary>
+        /// This test verifies that dynamically changing the memory size configuration using CONFIG SET
+        /// incurs the expected shifts in the head and tail addresses of the store.
+        /// </summary>
+        /// <param name="smallerSize">Memory size smaller than the initial size</param>
+        /// <param name="largerSize">Memory size larger than the initial size (within buffer bounds)</param>
+        [Test]
+        [TestCase("1m", "4m")]
+        [TestCase("1024k", "4000k")]
+        [TestCase("16k", "24k")]
+        [TestCase("32k", "64k")]
+        public void ConfigSetInlineMemorySizeUtilizationTest(string smallerSize, string largerSize)
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true));
+            var db = redis.GetDatabase(0);
+            var option = "memory";
+            var currMemorySize = TestUtils.GetEffectiveMemorySize(memorySize, pageSize, out var parsedPageSize);
+            var initialMemorySize = currMemorySize;
+
+            var store = server.Provider.StoreWrapper.store;
+            var tracker = store.Log.LogSizeTracker;
+            Assert.That(tracker.TargetSize, Is.EqualTo(currMemorySize));
+
+            using var trimCompleteEvent = new ManualResetEventSlim(false);
+            tracker.PostMemoryTrim = (allocatedPageCount, headAddress) => { trimCompleteEvent.Set(); };
+
+            var garnetServer = redis.GetServer(TestUtils.EndPoint);
+            var info = TestUtils.GetStoreAddressInfo(garnetServer);
+            ClassicAssert.AreEqual(PageHeader.Size, info.TailAddress);
+
+            var i = 0;
+            var val = new RedisValue(new string('x', 512 - 32));
+
+            // Insert records until head address moves
+            var prevHead = info.HeadAddress;
+            var prevTail = info.TailAddress;
+            while (info.HeadAddress == prevHead)
+            {
+                var key = $"key{i++:00000}";
+                _ = db.StringSet(key, val);
+
+                prevHead = info.HeadAddress;
+                prevTail = info.TailAddress;
+                info = TestUtils.GetStoreAddressInfo(garnetServer);
+            }
+
+            prevHead = info.HeadAddress;
+            prevTail = info.TailAddress;
+
+            // Verify that records were inserted up to the configured memory size limit.
+            // We may have overflowed by multiple pages.
+            Assert.That(prevTail - prevHead, Is.LessThanOrEqualTo(tracker.TargetDeltaRange.high));
+
+            ////////////////////////////////////////////////////////
+            // Try to set memory size to a smaller value than current
+            currMemorySize = TestUtils.GetEffectiveMemorySize(smallerSize, pageSize, out _);
+            Assert.That(currMemorySize, Is.LessThan(initialMemorySize));
+            var result = db.Execute("CONFIG", "SET", option, smallerSize);
+            ClassicAssert.AreEqual("OK", result.ToString());
+            Assert.That(tracker.TargetSize, Is.EqualTo(currMemorySize));
+
+            // Insert records until head address moves
+            // Precondition: We have too much in memory for the smallSize and must evict.
+            Assert.That(prevTail - prevHead, Is.GreaterThan(tracker.TargetDeltaRange.high));
+
+            // Wait for the logSizeTracker to stabilize.
+            Assert.That(trimCompleteEvent.Wait(TimeSpan.FromSeconds(3 * 3 * LogSizeTracker.ResizeTaskDelaySeconds)),
+                "Timeout occurred. Resizing did not happen within the specified time.");
+
+            info = TestUtils.GetStoreAddressInfo(garnetServer);
+            prevHead = info.HeadAddress;
+            prevTail = info.TailAddress;
+
+            // Verify that records were inserted up to the configured memory size limit.
+            // We may have overflowed by multiple pages.
+            Assert.That(prevTail - prevHead, Is.LessThanOrEqualTo(tracker.TargetDeltaRange.high));
+
+            ////////////////////////////////////////////////////////
+            // Try to set memory size to a larger value than current
+            currMemorySize = TestUtils.GetEffectiveMemorySize(largerSize, pageSize, out _);
+            result = db.Execute("CONFIG", "SET", option, largerSize);
+            ClassicAssert.AreEqual("OK", result.ToString());
+            Assert.That(tracker.TargetSize, Is.EqualTo(currMemorySize));
+
+            // Continue to insert records until new memory capacity is reached
+            prevHead = info.HeadAddress;
+            prevTail = info.TailAddress;
+            while (info.HeadAddress == prevHead)
+            {
+                var key = $"key{i++:00000}";
+                _ = db.StringSet(key, val);
+
+                prevHead = info.HeadAddress;
+                prevTail = info.TailAddress;
+                info = TestUtils.GetStoreAddressInfo(garnetServer);
+            }
+
+            // Verify that memory is fully utilized and within memory bounds
+            Assert.That(prevTail - prevHead, Is.LessThanOrEqualTo(tracker.TargetDeltaRange.high));
+        }
+
+        /// <summary>
+        /// This test verifies recovery behavior after dynamically changing the memory size configuration using CONFIG SET memory.
+        /// The test fills the store to a larger capacity than the initial memory size, then verifies that recovering with the
+        /// smaller initial memory size retains the last inserted keys in the expected initial capacity.
+        /// </summary>
+        /// <param name="largerSize">Memory size larger than the initial size (within buffer bounds)</param>
+        [Test]
+        [TestCase("4m")]
+        public void ConfigSetMemorySizeRecoveryTest(string largerSize)
+        {
+            var option = "memory";
+            var initMemorySize = memorySize;
+
+            var currMemorySize = TestUtils.GetEffectiveMemorySize(initMemorySize, pageSize, out var parsedPageSize);
+
+            var store = server.Provider.StoreWrapper.store;
+            var tracker = store.Log.LogSizeTracker;
+            Assert.That(tracker.TargetSize, Is.EqualTo(currMemorySize));
+            Assert.That(store.hlogBase.MaxAllocatedPageCount, Is.EqualTo((int)(currMemorySize / parsedPageSize)));
+
+            int lastIdxSecondRound;
+            int keysInsertedFirstRound;
+
+            // These are outside the individual blocks for debugging
+            var lastIdxFirstRound = -1;
+            var allocatedPagesFirstRound = -1;
+            var allocatedPagesSecondRound = -1;
+            long highTarget1 = -1, lowTarget1 = -1;
+            int maxAllocatedPageCount1 = -1;
+
+            using (var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true)))
+            {
+                var db = redis.GetDatabase(0);
+                var garnetServer = redis.GetServer(TestUtils.EndPoint);
+                var info = TestUtils.GetStoreAddressInfo(garnetServer);
+                ClassicAssert.AreEqual(PageHeader.Size, info.TailAddress);
+
+                // Insert records until head address moves. We want to fit two records per page; pages are 4096 bytes so after subtracting
+                // PageHeader.Size we have 4032 / 2 = 2016 bytes per record. FixedHeaderSize is 16 bytes, Keys are 8 bytes, we have no optionals
+                // (ETag or Expiration), and we are inline so have no ObjectLogPosition, so:
+                //   FixedHeaderSize + 8 + valueLength = 2016, so valueLength = 2016-24 = 1992 bytes.
+                // It's rounded up to kRecordAlignment (8) anyway.
+                var val = new RedisValue(new string('x', 1992));
+
+                var i = 0;
+                var prevHead = info.HeadAddress;
+                var prevTail = info.TailAddress;
+                while (info.HeadAddress == prevHead)
+                {
+                    var key = $"key{i++:00000}";
+                    _ = db.StringSet(key, val);
+
+                    prevHead = info.HeadAddress;
+                    prevTail = info.TailAddress;
+                    info = TestUtils.GetStoreAddressInfo(garnetServer);
+                }
+
+                lastIdxFirstRound = i - 1;
+
+                // Verify that records were inserted up to the configured memory size limit
+                // We may have overflowed by multiple pages.
+                Assert.That(prevTail - prevHead, Is.LessThanOrEqualTo(tracker.TargetDeltaRange.high));
+
+                // Find the first key index that still exists in the server
+                ClassicAssert.IsTrue(db.KeyExists($"key{lastIdxFirstRound:00000}"));
+                var c = lastIdxFirstRound;
+                while (c > 0 && db.KeyExists($"key{--c:00000}"))
+                    continue;
+
+                // Record the number of keys inserted in the first round
+                keysInsertedFirstRound = lastIdxFirstRound + 1 - c;
+                allocatedPagesFirstRound = store.hlogBase.AllocatedPageCount - 1;   // APC includes the one-ahead page allocation
+                Assert.That(allocatedPagesFirstRound, Is.LessThanOrEqualTo(store.hlogBase.MaxAllocatedPageCount));
+
+                (highTarget1, lowTarget1) = tracker.TargetDeltaRange;
+                maxAllocatedPageCount1 = tracker.logAccessor.allocatorBase.MaxAllocatedPageCount;
+
+                ////////////////////////////////////////////////////////
+                // Try to set memory size to a larger value than current
+                var result = db.Execute("CONFIG", "SET", option, largerSize);
+                ClassicAssert.AreEqual("OK", result.ToString());
+
+                currMemorySize = TestUtils.GetEffectiveMemorySize(largerSize, pageSize, out _);
+
+                // Continue to insert records until new memory capacity is reached
+                prevHead = info.HeadAddress;
+                prevTail = info.TailAddress;
+                while (info.HeadAddress == prevHead)
+                {
+                    var key = $"key{i++:00000}";
+                    _ = db.StringSet(key, val);
+
+                    prevHead = info.HeadAddress;
+                    prevTail = info.TailAddress;
+                    info = TestUtils.GetStoreAddressInfo(garnetServer);
+                }
+
+                lastIdxSecondRound = i - 1;
+                allocatedPagesSecondRound = store.hlogBase.AllocatedPageCount - 1;  // APC includes the one-ahead page allocation
+
+                // Verify that memory is fully utilized
+                Assert.That(prevTail - prevHead, Is.LessThanOrEqualTo(currMemorySize));
+
+                // SAVE and wait for completion
+                garnetServer.Save(SaveType.BackgroundSave);
+                while (garnetServer.LastSave().Ticks == DateTimeOffset.FromUnixTimeSeconds(0).Ticks)
+                    Thread.Sleep(10);
+            }
+
+            // Doing this here so lastIdxFirstRound remains visible for debugging without getting a warning.
+            Assert.That(lastIdxSecondRound, Is.GreaterThan(lastIdxFirstRound));
+
+            ///////////////////////////////////////////////////////////
+            // Restart server with initial memory size and recover data
+            server.Dispose(deleteDir: false);
+            server = TestUtils.CreateGarnetServer(null,
+                memorySize: memorySize,
+                indexSize: indexSize,
+                pageSize: pageSize,
+                useReviv: useReviv,
+                tryRecover: true);
+            server.Start();
+
+            store = server.Provider.StoreWrapper.store;
+            tracker = store.Log.LogSizeTracker;
+            var allocatedPagesRestore = store.hlogBase.AllocatedPageCount - 1;  // APC includes the one-ahead page allocation
+
+            var (highTargetRestore, lowTargetRestore) = tracker.TargetDeltaRange;
+            Assert.That(highTargetRestore, Is.EqualTo(highTarget1));
+            Assert.That(lowTargetRestore, Is.EqualTo(lowTarget1));
+            var maxAllocatedPageCount2 = tracker.logAccessor.allocatorBase.MaxAllocatedPageCount;
+            Assert.That(maxAllocatedPageCount2, Is.EqualTo(maxAllocatedPageCount1));
+
+            // Recovery and insertion don't track sizes exactly the same way with logSizeTracker enabled, so this is not entirely deterministic; just verify the ranges.
+            Assert.That(allocatedPagesRestore, Is.GreaterThanOrEqualTo(allocatedPagesFirstRound));
+            Assert.That(allocatedPagesRestore, Is.LessThanOrEqualTo(allocatedPagesSecondRound));
+            Assert.That(allocatedPagesRestore, Is.GreaterThanOrEqualTo(lowTargetRestore / store.Log.allocatorBase.PageSize));
+            Assert.That(allocatedPagesRestore, Is.LessThanOrEqualTo(RoundUp(highTargetRestore, store.Log.allocatorBase.PageSize) / store.Log.allocatorBase.PageSize));
+
+            using (var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true)))
+            {
+                var db = redis.GetDatabase(0);
+
+                // Find the smallest key index that still exists in the server
+                var c = lastIdxSecondRound;
+                while (c > 0 && db.KeyExists($"key{--c:00000}"))
+                    continue;
+
+                // Verify the head/tail addresses are within range and that the number of existing keys matches the head/tail range. We should have two records per page.
+                var addressRange = store.Log.TailAddress - store.Log.HeadAddress;
+                var addressRangePages = RoundUp(addressRange, store.Log.allocatorBase.PageSize) / store.Log.allocatorBase.PageSize;
+                Assert.That(addressRange, Is.LessThanOrEqualTo(highTargetRestore));
+                Assert.That(lastIdxSecondRound + 1 - c, Is.EqualTo(allocatedPagesRestore * 2));   // Two records per page; AllocatedPageCount includes the "allocate-ahead" page
+                Assert.That(lastIdxSecondRound + 1 - c, Is.EqualTo(addressRangePages * 2));
+
+                // Verify that all previous keys are not present in the database
+                while (c > 0)
+                    ClassicAssert.IsFalse(db.KeyExists($"key{--c:00000}"));
+            }
+        }
+    }
+
+    /// <summary>
+    /// Test memory utilization behavior when dynamically changing the memory size configuration using CONFIG SET.
+    /// </summary>
+    [TestFixture(RevivificationMode.NoReviv)]
+    [TestFixture(RevivificationMode.UseReviv)]
+    public class RespConfigIndexUtilizationTests : TestBase
+    {
+        GarnetServer server;
+        private readonly string memorySize = "3m";
+        private readonly string indexSize = "512";
+        private readonly string pageSize = $"{MinKvLogPageSize}";
+        private readonly bool useReviv;
+
+        public RespConfigIndexUtilizationTests(RevivificationMode revivMode)
+        {
+            this.useReviv = revivMode == RevivificationMode.UseReviv;
+        }
+
+        [SetUp]
+        public void Setup()
+        {
+            TestUtils.DeleteDirectory(TestUtils.MethodTestDir, wait: true);
+            server = TestUtils.CreateGarnetServer(null,
+                memorySize: memorySize,
+                indexSize: indexSize,
+                pageSize: pageSize,
+                useReviv: useReviv);
+            server.Start();
+        }
+
+        [TearDown]
+        public void TearDown()
+        {
+            server.Dispose();
+            TestUtils.OnTearDown();
+        }
+
+        /// <summary>
+        /// This test verifies that dynamically changing the index size configuration using CONFIG SET
+        /// incurs the expected shifts in the overflow buckets of the store, and that no data is lost in the process.
+        /// </summary>
+        /// <param name="largerSize1">Larger index size than configured</param>
+        /// <param name="largerSize2">Larger index size than previous</param>
+        [Test]
+        [TestCase("1024", "4096")]
+        public void ConfigSetIndexSizeUtilizationTest(string largerSize1, string largerSize2)
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true));
+            var db = redis.GetDatabase(0);
+            var option = "index";
+            var parsedIndexSize = ServerOptions.ParseSize(indexSize, out _);
+
+            var currIndexSize = server.Provider.StoreWrapper.store.IndexSize;
+
+            // Verify initial index size and overflow bucket allocations are zero
+            ClassicAssert.AreEqual(parsedIndexSize / 64, currIndexSize);
+            ClassicAssert.AreEqual(0, GetOverflowBucketAllocations());
+
+            // Generate data with random keys (so that hashtable overflows)
+            var val = new RedisValue("x");
+            var keys = new string[500];
+            for (var i = 0; i < keys.Length; i++)
+                keys[i] = TestUtils.GetRandomString(8);
+
+            // Insert first batch of data
+            for (var i = 0; i < 250; i++)
+                _ = db.StringSet(keys[i], val);
+
+            // Verify that overflow bucket allocations are non-zero after initial insertions
+            var currOverflowBucketAllocations = GetOverflowBucketAllocations();
+            ClassicAssert.Greater(currOverflowBucketAllocations, 0);
+            var prevOverflowBucketAllocations = currOverflowBucketAllocations;
+
+            // Try to set index size to a larger value than current
+            var result = db.Execute("CONFIG", "SET", option, largerSize1);
+            ClassicAssert.AreEqual("OK", result.ToString());
+
+            // Verify that overflow bucket allocations have not increased after growing the index.
+            // Note: the split algorithm may produce equal overflow counts in some cases because
+            // it inserts chain-start entries for both sides of the split, so we use LessOrEqual.
+            currOverflowBucketAllocations = GetOverflowBucketAllocations();
+            ClassicAssert.LessOrEqual(currOverflowBucketAllocations, prevOverflowBucketAllocations);
+
+            // Insert second batch of data
+            for (var i = 250; i < 500; i++)
+                _ = db.StringSet(keys[i], val);
+
+            prevOverflowBucketAllocations = GetOverflowBucketAllocations();
+
+            // Try to set index size to a larger value than current
+            result = db.Execute("CONFIG", "SET", option, largerSize2);
+            ClassicAssert.AreEqual("OK", result.ToString());
+
+            // Verify that overflow bucket allocations have not increased again
+            currOverflowBucketAllocations = GetOverflowBucketAllocations();
+            ClassicAssert.LessOrEqual(currOverflowBucketAllocations, prevOverflowBucketAllocations);
+
+            // Verify that all keys still exist in the database
+            foreach (var key in keys)
+                ClassicAssert.IsTrue(db.KeyExists(key));
+
+            long GetOverflowBucketAllocations() =>
+                server.Provider.StoreWrapper.store.OverflowBucketAllocations;
+        }
+    }
+
+    /// <summary>
+    /// Test memory utilization behavior when dynamically changing the memory size configuration using CONFIG SET memory.
+    /// </summary>
+    [TestFixture(RevivificationMode.NoReviv)]
+    [TestFixture(RevivificationMode.UseReviv)]
+    public class RespConfigHeapUtilizationTests : TestBase
+    {
+        GarnetServer server;
+        private readonly string memorySize = "3m";
+        private readonly string indexSize = "512";
+        private readonly string pageSize = $"{MinKvLogPageSize}";
+        private readonly bool useReviv;
+
+        public RespConfigHeapUtilizationTests(RevivificationMode revivMode)
+        {
+            this.useReviv = revivMode == RevivificationMode.UseReviv;
+        }
+
+        [SetUp]
+        public void Setup()
+        {
+            TestUtils.DeleteDirectory(TestUtils.MethodTestDir, wait: true);
+            server = TestUtils.CreateGarnetServer(null,
+                memorySize: memorySize,
+                indexSize: indexSize,
+                pageSize: pageSize,
+                useReviv: useReviv);
+            server.Start();
+        }
+
+        [TearDown]
+        public void TearDown()
+        {
+            server.Dispose();
+            TestUtils.OnTearDown();
+        }
+
+        /// <summary>
+        /// This test verifies that dynamically shrinking the main-log memory target via CONFIG SET memory
+        /// drives the log size tracker to evict pages / release heap so that total memory usage is reduced.
+        /// </summary>
+        /// <param name="smallerSize">Memory size smaller than the current total log+heap usage</param>
+        [Test]
+        [TestCase(MinKvLogPageSize * 16)]
+        public void ConfigSetHeapMemorySizeUtilizationTest(int smallerSize)
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true));
+            var db = redis.GetDatabase(0);
+            var option = "memory";
+
+            var store = server.Provider.StoreWrapper.store;
+            var tracker = store.Log.LogSizeTracker;
+
+            // Verify initial state: no data yet, allocated page count at the minimum.
+            ClassicAssert.AreEqual(RespConfigTests.MinLogAllocatedPageCount, store.Log.AllocatedPageCount);
+
+            // Insert enough list objects so that (a) the inline log grows beyond MinResizeTargetPageCount pages
+            // (required before DetermineEvictionRange can evict anything), and (b) the tracked heap size is
+            // well above the new target we're about to configure. Each list contributes ~4KB of heap
+            // (16 items * 256 bytes), and each record adds a small inline entry to the log.
+            const int numKeys = 1024;
+            var values = new RedisValue[16];
+            var valPayload = new string('x', 256);
+            for (var i = 0; i < values.Length; i++)
+                values[i] = valPayload;
+            for (var i = 0; i < numKeys; i++)
+                _ = db.ListRightPush($"key{i:00000}", values);
+
+            // Sanity-check the preconditions for the shrink/eviction we are about to trigger.
+            var apcBefore = store.Log.AllocatedPageCount;
+            var heapBefore = tracker.LogHeapSizeBytes;
+            Assert.That(apcBefore, Is.GreaterThan(1),
+                "Test precondition: need more than one page for eviction to be possible.");
+            Assert.That(heapBefore, Is.GreaterThan(0), "Test precondition: heap should be non-empty after inserts.");
+
+            using var trimCompleteEvent = new ManualResetEventSlim(false);
+            tracker.PostMemoryTrim = (allocatedPageCount, headAddress) => { trimCompleteEvent.Set(); };
+
+            // Shrink the memory target. The 'shrink' branch of LogSizeTracker.UpdateTargetSize signals the
+            // resizer task; because TotalSize is now well above highTargetSize, the task calls
+            // DetermineEvictionRange + ShiftAddresses and then invokes PostMemoryTrim.
+            var result = db.Execute("CONFIG", "SET", option, smallerSize);
+            ClassicAssert.AreEqual("OK", result.ToString());
+            Assert.That(tracker.TargetSize, Is.EqualTo(smallerSize));
+
+            // Wait for the trim callback.
+            Assert.That(trimCompleteEvent.Wait(TimeSpan.FromSeconds(3 * LogSizeTracker.ResizeTaskDelaySeconds)),
+                "Timeout occurred. PostMemoryTrim was not invoked after CONFIG SET memory shrink.");
+
+            // Verify that memory usage actually dropped: we expect at least one of the allocated page count
+            // or the tracked heap size to have decreased as a result of the eviction scan.
+            var apcAfter = store.Log.AllocatedPageCount;
+            var heapAfter = tracker.LogHeapSizeBytes;
+            Assert.That(apcAfter < apcBefore || heapAfter < heapBefore, Is.True,
+                $"Expected APC ({apcBefore}->{apcAfter}) or heap ({heapBefore}->{heapAfter}) to decrease after trim.");
+        }
+
+        /// <summary>
+        /// Verifies that runtime-adjustable options (backed by <see cref="RuntimeServerConfig"/>) can be
+        /// read and written through CONFIG GET / CONFIG SET, covering integer, long, boolean, enum,
+        /// seconds-based timeout, alias, and multi-option forms.
+        /// </summary>
+        [Test]
+        public void ConfigGetSetRuntimeOptionsTest()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true));
+            var db = redis.GetDatabase(0);
+
+            static string Get(IDatabase db, string requestName, string expectedEchoName = null)
+            {
+                var res = (RedisResult[])db.Execute("CONFIG", "GET", requestName);
+                ClassicAssert.AreEqual(2, res.Length);
+                ClassicAssert.AreEqual(expectedEchoName ?? requestName, res[0].ToString());
+                return res[1].ToString();
+            }
+
+            // Integer option.
+            ClassicAssert.AreEqual("OK", db.Execute("CONFIG", "SET", "replica-sync-delay", "42").ToString());
+            ClassicAssert.AreEqual("42", Get(db, "replica-sync-delay"));
+
+            // Integer option accepting the -1 sentinel.
+            ClassicAssert.AreEqual("OK", db.Execute("CONFIG", "SET", "aof-replay-max-lag-bytes", "-1").ToString());
+            ClassicAssert.AreEqual("-1", Get(db, "aof-replay-max-lag-bytes"));
+
+            // 64-bit (long) option: value exceeds int.MaxValue and round-trips, and the -1 sentinel disables.
+            var largeLag = ((long)int.MaxValue + 1).ToString();
+            ClassicAssert.AreEqual("OK", db.Execute("CONFIG", "SET", "aof-sync-max-lag-bytes", largeLag).ToString());
+            ClassicAssert.AreEqual(largeLag, Get(db, "aof-sync-max-lag-bytes"));
+            ClassicAssert.AreEqual("OK", db.Execute("CONFIG", "SET", "aof-sync-max-lag-bytes", "-1").ToString());
+            ClassicAssert.AreEqual("-1", Get(db, "aof-sync-max-lag-bytes"));
+
+            // Boolean option (yes/no).
+            ClassicAssert.AreEqual("OK", db.Execute("CONFIG", "SET", "sg-get", "no").ToString());
+            ClassicAssert.AreEqual("no", Get(db, "sg-get"));
+            ClassicAssert.AreEqual("OK", db.Execute("CONFIG", "SET", "sg-get", "yes").ToString());
+            ClassicAssert.AreEqual("yes", Get(db, "sg-get"));
+
+            // Enum option.
+            ClassicAssert.AreEqual("OK", db.Execute("CONFIG", "SET", "compaction-type", "Lookup").ToString());
+            ClassicAssert.AreEqual("Lookup", Get(db, "compaction-type"));
+
+            // An enum option also accepts its underlying numeric value, and reports back the member name.
+            ClassicAssert.AreEqual("OK", db.Execute("CONFIG", "SET", "compaction-type", "1").ToString());
+            ClassicAssert.AreEqual(nameof(LogCompactionType.Shift), Get(db, "compaction-type"));
+
+            // Timeout option expressed in seconds.
+            ClassicAssert.AreEqual("OK", db.Execute("CONFIG", "SET", "repl-attach-timeout", "30").ToString());
+            ClassicAssert.AreEqual("30", Get(db, "repl-attach-timeout"));
+
+            // Alias resolves to the canonical cluster-node-timeout option; CONFIG GET echoes the canonical name.
+            ClassicAssert.AreEqual("OK", db.Execute("CONFIG", "SET", "cluster-timeout", "77").ToString());
+            ClassicAssert.AreEqual("77", Get(db, "cluster-timeout", expectedEchoName: "cluster-node-timeout"));
+            ClassicAssert.AreEqual("77", Get(db, "cluster-node-timeout"));
+
+            // Multiple options in a single CONFIG SET.
+            ClassicAssert.AreEqual("OK",
+                db.Execute("CONFIG", "SET", "compaction-max-segments", "7", "object-scan-count-limit", "500").ToString());
+            ClassicAssert.AreEqual("7", Get(db, "compaction-max-segments"));
+            ClassicAssert.AreEqual("500", Get(db, "object-scan-count-limit"));
+        }
+
+        /// <summary>
+        /// Verifies that the GarnetClient (gossip) network-writer options are exposed as individual
+        /// runtime-adjustable parameters: they default to NetworkWriterOptions.Default, appear in
+        /// CONFIG GET *, and round-trip through CONFIG SET (int, long and enum kinds).
+        /// </summary>
+        [Test]
+        public void ConfigGetSetGossipOptionsTest()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true));
+            var db = redis.GetDatabase(0);
+
+            static string Get(IDatabase db, string name)
+            {
+                var res = (RedisResult[])db.Execute("CONFIG", "GET", name);
+                ClassicAssert.AreEqual(2, res.Length);
+                ClassicAssert.AreEqual(name, res[0].ToString());
+                return res[1].ToString();
+            }
+
+            var defaults = Garnet.client.NetworkWriterOptions.Default;
+
+            // Each slot is seeded from NetworkWriterOptions.Default.
+            ClassicAssert.AreEqual(defaults.NetworkBufferSizeBytes.ToString(), Get(db, "gossip-network-buffer-size"));
+            ClassicAssert.AreEqual(defaults.RequestPageSizeBytes.ToString(), Get(db, "gossip-request-page-size"));
+            ClassicAssert.AreEqual(defaults.RequestPageCount.ToString(), Get(db, "gossip-request-page-count"));
+            ClassicAssert.AreEqual(defaults.MaxOutstandingRequests.ToString(), Get(db, "gossip-max-outstanding-requests"));
+            ClassicAssert.AreEqual(defaults.MaxOutstandingCompletions.ToString(), Get(db, "gossip-max-outstanding-completions"));
+            ClassicAssert.AreEqual(defaults.MaxConcurrentNetworkSends.ToString(), Get(db, "gossip-max-concurrent-network-sends"));
+            ClassicAssert.AreEqual(defaults.MaxOutOfLineRentedBytes.ToString(), Get(db, "gossip-max-out-of-line-rented-bytes"));
+            ClassicAssert.AreEqual(nameof(Garnet.client.FlushResultAllocationMode.Buffered), Get(db, "gossip-flush-result-allocation-mode"));
+
+            // Integer option round-trips.
+            ClassicAssert.AreEqual("OK", db.Execute("CONFIG", "SET", "gossip-max-concurrent-network-sends", "32").ToString());
+            ClassicAssert.AreEqual("32", Get(db, "gossip-max-concurrent-network-sends"));
+
+            // 64-bit (long) option: value exceeds int.MaxValue and round-trips.
+            var largeBytes = ((long)int.MaxValue + 1).ToString();
+            ClassicAssert.AreEqual("OK", db.Execute("CONFIG", "SET", "gossip-max-out-of-line-rented-bytes", largeBytes).ToString());
+            ClassicAssert.AreEqual(largeBytes, Get(db, "gossip-max-out-of-line-rented-bytes"));
+            // Zero disables throttling and is accepted.
+            ClassicAssert.AreEqual("OK", db.Execute("CONFIG", "SET", "gossip-max-out-of-line-rented-bytes", "0").ToString());
+            ClassicAssert.AreEqual("0", Get(db, "gossip-max-out-of-line-rented-bytes"));
+
+            // Enum option round-trips through its member name and its underlying numeric value.
+            ClassicAssert.AreEqual("OK", db.Execute("CONFIG", "SET", "gossip-flush-result-allocation-mode", "PerOperation").ToString());
+            ClassicAssert.AreEqual(nameof(Garnet.client.FlushResultAllocationMode.PerOperation), Get(db, "gossip-flush-result-allocation-mode"));
+            ClassicAssert.AreEqual("OK", db.Execute("CONFIG", "SET", "gossip-flush-result-allocation-mode", "0").ToString());
+            ClassicAssert.AreEqual(nameof(Garnet.client.FlushResultAllocationMode.Buffered), Get(db, "gossip-flush-result-allocation-mode"));
+
+            // Multiple gossip options in a single CONFIG SET.
+            ClassicAssert.AreEqual("OK",
+                db.Execute("CONFIG", "SET", "gossip-network-buffer-size", "16384", "gossip-request-page-count", "4").ToString());
+            ClassicAssert.AreEqual("16384", Get(db, "gossip-network-buffer-size"));
+            ClassicAssert.AreEqual("4", Get(db, "gossip-request-page-count"));
+
+            // The gossip parameters are surfaced through CONFIG GET *.
+            var all = (RedisResult[])db.Execute("CONFIG", "GET", "*");
+            var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            for (var i = 0; i < all.Length; i += 2)
+                map[all[i].ToString()] = all[i + 1].ToString();
+            ClassicAssert.IsTrue(map.ContainsKey("gossip-network-buffer-size"));
+            ClassicAssert.IsTrue(map.ContainsKey("gossip-max-out-of-line-rented-bytes"));
+            ClassicAssert.IsTrue(map.ContainsKey("gossip-flush-result-allocation-mode"));
+
+            // The client-swap grace defaults to 5 seconds and round-trips through CONFIG SET.
+            ClassicAssert.AreEqual("5", Get(db, "gossip-client-swap-grace"));
+            ClassicAssert.IsTrue(map.ContainsKey("gossip-client-swap-grace"));
+            ClassicAssert.AreEqual("OK", db.Execute("CONFIG", "SET", "gossip-client-swap-grace", "10").ToString());
+            ClassicAssert.AreEqual("10", Get(db, "gossip-client-swap-grace"));
+            // Zero disables the grace window and is accepted.
+            ClassicAssert.AreEqual("OK", db.Execute("CONFIG", "SET", "gossip-client-swap-grace", "0").ToString());
+            ClassicAssert.AreEqual("0", Get(db, "gossip-client-swap-grace"));
+        }
+
+        /// <summary>
+        /// Verifies that CONFIG SET rejects malformed / out-of-range values for the gossip network-writer
+        /// options and that a rejected value does not mutate the option.
+        /// </summary>
+        [Test]
+        public void ConfigSetGossipOptionsValidationTest()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true));
+            var db = redis.GetDatabase(0);
+
+            // Out-of-range integer (min is 1).
+            var outOfRange = Assert.Throws<RedisServerException>(() => db.Execute("CONFIG", "SET", "gossip-request-page-count", "0"));
+            ClassicAssert.AreEqual("ERR Value for 'gossip-request-page-count' is out of range (1..2147483647).", outOfRange.Message);
+            // Non-integer value.
+            var notInteger = Assert.Throws<RedisServerException>(() => db.Execute("CONFIG", "SET", "gossip-network-buffer-size", "abc"));
+            ClassicAssert.AreEqual("ERR Invalid value for 'gossip-network-buffer-size': expected an integer.", notInteger.Message);
+            // Invalid enum value.
+            var badEnum = Assert.Throws<RedisServerException>(() => db.Execute("CONFIG", "SET", "gossip-flush-result-allocation-mode", "Bogus"));
+            ClassicAssert.AreEqual("ERR Invalid value for 'gossip-flush-result-allocation-mode': 'Bogus'.", badEnum.Message);
+
+            // A rejected value must not have mutated the option.
+            var res = (RedisResult[])db.Execute("CONFIG", "GET", "gossip-request-page-count");
+            ClassicAssert.AreEqual(Garnet.client.NetworkWriterOptions.Default.RequestPageCount.ToString(), res[1].ToString());
+        }
+
+        /// <summary>
+        /// Verifies that CONFIG SET rejects gossip values that pass their per-parameter range but fail the
+        /// NetworkWriterOptions cross-field constraints, rolls back every gossip parameter in the batch, and
+        /// leaves the group publishable so later CONFIG SETs still succeed.
+        /// </summary>
+        [Test]
+        public void ConfigSetGossipOptionsRejectsInvalidGroupTest()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true));
+            var db = redis.GetDatabase(0);
+            var defaults = Garnet.client.NetworkWriterOptions.Default;
+
+            static string Get(IDatabase db, string name) => ((RedisResult[])db.Execute("CONFIG", "GET", name))[1].ToString();
+
+            var pageCount = Assert.Throws<RedisServerException>(() => db.Execute("CONFIG", "SET", "gossip-request-page-count", "3"));
+            ClassicAssert.AreEqual("ERR Invalid GOSSIP_CLIENT configuration: Request page count must be a positive power of two. (Parameter 'requestPageCount')", pageCount.Message);
+            ClassicAssert.AreEqual(defaults.RequestPageCount.ToString(), Get(db, "gossip-request-page-count"));
+
+            var completions = Assert.Throws<RedisServerException>(() => db.Execute("CONFIG", "SET", "gossip-max-outstanding-completions", "3"));
+            StringAssert.Contains("power of two", completions.Message);
+            ClassicAssert.AreEqual(defaults.MaxOutstandingCompletions.ToString(), Get(db, "gossip-max-outstanding-completions"));
+
+            var capacity = Assert.Throws<RedisServerException>(() => db.Execute("CONFIG", "SET", "gossip-request-page-count", (1 << 20).ToString()));
+            StringAssert.Contains("must not exceed", capacity.Message);
+            ClassicAssert.AreEqual(defaults.RequestPageCount.ToString(), Get(db, "gossip-request-page-count"));
+
+            // An invalid member rolls back the batch's other gossip changes; ungrouped parameters still apply.
+            _ = Assert.Throws<RedisServerException>(() => db.Execute("CONFIG", "SET",
+                "gossip-max-concurrent-network-sends", "32", "gossip-request-page-count", "3", "object-scan-count-limit", "500"));
+            ClassicAssert.AreEqual(defaults.MaxConcurrentNetworkSends.ToString(), Get(db, "gossip-max-concurrent-network-sends"));
+            ClassicAssert.AreEqual(defaults.RequestPageCount.ToString(), Get(db, "gossip-request-page-count"));
+            ClassicAssert.AreEqual("500", Get(db, "object-scan-count-limit"));
+
+            // The group was never left in an invalid state, so later CONFIG SETs succeed.
+            ClassicAssert.AreEqual("OK", db.Execute("CONFIG", "SET", "gossip-request-page-count", "4").ToString());
+            ClassicAssert.AreEqual("4", Get(db, "gossip-request-page-count"));
+            ClassicAssert.AreEqual("OK", db.Execute("CONFIG", "SET", "object-scan-count-limit", "600").ToString());
+        }
+
+        /// <summary>
+        /// Verifies that concurrent multi-parameter CONFIG SET batches publish a group snapshot containing whole
+        /// batches only: each writer sets two gossip parameters to the same value, so a published snapshot with
+        /// differing values captured part of one batch alongside another.
+        /// </summary>
+        [Test]
+        public void RuntimeServerConfigPublishesWholeGroupBatchesConcurrently()
+        {
+            var runtimeConfig = new RuntimeServerConfig(new GarnetServerOptions());
+            var group = (IConfigGroup<Garnet.client.NetworkWriterOptions>)runtimeConfig.GetConfigGroup(ServerConfigGroupType.GOSSIP_CLIENT);
+            const int Writers = 4;
+            const int Iterations = 20_000;
+
+            var torn = 0;
+            var errors = 0;
+            // The defaults differ, so align both parameters before sampling.
+            runtimeConfig.TrySetAll(
+                [(ServerConfigType.GOSSIP_MAX_CONCURRENT_NETWORK_SENDS, "1"), (ServerConfigType.GOSSIP_MAX_OUTSTANDING_REQUESTS, "1")],
+                _ => Interlocked.Increment(ref errors));
+            using var done = new CancellationTokenSource();
+            var reader = Task.Run(() =>
+            {
+                while (!done.IsCancellationRequested)
+                {
+                    var options = group.Read(out _);
+                    if (options.MaxConcurrentNetworkSends != options.MaxOutstandingRequests)
+                        _ = Interlocked.Increment(ref torn);
+                }
+            });
+
+            var writers = new Task[Writers];
+            for (var w = 0; w < Writers; w++)
+            {
+                var value = (w + 1).ToString();
+                writers[w] = Task.Run(() =>
+                {
+                    for (var i = 0; i < Iterations; i++)
+                    {
+                        runtimeConfig.TrySetAll(
+                            [(ServerConfigType.GOSSIP_MAX_CONCURRENT_NETWORK_SENDS, value), (ServerConfigType.GOSSIP_MAX_OUTSTANDING_REQUESTS, value)],
+                            _ => Interlocked.Increment(ref errors));
+                    }
+                });
+            }
+
+            Task.WaitAll(writers);
+            done.Cancel();
+            reader.Wait();
+
+            ClassicAssert.AreEqual(0, errors);
+            ClassicAssert.AreEqual(0, torn);
+            var final = group.Read(out _);
+            ClassicAssert.AreEqual(final.MaxConcurrentNetworkSends, final.MaxOutstandingRequests);
+            ClassicAssert.AreEqual(runtimeConfig.GetInt(ServerConfigType.GOSSIP_MAX_CONCURRENT_NETWORK_SENDS), final.MaxConcurrentNetworkSends);
+        }
+
+        /// <summary>
+        /// Verifies that an enum-valued option round-trips through its member name and through its
+        /// underlying numeric value, and that a numeric value naming no declared member is rejected.
+        /// </summary>
+        [Test]
+        public void RuntimeServerConfigRoundTripsEnumOption()
+        {
+            var runtimeConfig = new RuntimeServerConfig(new GarnetServerOptions());
+
+            // Member name, matched without regard to case.
+            ClassicAssert.IsTrue(runtimeConfig.TrySet(ServerConfigType.COMPACTION_TYPE, "lookup", out var error));
+            ClassicAssert.IsNull(error);
+            ClassicAssert.AreEqual(LogCompactionType.Lookup, runtimeConfig.GetEnum<LogCompactionType>(ServerConfigType.COMPACTION_TYPE));
+            ClassicAssert.AreEqual(nameof(LogCompactionType.Lookup), runtimeConfig.RespFormat(ServerConfigType.COMPACTION_TYPE));
+
+            // Underlying numeric value, reported back as the member name.
+            ClassicAssert.IsTrue(runtimeConfig.TrySet(ServerConfigType.COMPACTION_TYPE,
+                ((int)LogCompactionType.Shift).ToString(), out error));
+            ClassicAssert.IsNull(error);
+            ClassicAssert.AreEqual(LogCompactionType.Shift, runtimeConfig.GetEnum<LogCompactionType>(ServerConfigType.COMPACTION_TYPE));
+            ClassicAssert.AreEqual(nameof(LogCompactionType.Shift), runtimeConfig.RespFormat(ServerConfigType.COMPACTION_TYPE));
+
+            // A numeric value naming no declared member leaves the option untouched.
+            ClassicAssert.IsFalse(runtimeConfig.TrySet(ServerConfigType.COMPACTION_TYPE, "999", out error));
+            ClassicAssert.AreEqual("ERR Invalid value for 'compaction-type': '999'.", error);
+            ClassicAssert.AreEqual(LogCompactionType.Shift, runtimeConfig.GetEnum<LogCompactionType>(ServerConfigType.COMPACTION_TYPE));
+        }
+
+        /// <summary>
+        /// Verifies that a duration-valued option can be read through every unit it declares, and that a
+        /// non-positive value is surfaced as an infinite timeout where that is the documented meaning.
+        /// </summary>
+        [Test]
+        public void RuntimeServerConfigExposesDurationsInEveryDeclaredUnit()
+        {
+            var runtimeConfig = new RuntimeServerConfig(new GarnetServerOptions { ReplicaSyncDelayMs = 5000 });
+
+            ClassicAssert.AreEqual(5000, runtimeConfig.GetInt(ServerConfigType.REPLICA_SYNC_DELAY));
+            ClassicAssert.AreEqual(5000, runtimeConfig.GetMilliseconds(ServerConfigType.REPLICA_SYNC_DELAY));
+            ClassicAssert.AreEqual(5, runtimeConfig.GetSeconds(ServerConfigType.REPLICA_SYNC_DELAY));
+            ClassicAssert.AreEqual(TimeSpan.FromSeconds(5), runtimeConfig.GetTimeSpan(ServerConfigType.REPLICA_SYNC_DELAY));
+
+            // A zero value is surfaced as an infinite timeout (the "non-positive means infinite" convention).
+            ClassicAssert.IsTrue(runtimeConfig.TrySet(ServerConfigType.CLUSTER_NODE_TIMEOUT, "0", out var error));
+            ClassicAssert.IsNull(error);
+            ClassicAssert.AreEqual(Timeout.InfiniteTimeSpan, runtimeConfig.GetTimeSpan(ServerConfigType.CLUSTER_NODE_TIMEOUT));
+
+            // A negative value is out of range (0 is the canonical way to request an infinite timeout).
+            ClassicAssert.IsFalse(runtimeConfig.TrySet(ServerConfigType.CLUSTER_NODE_TIMEOUT, "-3", out error));
+            ClassicAssert.AreEqual("ERR Value for 'cluster-node-timeout' is out of range (0..2147483647).", error);
+            ClassicAssert.AreEqual("0", runtimeConfig.RespFormat(ServerConfigType.CLUSTER_NODE_TIMEOUT));
+        }
+
+        /// <summary>
+        /// Verifies that the slow log can be enabled at runtime on a server that started with it disabled,
+        /// which requires the threshold to be read live rather than captured at startup.
+        /// </summary>
+        [Test]
+        public void ConfigSetSlowLogThresholdTakesEffectAtRuntime()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true));
+            var db = redis.GetDatabase(0);
+
+            // The server starts with the slow log disabled.
+            ClassicAssert.AreEqual("0", ((RedisResult[])db.Execute("CONFIG", "GET", "slowlog-log-slower-than"))[1].ToString());
+
+            // Enable it with a threshold low enough that every command qualifies, regardless of host speed.
+            ClassicAssert.AreEqual("OK", db.Execute("CONFIG", "SET", "slowlog-log-slower-than", "1").ToString());
+            ClassicAssert.AreEqual("1", ((RedisResult[])db.Execute("CONFIG", "GET", "slowlog-log-slower-than"))[1].ToString());
+
+            for (var i = 0; i < 5; i++)
+                _ = db.StringSet($"slowlog-key-{i}", "value");
+
+            ClassicAssert.Greater((int)db.Execute("SLOWLOG", "LEN"), 0);
+        }
+
+        /// <summary>
+        /// Verifies that CONFIG SET rejects malformed / out-of-range values for runtime-adjustable options
+        /// and that a rejected value does not mutate the option.
+        /// </summary>
+        [Test]
+        public void ConfigSetRuntimeOptionValidationTest()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true));
+            var db = redis.GetDatabase(0);
+
+            // Out-of-range integer (min is 0).
+            var outOfRange = Assert.Throws<RedisServerException>(() => db.Execute("CONFIG", "SET", "replica-sync-delay", "-5"));
+            ClassicAssert.AreEqual("ERR Value for 'replica-sync-delay' is out of range (0..2147483647).", outOfRange.Message);
+            // Non-integer value.
+            var notInteger = Assert.Throws<RedisServerException>(() => db.Execute("CONFIG", "SET", "compaction-max-segments", "abc"));
+            ClassicAssert.AreEqual("ERR Invalid value for 'compaction-max-segments': expected an integer.", notInteger.Message);
+            // Invalid enum value.
+            var badEnum = Assert.Throws<RedisServerException>(() => db.Execute("CONFIG", "SET", "compaction-type", "Bogus"));
+            ClassicAssert.AreEqual("ERR Invalid value for 'compaction-type': 'Bogus'.", badEnum.Message);
+            // An out-of-range numeric value does not name a declared member and is rejected.
+            var numericEnumOutOfRange = Assert.Throws<RedisServerException>(() => db.Execute("CONFIG", "SET", "compaction-type", "999"));
+            ClassicAssert.AreEqual("ERR Invalid value for 'compaction-type': '999'.", numericEnumOutOfRange.Message);
+            // Invalid boolean value.
+            var badBool = Assert.Throws<RedisServerException>(() => db.Execute("CONFIG", "SET", "sg-get", "maybe"));
+            ClassicAssert.AreEqual("ERR Invalid value for 'sg-get': expected 'yes' or 'no'.", badBool.Message);
+
+            // A rejected value must not have mutated the option.
+            var res = (RedisResult[])db.Execute("CONFIG", "GET", "compaction-max-segments");
+            ClassicAssert.AreNotEqual("abc", res[1].ToString());
+        }
+
+        /// <summary>
+        /// Verifies that read-only parameters exposed through the runtime config table (timeout, save,
+        /// appendonly, databases) reject CONFIG SET, and that CONFIG GET * includes the fixed
+        /// slave-read-only compatibility setting.
+        /// </summary>
+        [Test]
+        public void ConfigGetAllAndReadOnlyRejectionTest()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true));
+            var db = redis.GetDatabase(0);
+
+            // CONFIG SET on read-only parameters is rejected.
+            var appendOnly = Assert.Throws<RedisServerException>(() => db.Execute("CONFIG", "SET", "appendonly", "yes"));
+            ClassicAssert.AreEqual("ERR Option 'appendonly' is read-only and cannot be set at runtime.", appendOnly.Message);
+            var databases = Assert.Throws<RedisServerException>(() => db.Execute("CONFIG", "SET", "databases", "32"));
+            ClassicAssert.AreEqual("ERR Option 'databases' is read-only and cannot be set at runtime.", databases.Message);
+            var timeout = Assert.Throws<RedisServerException>(() => db.Execute("CONFIG", "SET", "timeout", "10"));
+            ClassicAssert.AreEqual("ERR Option 'timeout' is read-only and cannot be set at runtime.", timeout.Message);
+
+            // CONFIG GET * returns a name/value map including read-only parameters and compatibility settings.
+            var all = (RedisResult[])db.Execute("CONFIG", "GET", "*");
+            ClassicAssert.IsTrue(all.Length % 2 == 0);
+            var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            for (var i = 0; i < all.Length; i += 2)
+                map[all[i].ToString()] = all[i + 1].ToString();
+
+            // Read-only parameters.
+            ClassicAssert.IsTrue(map.ContainsKey("timeout"));
+            ClassicAssert.IsTrue(map.ContainsKey("save"));
+            ClassicAssert.IsTrue(map.ContainsKey("appendonly"));
+            ClassicAssert.IsTrue(map.ContainsKey("databases"));
+            // Fixed compatibility setting.
+            ClassicAssert.IsTrue(map.ContainsKey("slave-read-only"));
+            ClassicAssert.AreEqual("yes", map["slave-read-only"]);
+            // A settable runtime parameter.
+            ClassicAssert.IsTrue(map.ContainsKey("replica-sync-delay"));
+        }
+
+        /// <summary>
+        /// Verifies that the read-only AOF parameters are exposed through CONFIG GET (and GET *) but reject
+        /// CONFIG SET because they describe the physical AOF layout / startup-only toggles.
+        /// </summary>
+        [Test]
+        public void ConfigAofReadOnlyParametersTest()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true));
+            var db = redis.GetDatabase(0);
+
+            string[] readOnly =
+            [
+                "aof-memory", "aof-page-size", "aof-segment-size", "aof-physical-sublog-count",
+                "aof-replay-task-count", "aof-commit-wait", "aof-size-limit", "fast-aof-truncate",
+                "aof-null-device",
+            ];
+
+            foreach (var name in readOnly)
+            {
+                // Exposed through CONFIG GET.
+                var res = (RedisResult[])db.Execute("CONFIG", "GET", name);
+                ClassicAssert.AreEqual(2, res.Length);
+                ClassicAssert.AreEqual(name, res[0].ToString());
+
+                // But rejected by CONFIG SET.
+                var ex = Assert.Throws<RedisServerException>(() => db.Execute("CONFIG", "SET", name, res[1].ToString()));
+                ClassicAssert.AreEqual($"ERR Option '{name}' is read-only and cannot be set at runtime.", ex.Message);
+            }
+
+            // All appear in CONFIG GET *.
+            var all = (RedisResult[])db.Execute("CONFIG", "GET", "*");
+            var map = new Dictionary<string, string>(StringComparer.OrdinalIgnoreCase);
+            for (var i = 0; i < all.Length; i += 2)
+                map[all[i].ToString()] = all[i + 1].ToString();
+            foreach (var name in readOnly)
+                ClassicAssert.IsTrue(map.ContainsKey(name), $"CONFIG GET * missing '{name}'.");
+        }
+
+        /// <summary>
+        /// Verifies that the runtime-adjustable AOF options round-trip through CONFIG GET / CONFIG SET and
+        /// that out-of-range values are rejected.
+        /// </summary>
+        [Test]
+        public void ConfigAofRuntimeAdjustableParametersTest()
+        {
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true));
+            var db = redis.GetDatabase(0);
+
+            static string Get(IDatabase db, string name)
+            {
+                var res = (RedisResult[])db.Execute("CONFIG", "GET", name);
+                ClassicAssert.AreEqual(2, res.Length);
+                ClassicAssert.AreEqual(name, res[0].ToString());
+                return res[1].ToString();
+            }
+
+            // aof-size-limit-enforce-frequency round-trips.
+            ClassicAssert.AreEqual("OK", db.Execute("CONFIG", "SET", "aof-size-limit-enforce-frequency", "10").ToString());
+            ClassicAssert.AreEqual("10", Get(db, "aof-size-limit-enforce-frequency"));
+            var negative = Assert.Throws<RedisServerException>(() => db.Execute("CONFIG", "SET", "aof-size-limit-enforce-frequency", "-1"));
+            ClassicAssert.AreEqual("ERR Value for 'aof-size-limit-enforce-frequency' is out of range (0..2147483647).", negative.Message);
+        }
+    }
+
+    /// <summary>
+    /// Tests for runtime CONFIG SET of background-task frequencies whose change is enacted by a task
+    /// lifecycle action (start / kill / restart) wired through <c>ConfigMeta.UpdateAction</c>.
+    /// </summary>
+    [TestFixture]
+    public class RespConfigTaskLifecycleTests : TestBase
+    {
+        GarnetServer server;
+
+        [SetUp]
+        public void Setup()
+        {
+            TestUtils.DeleteDirectory(TestUtils.MethodTestDir, wait: true);
+        }
+
+        [TearDown]
+        public void TearDown()
+        {
+            server?.Dispose();
+            TestUtils.OnTearDown();
+        }
+
+        static string Get(IDatabase db, string name)
+        {
+            var res = (RedisResult[])db.Execute("CONFIG", "GET", name);
+            ClassicAssert.AreEqual(2, res.Length);
+            ClassicAssert.AreEqual(name, res[0].ToString());
+            return res[1].ToString();
+        }
+
+        /// <summary>
+        /// When the server starts with per-operation auto-commit (aof-commit-freq 0), the value is fixed
+        /// into the AOF log at startup: runtime CONFIG SET is rejected and the option is left unchanged.
+        /// </summary>
+        [Test]
+        public void ConfigCommitFreqRejectedWhenStartedAtZeroTest()
+        {
+            server = TestUtils.CreateGarnetServer(TestUtils.MethodTestDir, enableAOF: true, commitFrequencyMs: 0);
+            server.Start();
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true));
+            var db = redis.GetDatabase(0);
+
+            ClassicAssert.AreEqual("0", Get(db, "aof-commit-freq"));
+
+            var toZero = Assert.Throws<RedisServerException>(() => db.Execute("CONFIG", "SET", "aof-commit-freq", "0"));
+            ClassicAssert.AreEqual("ERR 'aof-commit-freq' cannot be set to 0 at runtime; per-operation auto-commit is fixed at startup.", toZero.Message);
+
+            var fromZero = Assert.Throws<RedisServerException>(() => db.Execute("CONFIG", "SET", "aof-commit-freq", "100"));
+            ClassicAssert.AreEqual("ERR 'aof-commit-freq' cannot be changed at runtime because the server started with per-operation auto-commit (0).", fromZero.Message);
+
+            ClassicAssert.AreEqual("0", Get(db, "aof-commit-freq"));
+        }
+
+        /// <summary>
+        /// When the server starts with periodic commit (aof-commit-freq &gt; 0), the safe {-1, &gt; 0}
+        /// transitions are accepted and enacted by restarting / killing the commit task, while a move to 0
+        /// remains rejected and leaves the value intact.
+        /// </summary>
+        [Test]
+        public void ConfigCommitFreqRuntimeAdjustableTest()
+        {
+            server = TestUtils.CreateGarnetServer(TestUtils.MethodTestDir, enableAOF: true, commitFrequencyMs: 100);
+            server.Start();
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true));
+            var db = redis.GetDatabase(0);
+
+            ClassicAssert.AreEqual("100", Get(db, "aof-commit-freq"));
+
+            // -1 disables the periodic task (manual commit).
+            ClassicAssert.AreEqual("OK", db.Execute("CONFIG", "SET", "aof-commit-freq", "-1").ToString());
+            ClassicAssert.AreEqual("-1", Get(db, "aof-commit-freq"));
+
+            // A positive value re-enables / retunes the task.
+            ClassicAssert.AreEqual("OK", db.Execute("CONFIG", "SET", "aof-commit-freq", "250").ToString());
+            ClassicAssert.AreEqual("250", Get(db, "aof-commit-freq"));
+
+            // 0 remains rejected because auto-commit cannot be toggled on a live log.
+            var toZero = Assert.Throws<RedisServerException>(() => db.Execute("CONFIG", "SET", "aof-commit-freq", "0"));
+            ClassicAssert.AreEqual("ERR 'aof-commit-freq' cannot be set to 0 at runtime; per-operation auto-commit is fixed at startup.", toZero.Message);
+            ClassicAssert.AreEqual("250", Get(db, "aof-commit-freq"));
+        }
+
+        /// <summary>
+        /// expired-key-deletion-scan-freq toggles the background scan task, which in turn gates the
+        /// on-demand EXPDELSCAN command — verifying that the admin command reads the runtime value rather
+        /// than the startup value.
+        /// </summary>
+        [Test]
+        public void ConfigExpiredKeyDeletionScanRuntimeAdjustableTest()
+        {
+            server = TestUtils.CreateGarnetServer(TestUtils.MethodTestDir, expiredKeyDeletionScanFrequencySecs: -1);
+            server.Start();
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true));
+            var db = redis.GetDatabase(0);
+
+            ClassicAssert.AreEqual("-1", Get(db, "expired-key-deletion-scan-freq"));
+
+            // With the background scan disabled, on-demand EXPDELSCAN is allowed.
+            Assert.DoesNotThrow(() => db.Execute("EXPDELSCAN"));
+
+            // Enabling the background scan starts the task and disables the on-demand command.
+            ClassicAssert.AreEqual("OK", db.Execute("CONFIG", "SET", "expired-key-deletion-scan-freq", "5").ToString());
+            ClassicAssert.AreEqual("5", Get(db, "expired-key-deletion-scan-freq"));
+            var ex = Assert.Throws<RedisServerException>(() => db.Execute("EXPDELSCAN"));
+            ClassicAssert.AreEqual("ERR Cannot execute EXPDELSCAN with background expired key deletion scan enabled", ex.Message);
+
+            // Disabling it again kills the task and re-enables the on-demand command.
+            ClassicAssert.AreEqual("OK", db.Execute("CONFIG", "SET", "expired-key-deletion-scan-freq", "-1").ToString());
+            ClassicAssert.AreEqual("-1", Get(db, "expired-key-deletion-scan-freq"));
+            Assert.DoesNotThrow(() => db.Execute("EXPDELSCAN"));
+        }
+
+        /// <summary>
+        /// expired-object-collection-freq round-trips through CONFIG GET / CONFIG SET and starts / kills
+        /// the background collection task accordingly.
+        /// </summary>
+        [Test]
+        public void ConfigExpiredObjectCollectionRuntimeAdjustableTest()
+        {
+            server = TestUtils.CreateGarnetServer(TestUtils.MethodTestDir);
+            server.Start();
+            using var redis = ConnectionMultiplexer.Connect(TestUtils.GetConfig(allowAdmin: true));
+            var db = redis.GetDatabase(0);
+
+            ClassicAssert.AreEqual("0", Get(db, "expired-object-collection-freq"));
+
+            // Enabling starts the collection task.
+            ClassicAssert.AreEqual("OK", db.Execute("CONFIG", "SET", "expired-object-collection-freq", "5").ToString());
+            ClassicAssert.AreEqual("5", Get(db, "expired-object-collection-freq"));
+
+            // Disabling kills it.
+            ClassicAssert.AreEqual("OK", db.Execute("CONFIG", "SET", "expired-object-collection-freq", "0").ToString());
+            ClassicAssert.AreEqual("0", Get(db, "expired-object-collection-freq"));
+
+            // Out-of-range values are rejected.
+            var negative = Assert.Throws<RedisServerException>(() => db.Execute("CONFIG", "SET", "expired-object-collection-freq", "-1"));
+            ClassicAssert.AreEqual("ERR Value for 'expired-object-collection-freq' is out of range (0..2147483647).", negative.Message);
+        }
+    }
+}

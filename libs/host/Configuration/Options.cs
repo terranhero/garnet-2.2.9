@@ -1,0 +1,1211 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.ComponentModel.DataAnnotations;
+using System.IO;
+using System.Linq;
+using System.Net;
+using System.Net.Sockets;
+using System.Reflection;
+using System.Runtime.InteropServices;
+using System.Security.Cryptography.X509Certificates;
+using System.Threading;
+using Azure.Identity;
+using CommandLine;
+using Garnet.common;
+using Garnet.server;
+using Garnet.server.Auth.Aad;
+using Garnet.server.Auth.Settings;
+using Garnet.server.TLS;
+using Microsoft.Extensions.Logging;
+using Tsavorite.core;
+using Tsavorite.devices;
+
+namespace Garnet
+{
+    /// <summary>
+    /// This class contains all configurable settings for Garnet
+    /// In order to add a new configurable setting:
+    /// 1. Add a new property and decorate it with an OptionAttribute.
+    /// 2. If needed, decorate with a new or existing ValidationAttribute from OptionsValidators.cs
+    /// 3. Add a default value for the new property in defaults.conf (do NOT use the OptionAttribute.Default property, it can cause unexpected behavior)
+    /// 4. If needed, add a matching property in Garnet.server/Servers/GarnetServerOptions.cs and initialize it in Options.GetServerOptions()
+    /// 5. If new setting has a matching setting in redis.conf, add the matching setting to RedisOptions.cs
+    /// </summary>
+    internal sealed class Options : ICloneable
+    {
+        [IntRangeValidation(0, 65535)]
+        [Option("port", Required = false, HelpText = "Port to run server on")]
+        public int Port { get; set; }
+
+        [IpAddressValidation(false)]
+        [Option("bind", Required = false, HelpText = "Whitespace or comma separated string of IP addresses to bind server to (default: any)")]
+        public string Address { get; set; }
+
+        [IntRangeValidation(0, 65535)]
+        [Option("cluster-announce-port", Required = false, HelpText = "Client-advertised port. Also used by peers unless cluster-port is set.")]
+        public int ClusterAnnouncePort { get; set; }
+
+        [IpAddressValidation(false)]
+        [Option("cluster-announce-ip", Required = false, HelpText = "Client-advertised IP address. Also used by peers unless cluster-address is set.")]
+        public string ClusterAnnounceIp { get; set; }
+
+        [Option("cluster-announce-hostname", Required = false, HelpText = "Client-advertised hostname.")]
+        public string ClusterAnnounceHostname { get; set; }
+
+        [ClusterAddressValidation]
+        [Option("cluster-address", Required = false, HelpText = "IP address advertised for peer connections. Defaults to the client-advertised IP address.")]
+        public string ClusterAddress { get; set; }
+
+        [ClusterPortValidation]
+        [Option("cluster-port", Required = false, HelpText = "Port advertised for peer connections. Defaults to the client-advertised port.")]
+        public int? ClusterPort { get; set; }
+
+        [Option("cluster-preferred-endpoint-type", Required = false, HelpText = "Determines the endpoint type to be advertised to other nodes. (value options: ip, hostname, unknown)")]
+        public ClusterPreferredEndpointType ClusterPreferredEndpointType { get; set; }
+
+        [MemorySizeValidation]
+        [Option('m', "memory", Required = false, HelpText = "Total main-log memory (inline and heap) to use, in bytes. Does not need to be a power of 2")]
+        public string LogMemorySize { get; set; }
+
+        [MemorySizeValidation]
+        [Option('p', "page", Required = false, HelpText = "Size of each main-log page in bytes (rounds down to power of 2; minimum 512).")]
+        public string PageSize { get; set; }
+
+        [IntRangeValidation(0, MemoryUtils.ArrayMaxLength)]
+        [Option("pagecount", Required = false, HelpText = "Number of main-log pages (rounds down to power of 2). This allows specifying less pages initially than LogMemorySize divided by PageSize.")]
+        public int PageCount { get; set; }
+
+        [MemorySizeValidation]
+        [Option('s', "segment", Required = false, HelpText = "Size of each main-log segment in bytes on disk (rounds down to power of 2)")]
+        public string SegmentSize { get; set; }
+
+        [MemorySizeValidation]
+        [Option("object-log-segment", Required = false, HelpText = "Size of each object-log segment in bytes on disk (rounds down to power of 2)")]
+        public string ObjectLogSegmentSize { get; set; }
+
+        [MemorySizeValidation]
+        [Option('i', "index", Required = false, HelpText = "Start size of hash index in bytes (rounds down to power of 2)")]
+        public string IndexMemorySize { get; set; }
+
+        [MemorySizeValidation(false)]
+        [Option("index-max-size", Required = false, HelpText = "Max size of hash index in bytes (rounds down to power of 2)")]
+        public string IndexMaxMemorySize { get; set; }
+
+
+        [OptionValidation]
+        [Option("use-native-allocator", Required = false, HelpText = "Route large memory regions (log pages / hash index / recovery frames) through a native (off-managed-heap) direct-VM allocator (mmap/VirtualAlloc) instead of the GC heap. No native library is required. When enabled, this memory is outside the managed GC heap: size GCHeapHardLimit to leave headroom and monitor 'native_allocator_bytes' in INFO memory.")]
+        public bool? UseNativeAllocator { get; set; }
+
+        [OptionValidation]
+        [Option("use-legacy-buffer-pool", Required = false, HelpText = "Select the per-level ConcurrentQueue SectorAlignedBufferPool instead of the default origin-return (per-thread) pool. The origin-return pool returns each buffer to the thread that allocated it, so it scales with concurrent IO-completion threads under a per-pool byte budget.")]
+        public bool? UseLegacyBufferPool { get; set; }
+
+        [MemorySizeValidation]
+        [Option("buffer-pool-memory-budget", Required = false, HelpText = "Per-pool managed byte budget for the default origin-return SectorAlignedBufferPool (ignored when --use-legacy-buffer-pool is set). Bounds the total cacheable buffer bytes across all IO-completion threads, reserving 25% for small size-classes and 75% for large so large record/flush buffers cannot starve caching of hot small buffers. Requests above the pooled ceiling, or beyond the budget, allocate on demand and free on return (bounded memory, lower reuse). Set to 0 to disable buffer caching entirely (every IO buffer is allocated on demand and reclaimed by the GC; applies to both pool backends). E.g. 1g, 8g.")]
+        public string BufferPoolMemoryBudget { get; set; }
+
+        [PercentageValidation(false)]
+        [Option("mutable-percent", Required = false, HelpText = "Percentage of log memory that is kept mutable")]
+        public int MutablePercent { get; set; }
+
+        [OptionValidation]
+        [Option("readcache", Required = false, HelpText = "Enables read cache for faster access to on-disk records.")]
+        public bool? EnableReadCache { get; set; }
+
+        [MemorySizeValidation]
+        [Option("readcache-memory", Required = false, HelpText = "Total readcache-log memory (inline and heap) to use if readcache is enabled, in bytes. Does not need to be a power of 2")]
+        public string ReadCacheMemorySize { get; set; }
+
+        [MemorySizeValidation]
+        [Option("readcache-page", Required = false, HelpText = "Size of each read cache page in bytes (rounds down to power of 2; minimum 512).")]
+        public string ReadCachePageSize { get; set; }
+
+        [IntRangeValidation(0, MemoryUtils.ArrayMaxLength)]
+        [Option("readcache-pagecount", Required = false, HelpText = "Number of readcache-log pages (rounds down to power of 2). This allows specifying less pages initially than ReadCacheMemorySize divided by ReadCachePageSize.")]
+        public int ReadCachePageCount { get; set; }
+
+        [OptionValidation]
+        [Option("storage-tier", Required = false, HelpText = "Enable tiering of records (hybrid log) to storage, to support a larger-than-memory store. Use --logdir to specify storage directory.")]
+        public bool? EnableStorageTier { get; set; }
+
+        [OptionValidation]
+        [Option("copy-reads-to-tail", Required = false, HelpText = "When records are read from the main store's in-memory immutable region or storage device, copy them to the tail of the log.")]
+        public bool? CopyReadsToTail { get; set; }
+
+        [LogDirValidation(false, false)]
+        [Option('l', "logdir", Required = false, HelpText = "Storage directory for tiered records (hybrid log), if storage tiering (--storage-tier) is enabled. Uses current directory if unspecified.")]
+        public string LogDir { get; set; }
+
+        [CheckpointDirValidation(false, false)]
+        [Option('c', "checkpointdir", Required = false, HelpText = "Storage directory for checkpoints. Uses logdir if unspecified.")]
+        public string CheckpointDir { get; set; }
+
+        [OptionValidation]
+        [Option('r', "recover", Required = false, HelpText = "Recover from latest checkpoint and log, if present.")]
+        public bool? Recover { get; set; }
+
+        [OptionValidation]
+        [Option("no-pubsub", Required = false, HelpText = "Disable pub/sub feature on server.")]
+        public bool? DisablePubSub { get; set; }
+
+        [MemorySizeValidation]
+        [Option("pubsub-pagesize", Required = false, HelpText = "Page size of log used for pub/sub (rounds down to power of 2)")]
+        public string PubSubPageSize { get; set; }
+
+        [OptionValidation]
+        [Option("no-obj", Required = false, HelpText = "Disable support for data structure objects.")]
+        public bool? DisableObjects { get; set; }
+
+        [OptionValidation]
+        [Option("cluster", Required = false, HelpText = "Enable cluster.")]
+        public bool? EnableCluster { get; set; }
+
+        [OptionValidation]
+        [Option("clean-cluster-config", Required = false, HelpText = "Start with clean cluster config.")]
+        public bool? CleanClusterConfig { get; set; }
+
+        [IntRangeValidation(0, 16384)]
+        [Option("pmt", Required = false, HelpText = "Number of parallel migrate tasks to spawn when SLOTS or SLOTSRANGE option is used.")]
+        public int ParallelMigrateTaskCount { get; set; }
+
+        [OptionValidation]
+        [Option("fast-migrate", Required = false, HelpText = "When migrating slots 1. write directly to network buffer to avoid unnecessary copies, 2. do not wait for ack from target before sending next batch of keys.")]
+        public bool? FastMigrate { get; set; }
+
+        [Option("auth", Required = false, HelpText = "Authentication mode of Garnet. This impacts how AUTH command is processed and how clients are authenticated against Garnet. Value options: NoAuth, Password, Aad, ACL")]
+        public GarnetAuthenticationMode AuthenticationMode { get; set; }
+
+        [HiddenOption]
+        [Option("password", Required = false, HelpText = "Authentication string for password authentication.")]
+        public string Password { get; set; }
+
+        [Option("cluster-username", Required = false, HelpText = "Username to authenticate intra-cluster communication with.")]
+        public string ClusterUsername { get; set; }
+
+        [HiddenOption]
+        [Option("cluster-password", Required = false, HelpText = "Password to authenticate intra-cluster communication with.")]
+        public string ClusterPassword { get; set; }
+
+        [FilePathValidation(true, true, false)]
+        [Option("acl-file", Required = false, HelpText = "External ACL user file.")]
+        public string AclFile { get; set; }
+
+        [OptionValidation]
+        [Option("acl-strict-custom-commands", Required = false, HelpText = "If true (default), the server refuses to start when an ACL rule references a custom (extension) command name that no loaded module has registered. Set to false to load unresolved names as-is and log warnings.")]
+        public bool? AclStrictCustomCommands { get; set; }
+
+        [Option("aad-authority", Required = false, HelpText = "The authority of AAD authentication.")]
+        public string AadAuthority { get; set; }
+
+        [Option("aad-audiences", Required = false, HelpText = "The audiences of AAD token for AAD authentication. Should be a comma separated string.")]
+        public string AadAudiences { get; set; }
+
+        [Option("aad-issuers", Required = false, HelpText = "The issuers of AAD token for AAD authentication. Should be a comma separated string.")]
+        public string AadIssuers { get; set; }
+
+        [Option("aad-authorized-app-ids", Required = false, HelpText = "The authorized client app Ids for AAD authentication. Should be a comma separated string.")]
+        public string AuthorizedAadApplicationIds { get; set; }
+
+        [Option("aad-validate-acl-username", Required = false, HelpText = "Only valid for AclWithAAD mode. Validates username -  expected to be OID of client app or a valid group's object id of which the client is part of.")]
+        public bool? AadValidateUsername { get; set; }
+
+        [OptionValidation]
+        [Option("aof", Required = false, HelpText = "Enable write ahead logging (append-only file).")]
+        public bool? EnableAOF { get; set; }
+
+        [MemorySizeValidation]
+        [Option("aof-memory", Required = false, HelpText = "Total AOF memory buffer used in bytes (rounds down to power of 2) - spills to disk after this limit. Must be at least twice AofPageSize.")]
+        public string AofMemorySize { get; set; }
+
+        [MemorySizeValidation]
+        [Option("aof-page-size", Required = false, HelpText = "Size of each AOF page in bytes (rounds down to power of 2). Must be at least twice the main-log PageSize, since an AOF entry can be as large as the underlying main-log record being written; object commands like LPUSH/HSET can push this even higher. When you raise this, also raise --aof-memory to at least 2x this value.")]
+        public string AofPageSize { get; set; }
+
+        [MemorySizeValidation]
+        [Option("aof-segment-size", Required = false, HelpText = "Size of each AOF segment (file) in bytes on disk (rounds down to power of 2). This is the granularity at which AOF files are created and truncated.")]
+        public string AofSegmentSize { get; set; }
+
+        [IntRangeValidation(1, AofAddress.MaxSublogCount, isRequired: false)]
+        [Option("aof-physical-sublog-count", Required = false, HelpText = "Number of AOF physical sublogs (i.e. TsavoriteLog instances) used (=1 equivalent to the legacy single log implementation >1: sharded log implementation.")]
+        public int AofPhysicalSublogCount { get; set; }
+
+        [IntRangeValidation(1, 256, isRequired: false)]
+        [Option("aof-replay-task-count", Required = false, HelpText = "Number of replay tasks per physical sublog at the replica.")]
+        public int AofReplayTaskCount { get; set; }
+
+        [IntRangeValidation(-1, int.MaxValue, isRequired: false)]
+        [Option("aof-replay-drift-threshold", Required = false, HelpText = "Cross-sublog replay drift, in sequence-number units, tolerated on a replica before a replay-align barrier round is triggered. -1 disables the barrier.")]
+        public int AofReplayDriftThreshold { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue, isRequired: false)]
+        [Option("aof-replay-drift-check-freq", Required = false, HelpText = "How often the cross-sublog drift is re-checked during replay, as a multiple of aof-replay-drift-threshold: one scan per (this value x threshold) sequence-number window system-wide, rotated across replay threads (window index mod virtual sublog count), firing a replay-align round when the drift exceeds the threshold. 0 = readers about to wait are the only round source.")]
+        public int AofReplayDriftCheckFreq { get; set; }
+
+        [IntRangeValidation(-1, int.MaxValue, isRequired: false)]
+        [Option("aof-replay-barrier-spin-us", Required = false, HelpText = "How long a replay thread spins at the replay-align barrier before sleeping: -1 = spin forever, 0 = never spin, >0 = spin up to that many microseconds then sleep.")]
+        public int AofReplayBarrierSpinUs { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue)]
+        [Option("aof-tail-witness-freq", Required = false, HelpText = "Polling frequency of the background task responsible for moving time ahead for all physical sublogs (Used only with physical sublog value >1).")]
+        public int AofTailWitnessFreqMs { get; set; }
+
+        [IntRangeValidation(-1, int.MaxValue)]
+        [Option("aof-commit-freq", Required = false, HelpText = "Write ahead logging (append-only file) commit issue frequency in milliseconds. 0 = issue an immediate commit per operation, -1 = manually issue commits using COMMITAOF command")]
+        public int CommitFrequencyMs { get; set; }
+
+        [OptionValidation]
+        [Option("aof-commit-wait", Required = false, HelpText = "Wait for AOF to flush the commit before returning results to client. Warning: will greatly increase operation latency.")]
+        public bool? WaitForCommit { get; set; }
+
+        [MemorySizeValidation(false)]
+        [Option("aof-size-limit", Required = false, HelpText = "Maximum size of AOF (rounds down to power of 2) after which unsafe truncation will be applied. Left empty AOF will grow without bound unless a checkpoint is taken")]
+        public string AofSizeLimit { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue)]
+        [Option("aof-size-limit-enforce-frequency", Required = false, HelpText = "Frequency (in secs) of execution of the AutoCheckpointBasedOnAofSizeLimit background task.")]
+        public int AofSizeLimitEnforceFrequencySecs { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue)]
+        [Option("compaction-freq", Required = false, HelpText = "Background hybrid log compaction frequency in seconds. 0 = disabled (compaction performed before checkpointing instead)")]
+        public int CompactionFrequencySecs { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue)]
+        [Option("checkpoint-freq", Required = false, HelpText = "Frequency in seconds at which the server automatically takes a background checkpoint of all active databases. 0 = disabled. The interval is the gap between checkpoints, not a fixed period.")]
+        public int CheckpointFrequencySecs { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue)]
+        [Option("expired-object-collection-freq", Required = false, HelpText = "Frequency in seconds for the background task to perform object collection which removes expired members within object from memory. 0 = disabled. Use the HCOLLECT and ZCOLLECT API to collect on-demand.")]
+        public int ExpiredObjectCollectionFrequencySecs { get; set; }
+
+        [Option("compaction-type", Required = false, HelpText = "Hybrid log compaction type. Value options: None - no compaction, Shift - shift begin address without compaction (data loss), Lookup - lookup each record in compaction range, for record liveness checking using hash chain (no data loss; recommended for production use), Scan - scan old pages and move live records to tail (no data loss; NOT RECOMMENDED - builds a temporary parallel KV index proportional to the keyspace, causing significant transient memory use; prefer Lookup)")]
+        public LogCompactionType CompactionType { get; set; }
+
+        [OptionValidation]
+        [Option("compaction-force-delete", Required = false, HelpText = "Forcefully delete the inactive segments immediately after the compaction strategy (type) is applied. If false, take a checkpoint to actually delete the older data files from disk.")]
+        public bool? CompactionForceDelete { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue)]
+        [Option("compaction-max-segments", Required = false, HelpText = "Number of log segments created on disk before compaction triggers.")]
+        public int CompactionMaxSegments { get; set; }
+
+        [OptionValidation]
+        [Option("lua", Required = false, HelpText = "Enable Lua scripts on server.")]
+        public bool? EnableLua { get; set; }
+
+        [OptionValidation]
+        [Option("lua-transaction-mode", Required = false, HelpText = "Run Lua scripts as a transaction (lock keys - run script - unlock keys).")]
+        public bool? LuaTransactionMode { get; set; }
+
+        [PercentageValidation]
+        [Option("gossip-sp", Required = false, HelpText = "Percent of cluster nodes to gossip with at each gossip iteration.")]
+        public int GossipSamplePercent { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue)]
+        [Option("gossip-delay", Required = false, HelpText = "Cluster mode gossip protocol per node sleep (in seconds) delay to send updated config.")]
+        public int GossipDelay { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue)]
+        [Option("gossip-client-swap-grace", Required = false, HelpText = "Delay (in seconds) applied once to the whole gossip client collection after a configuration swap before the previous clients begin graceful retirement.")]
+        public int GossipClientSwapGraceSecs { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue)]
+        [Option("cluster-timeout", Required = false, HelpText = "Cluster node timeout is the amount of seconds a node must be unreachable.")]
+        public int ClusterTimeout { get; set; }
+
+        [IntRangeValidation(-1, int.MaxValue)]
+        [Option("cluster-config-flush-frequency", Required = false, HelpText = "How frequently to flush cluster config unto disk to persist updates. =-1: never (memory only), =0: immediately (every update performs flush), >0: frequency in ms")]
+        public int ClusterConfigFlushFrequencyMs { get; set; }
+
+        [Option("cluster-tls-client-target-host", Required = false, HelpText = "Name for the client target host when using TLS connections in cluster mode.")]
+        public string ClusterTlsClientTargetHost { get; set; }
+
+        [OptionValidation]
+        [Option("server-certificate-required", Required = false, HelpText = "Whether server TLS certificate is required by clients established on the server side, e.g., for cluster gossip and replication.")]
+        public bool? ServerCertificateRequired { get; set; }
+
+        [OptionValidation]
+        [Option("tls", Required = false, HelpText = "Enable TLS.")]
+        public bool? EnableTLS { get; set; }
+
+        [CertFileValidation(true, true, false)]
+        [Option("cert-file-name", Required = false, HelpText = "TLS certificate file name. Accepts a PKCS#12/PFX file or a PEM-encoded certificate (.pem, .crt, .cer); the format is auto-detected from the file's contents (example: testcert.pfx).")]
+        public string CertFileName { get; set; }
+
+        [HiddenOption]
+        [Option("cert-password", Required = false, HelpText = "TLS certificate password (example: placeholder). For a PEM-encoded cert-file-name, this is instead treated as the path to a separate PEM private key file, if the key isn't already included in cert-file-name.")]
+        public string CertPassword { get; set; }
+
+        [Option("cert-subject-name", Required = false, HelpText = "TLS certificate subject name.")]
+        public string CertSubjectName { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue)]
+        [Option("cert-refresh-freq", Required = false, HelpText = "TLS certificate refresh frequency in seconds (0 to disable).")]
+        public int CertificateRefreshFrequency { get; set; }
+
+        [OptionValidation]
+        [Option("client-certificate-required", Required = false, HelpText = "Whether client TLS certificate is required by the server.")]
+        public bool? ClientCertificateRequired { get; set; }
+
+        [Option("certificate-revocation-check-mode", Required = false, HelpText = "Certificate revocation check mode for certificate validation (NoCheck, Online, Offline).")]
+        public X509RevocationMode CertificateRevocationCheckMode { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue)]
+        [Option("tls-handshake-timeout", Required = false, HelpText = "Seconds an accepted connection may take to complete its TLS handshake before the server closes it (0 to disable).")]
+        public int TlsHandshakeTimeout { get; set; }
+
+        [Option("issuer-certificate-path", Required = false, HelpText = "Full path of file with issuer certificate for validation. If empty or null, validation against issuer will not be performed.")]
+        public string IssuerCertificatePath { get; set; }
+
+        [OptionValidation]
+        [Option("latency-monitor", Required = false, HelpText = "Track latency of various events.")]
+        public bool? LatencyMonitor { get; set; }
+
+        [IntRangeValidation(0, 5)]
+        [Option("latency-monitor-precision", Required = false, HelpText = "Resolution kept by the latency histograms, in significant decimal digits (0-5). This is relative accuracy at every magnitude: percentiles are reported to within 1 part in 10^N of the value, whether that value is microseconds or seconds. 2 (default) reports to ~1% at ~32KB per histogram, 1 to ~10% at ~5KB, 3 to ~0.1% at ~225KB.")]
+        public int LatencyMonitorPrecision { get; set; }
+
+        [OptionValidation]
+        [Option("commandstats-monitor", Required = false, HelpText = "Track per-command usage statistics (calls, failures, rejections). Exposed via INFO COMMANDSTATS.")]
+        public bool? CommandStatsMonitor { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue)]
+        [Option("slowlog-log-slower-than", Required = false, HelpText = "Threshold (microseconds) for logging command in the slow log. 0 to disable.")]
+        public int SlowLogThreshold { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue)]
+        [Option("slowlog-max-len", Required = false, HelpText = "Maximum number of slow log entries to keep.")]
+        public int SlowLogMaxEntries { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue)]
+        [Option("metrics-sampling-freq", Required = false, HelpText = "Metrics sampling frequency in seconds. Value of 0 disables metrics monitor task.")]
+        public int MetricsSamplingFrequency { get; set; }
+
+        [OptionValidation]
+        [Option('q', Required = false, HelpText = "Enabling quiet mode does not print server version and text art.")]
+        public bool? QuietMode { get; set; }
+
+        [Option("logger-level", Required = false, HelpText = "Logging level. Value options: Trace, Debug, Information, Warning, Error, Critical, None")]
+        public LogLevel LogLevel { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue)]
+        [Option("logger-freq", Required = false, HelpText = "Frequency (in seconds) of logging (used for tracking progress of long running operations e.g. migration)")]
+        public int LoggingFrequency { get; set; }
+
+        [OptionValidation]
+        [Option("disable-console-logger", Required = false, HelpText = "Disable console logger.")]
+        public bool? DisableConsoleLogger { get; set; }
+
+        [FilePathValidation(false, false, false)]
+        [Option("file-logger", Required = false, HelpText = "Enable file logger and write to the specified path.")]
+        public string FileLogger { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue)]
+        [Option("minthreads", Required = false, HelpText = "Minimum worker threads in thread pool, 0 uses the system default.")]
+        public int ThreadPoolMinThreads { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue)]
+        [Option("maxthreads", Required = false, HelpText = "Maximum worker threads in thread pool, 0 uses the system default.")]
+        public int ThreadPoolMaxThreads { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue)]
+        [Option("miniothreads", Required = false, HelpText = "Minimum IO completion threads in thread pool, 0 uses the system default.")]
+        public int ThreadPoolMinIOCompletionThreads { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue)]
+        [Option("maxiothreads", Required = false, HelpText = "Maximum IO completion threads in thread pool, 0 uses the system default.")]
+        public int ThreadPoolMaxIOCompletionThreads { get; set; }
+
+        [IntRangeValidation(-1, int.MaxValue)]
+        [Option("network-connection-limit", Required = false, HelpText = "Maximum number of simultaneously active network connections across all listeners, or -1 for unlimited. Equivalent to the Redis maxclients parameter, and settable at runtime with CONFIG SET maxclients.")]
+        public int NetworkConnectionLimit { get; set; }
+
+        [OptionValidation]
+        [Option("use-azure-storage", Required = false, HelpText = "Use Azure Page Blobs for storage instead of local storage.")]
+        public bool? UseAzureStorage { get; set; }
+
+        [HttpsUrlValidation]
+        [Option("storage-service-uri", Required = false, HelpText = "The URI to use when establishing connection to Azure Blobs Storage.")]
+        public string AzureStorageServiceUri { get; set; }
+
+        [Option("storage-managed-identity", Required = false, HelpText = "The managed identity to use when establishing connection to Azure Blobs Storage.")]
+        public string AzureStorageManagedIdentity { get; set; }
+
+        [HiddenOption]
+        [Option("storage-string", Required = false, HelpText = "The connection string to use when establishing connection to Azure Blobs Storage.")]
+        public string AzureStorageConnectionString { get; set; }
+
+        [IntRangeValidation(-1, int.MaxValue)]
+        [Option("checkpoint-throttle-delay", Required = false, HelpText = "Whether and by how much should we throttle the disk IO for checkpoints: -1 - disable throttling; >= 0 - run checkpoint flush in separate task, sleep for specified time after each WriteAsync")]
+        public int CheckpointThrottleFlushDelayMs { get; set; }
+
+
+        [IntRangeValidation(0, int.MaxValue)]
+        [Option("fast-commit-throttle", Required = false, HelpText = "Throttle FastCommit to write metadata once every K commits.")]
+        public int FastCommitThrottleFreq { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue)]
+        [Option("network-send-throttle", Required = false, HelpText = "Throttle the maximum outstanding network sends per session.")]
+        public int NetworkSendThrottleMax { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue)]
+        [Option("network-send-timeout", Required = false, HelpText = "Seconds a client with network-send-throttle responses outstanding may go without accepting any data before the server closes its connection (0 to disable).")]
+        public int NetworkSendTimeout { get; set; }
+
+        [MemorySizeValidation(false)]
+        [Option("network-buffer-memory-budget", Required = false, HelpText = "Process-wide budget for the network buffers held by live client connections, shared across all listeners. While connections are few this is slack and each connection gets the full 128k send and receive buffers; once the budget divided by the live buffer count falls below that, the base size for new buffers adapts down toward a 16k floor so the total stays near the budget. Buffers still grow on demand beyond their base size, so large requests are unaffected. Set to 0 to disable adaptation, leaving per-connection buffers unbounded. E.g. 1g, 512m.")]
+        public string NetworkBufferMemoryBudget { get; set; }
+
+        [OptionValidation]
+        [Option("sg-get", Required = false, HelpText = "Whether to use scatter-gather IO for a run of contiguous GET operations - useful to saturate disk random read IO. MGET always uses scatter-gather.")]
+        public bool? EnableScatterGatherGet { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue)]
+        [Option("replica-sync-delay", Required = false, HelpText = "Whether and by how much (milliseconds) should we throttle the replica sync: 0 - disable throttling")]
+        public int ReplicaSyncDelayMs { get; set; }
+
+        [IntRangeValidation(-1, int.MaxValue)]
+        [Option("aof-replay-max-lag-bytes", Required = false, HelpText = "Throttle ClusterAppendLog when replica.AOFTailAddress - ReplicationOffset > AofReplayMaxLagBytes. 0: Synchronous replay,  >=1: background replay with specified lag, -1: infinite lag")]
+        public int AofReplayMaxLagBytes { get; set; }
+
+        [Option("aof-sync-max-lag-bytes", Required = false, HelpText = "Stall primary AOF appends when the replication lag exceeds this budget, divided evenly per sublog (each sublog stalls at an even 1/m share). -1: disabled, >=1: max lag in bytes.")]
+        public long AofSyncMaxLagBytes { get; set; }
+
+        [OptionValidation]
+        [Option("main-memory-replication", Required = false, HelpText = "Use main-memory replication model.")]
+        public bool? MainMemoryReplication { get; set; }
+
+        [OptionValidation]
+        [Option("fast-aof-truncate", Required = false, HelpText = "Use fast-aof-truncate replication model.")]
+        public bool? FastAofTruncate { get; set; }
+
+        [OptionValidation]
+        [Option("on-demand-checkpoint", Required = false, HelpText = "Used with fast-aof-truncate replication model. Take on demand checkpoint to avoid missing data when attaching")]
+        public bool? OnDemandCheckpoint { get; set; }
+
+        [OptionValidation]
+        [Option("repl-diskless-sync", Required = false, HelpText = "Whether diskless replication is enabled or not.")]
+        public bool? ReplicaDisklessSync { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue)]
+        [Option("repl-diskless-sync-delay", Required = false, HelpText = "Delay in diskless replication sync in seconds. =0: Immediately start diskless replication sync.")]
+        public int ReplicaDisklessSyncDelay { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue)]
+        [Option("repl-attach-timeout", Required = false, HelpText = "Timeout in seconds for replication attach operation.")]
+        public int ReplicaAttachTimeout { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue)]
+        [Option("repl-sync-timeout", Required = false, HelpText = "Timeout in seconds for replication sync operations.")]
+        public int ReplicaSyncTimeout { get; set; }
+
+        [MemorySizeValidation(false)]
+        [Option("repl-diskless-sync-full-sync-aof-threshold", Required = false, HelpText = "AOF replay size threshold for diskless replication, beyond which we will perform a full sync even if a partial sync is possible. Defaults to AOF memory size if not specified.")]
+        public string ReplicaDisklessSyncFullSyncAofThreshold { get; set; }
+
+        [OptionValidation]
+        [Option("aof-null-device", Required = false, HelpText = "With fast-aof-truncate replication, use null device for AOF. Ensures no disk IO, but can cause data loss during replication.")]
+        public bool? UseAofNullDevice { get; set; }
+
+        [System.Text.Json.Serialization.JsonIgnore]
+        [FilePathValidation(true, false, false)]
+        [Option("config-import-path", Required = false, HelpText = "Import (load) configuration options from the provided path")]
+        public string ConfigImportPath { get; set; }
+
+        [System.Text.Json.Serialization.JsonIgnore]
+        [Option("config-import-format", Required = false, HelpText = $"Format of configuration options in path specified by config-import-path")]
+        public ConfigFileType ConfigImportFormat { get; set; }
+
+        [System.Text.Json.Serialization.JsonIgnore]
+        [Option("config-export-format", Required = false, HelpText = $"Format to export configuration options to path specified by config-export-path")]
+        public ConfigFileType ConfigExportFormat { get; set; }
+
+        [System.Text.Json.Serialization.JsonIgnore]
+        [OptionValidation]
+        [Option("use-azure-storage-for-config-import", Required = false, Default = false, HelpText = "Use Azure storage to import config file")]
+        public bool? UseAzureStorageForConfigImport { get; set; }
+
+        [System.Text.Json.Serialization.JsonIgnore]
+        [FilePathValidation(false, false, false)]
+        [Option("config-export-path", Required = false, HelpText = "Export (save) current configuration options to the provided path")]
+        public string ConfigExportPath { get; set; }
+
+        [System.Text.Json.Serialization.JsonIgnore]
+        [OptionValidation]
+        [Option("use-azure-storage-for-config-export", Required = false, Default = false, HelpText = "Use Azure storage to export config file")]
+        public bool? UseAzureStorageForConfigExport { get; set; }
+
+        [OptionValidation]
+        [Option("use-native-device-linux", Required = false, HelpText = "DEPRECATED: use DeviceType (--device-type) of Native instead.")]
+        public bool? UseNativeDeviceLinux { get; set; }
+
+        [Option("device-type", Required = false, HelpText = "Device type (Default, Native, RandomAccess, FileStream, AzureStorage, Null)")]
+        public DeviceType DeviceType { get; set; }
+
+        [Option("device-io-backend", Required = false, HelpText = "Linux-only IO backend for DeviceType=Native: Default (=libaio), Libaio, or Uring (io_uring). The shipped native library is built with -DUSE_URING=ON and requires liburing.so.2 at load time for all backends; a -DUSE_URING=OFF rebuild only needs libaio.")]
+        public NativeStorageDevice.IoBackend? DeviceIoBackend { get; set; }
+
+        [IntRangeValidation(1, 64)]
+        [Option("device-completion-threads", Required = false, HelpText = "Linux-only: Number of IO completion drain threads for DeviceType=Native (default 4, max 64). Under high concurrent pending-read load a single drainer convoys on the completion-signal path and collapses throughput; 4 removes that on both backends. On io_uring this scales further/more CPU-efficiently; libaio benefits less beyond a few.")]
+        public int? DeviceCompletionThreads { get; set; }
+
+        [IntRangeValidation(0, 65536)]
+        [Option("device-throttle-limit", Required = false, HelpText = "Per-device max number of in-flight IOs (IDevice.ThrottleLimit). 0 = use the device's built-in default: 4096 for the Native device (deep NVMe / io_uring queues), 120 for the managed in-box devices. Raising this lets disk-bound workloads keep the queue depth high enough to saturate fast NVMe / io_uring backends. For DeviceType=LocalMemory (which has no device-wide throttle) this instead sets the per-ring in-flight capacity, rounded up to a power of two.")]
+        public int? DeviceThrottleLimit { get; set; }
+
+        [IntRangeValidation(0, 4096)]
+        [Option("device-io-contexts", Required = false, HelpText = "Linux-only, DeviceType=Native: number of independent kernel io_contexts / io_uring rings (ring COUNT), decoupled from --device-completion-threads. Critical for io_uring: set at or above submitter concurrency (roughly your connection count) so each submitter owns a ring and io_submit is contention-free; too few rings serialize submitters on a per-ring lock and cost up to ~3x. libaio is largely indifferent. 0 = device default.")]
+        public int? DeviceIoContexts { get; set; }
+
+        [IntRangeValidation(0, 32768)]
+        [Option("device-queue-depth", Required = false, HelpText = "Linux-only, DeviceType=Native: per-ring kernel submission depth (maxEvents for io_uring_queue_init / libaio io_setup). Orthogonal to --device-io-contexts (ring count) and --device-throttle-limit (aggregate in-flight). 0 = device default. Note: for libaio, io-contexts x queue-depth is drawn from the global fs.aio-max-nr budget.")]
+        public int? DeviceQueueDepth { get; set; }
+
+        [Option("device-uring-sqpoll", Required = false, HelpText = "Linux-only, DeviceType=Native + --device-io-backend uring: enable io_uring SQPOLL (IORING_SETUP_SQPOLL) so a kernel thread polls the submission queue and submissions are syscall-free. Each ring gets its own poll thread (no IORING_SETUP_ATTACH_WQ) so submission stays parallel across rings. Ignored for libaio. Off by default (opt-in). NOTE: busy-polling kernel threads consume CPU; for high-IOPS multi-ring serving benchmark it against the default per-submit path.")]
+        public bool? DeviceUringSqPoll { get; set; }
+
+        [IntRangeValidation(0, 600000)]
+        [Option("device-uring-sqpoll-idle-ms", Required = false, HelpText = "Linux-only, DeviceType=Native + --device-io-backend uring: io_uring SQPOLL poll-thread idle window in milliseconds (sq_thread_idle): how long the kernel poll thread spins after the last submit before parking. 0 = native default (10s). Only meaningful with --device-uring-sqpoll.")]
+        public int? DeviceUringSqPollIdleMs { get; set; }
+
+        [IntRangeValidation(1, 4096)]
+        [Option("device-aio-max-devices", Required = false, HelpText = "Linux-only, DeviceType=Native (libaio): target number of Native devices to fit within the machine-global fs.aio-max-nr libaio budget (default 32). libaio io_setup permanently reserves io-contexts x queue-depth events from that global budget per device, so the default per-device reservation is capped at fs.aio-max-nr / this, keeping at least this many devices creatable regardless of --device-completion-threads / --device-throttle-limit. The cap cannot go below one event per ring, so an explicit --device-io-contexts above the per-device share still exceeds it (warned). Raise fs.aio-max-nr, or lower this, to give each serving device a deeper reservation. Ignored for io_uring (no global budget) and non-Linux.")]
+        public int? DeviceAioMaxDevices { get; set; }
+
+        [Option("reviv-bin-record-sizes", Separator = ',', Required = false,
+            HelpText = "#,#,...,#: For the main store, the sizes of records in each revivification bin, in order of increasing size." +
+                       "           Supersedes the default --reviv; cannot be used with --reviv-in-chain-only")]
+        public IEnumerable<int> RevivBinRecordSizes { get; set; }
+
+        [Option("reviv-bin-record-counts", Separator = ',', Required = false,
+            HelpText = "#,#,...,#: For the main store, the number of records in each bin:" +
+                       "    Default (not specified): If reviv-bin-record-sizes is specified, each bin is 256 records" +
+                       "    # (one value): If reviv-bin-record-sizes is specified, then all bins have this number of records, else error" +
+                       "    #,#,...,# (multiple values): If reviv-bin-record-sizes is specified, then it must be the same size as that array, else error" +
+                       "                                 Supersedes the default --reviv; cannot be used with --reviv-in-chain-only")]
+        public IEnumerable<int> RevivBinRecordCounts { get; set; }
+
+        [DoubleRangeValidation(0, 1)]
+        [Option("reviv-fraction", Required = false,
+            HelpText = "#: Fraction of mutable in-memory log space, from the highest log address down to the read-only region, that is eligible for revivification.")]
+        public double RevivifiableFraction { get; set; }
+
+        [OptionValidation]
+        [Option("reviv", Required = false,
+            HelpText = "A shortcut to specify revivification with default power-of-2-sized bins." +
+                       "    This default can be overridden by --reviv-in-chain-only or by the combination of reviv-bin-record-sizes and reviv-bin-record-counts.")]
+        public bool? EnableRevivification { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue)]
+        [Option("reviv-search-next-higher-bins", Required = false,
+            HelpText = "Search this number of next-higher bins if the search cannot be satisfied in the best-fitting bin." +
+                       "    Requires --reviv or the combination of rconeviv-bin-record-sizes and reviv-bin-record-counts")]
+        public int RevivNumberOfBinsToSearch { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue)]
+        [Option("reviv-bin-best-fit-scan-limit", Required = false,
+            HelpText = "Number of records to scan for best fit after finding first fit." +
+                       "    Requires --reviv or the combination of reviv-bin-record-sizes and reviv-bin-record-counts" +
+                       "    0: Use first fit" +
+                       "    #: Limit scan to this many records after first fit, up to the record count of the bin")]
+        public int RevivBinBestFitScanLimit { get; set; }
+
+        [OptionValidation]
+        [Option("reviv-in-chain-only", Required = false,
+            HelpText = "Revivify tombstoned records in tag chains only (do not use free list)." +
+                       "    Cannot be used with reviv-bin-record-sizes or reviv-bin-record-counts.")]
+        public bool? RevivInChainOnly { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue)]
+        [Option("object-scan-count-limit", Required = false, HelpText = "Limit of items to return in one iteration of *SCAN command")]
+        public int ObjectScanCountLimit { get; set; }
+
+        [OptionValidation]
+        [Option("enable-debug-command", Required = false, HelpText = "Enable DEBUG command for 'no', 'local' or 'all' connections")]
+        public ConnectionProtectionOption EnableDebugCommand { get; set; }
+
+        [OptionValidation]
+        [Option("enable-module-command", Required = false, HelpText = "Enable MODULE command for 'no', 'local' or 'all' connections. Command can only load from paths listed in ExtensionBinPaths")]
+        public ConnectionProtectionOption EnableModuleCommand { get; set; }
+
+        [OptionValidation]
+        [Option("protected-mode", Required = false, HelpText = "Enable protected mode.")]
+        public CommandLineBooleanOption ProtectedMode { get; set; }
+
+        [DirectoryPathsValidation(true, false)]
+        [Option("extension-bin-paths", Separator = ',', Required = false, HelpText = "List of directories on server from which custom command binaries can be loaded by admin users. MODULE command also requires enable-module-command to be set")]
+        public IEnumerable<string> ExtensionBinPaths { get; set; }
+
+        [ModuleFilePathValidation(true, true, false)]
+        [Option("loadmodulecs", Separator = ',', Required = false, HelpText = "List of modules to be loaded")]
+        public IEnumerable<string> LoadModuleCS { get; set; }
+
+        [Option("extension-allow-unsigned", Required = false, HelpText = "Allow loading custom commands from digitally unsigned assemblies (not recommended)")]
+        public bool? ExtensionAllowUnsignedAssemblies { get; set; }
+
+        [IntRangeValidation(1, int.MaxValue, isRequired: false)]
+        [Option("index-resize-freq", Required = false, HelpText = "Hash-index resize check frequency in seconds")]
+        public int IndexResizeFrequencySecs { get; set; }
+
+        [IntRangeValidation(1, 100, isRequired: false)]
+        [Option("index-resize-threshold", Required = false, HelpText = "Hash-index Overflow bucket count over total index size in percentage to trigger index resize")]
+        public int IndexResizeThreshold { get; set; }
+
+        [IntRangeValidation(1, 10000, isRequired: false)]
+        [Option("index-overflow-threshold", Required = false, HelpText = "Hash-index overflow bucket count over total index size in percentage at which allocation fails. Same unit as --index-resize-threshold and must exceed it. Overflow buckets chain linearly and are scanned by reads and upserts, so this is the average chain length allowed: 300 permits three overflow buckets per main bucket.")]
+        public int IndexOverflowThreshold { get; set; }
+
+        [MemorySizeValidation(isRequired: false)]
+        [Option("max-inline-key-size", Required = false, HelpText = "Maximum size of a key stored inline in the in-memory portion of the main log. Accepts a memory size (e.g. \"1k\", \"128\"). Must be in range [0, 1022] bytes; default is 1022.")]
+        public string MaxInlineKeySize { get; set; }
+
+        [MemorySizeValidation(isRequired: false)]
+        [Option("max-inline-value-size", Required = false, HelpText = "Maximum size of a value stored inline in the in-memory portion of the main log. Accepts a memory size (e.g. \"4k\", \"15m\"). Must be in range [0, 16777214] bytes; default is min (1m, PageSize / 2).")]
+        public string MaxInlineValueSize { get; set; }
+
+        [MemorySizeValidation(isRequired: false)]
+        [Option("initial-io-record-size", Required = false, HelpText = "Initial IO read size for records on disk. Accepts a memory size (e.g. 4k, 8k). Default is 128 bytes.")]
+        public string InitialIORecordSize { get; set; }
+
+        [OptionValidation]
+        [Option("fail-on-recovery-error", Required = false, HelpText = "Server bootup should fail if errors happen during bootup of AOF and checkpointing")]
+        public bool? FailOnRecoveryError { get; set; }
+
+        [OptionValidation]
+        [Option("lua-memory-management-mode", Required = false, HelpText = "Memory management mode for Lua scripts, must be set to Tracked or Managed to impose script limits")]
+        public LuaMemoryManagementMode LuaMemoryManagementMode { get; set; }
+
+        [MemorySizeValidation(false)]
+        [ForbiddenWithOption(nameof(LuaMemoryManagementMode), nameof(LuaMemoryManagementMode.Native))]
+        [Option("lua-script-memory-limit", HelpText = "Memory limit for a Lua instances while running a script, lua-memory-management-mode must be set to something other than Native to use this flag")]
+        public string LuaScriptMemoryLimit { get; set; }
+
+        [IntRangeValidation(10, int.MaxValue, isRequired: false)]
+        [Option("lua-script-timeout", Required = false, HelpText = "Timeout for a Lua instance while running a script, specified in positive milliseconds (0 = disabled)")]
+        public int LuaScriptTimeoutMs { get; set; }
+
+        [OptionValidation]
+        [Option("lua-logging-mode", Required = false, HelpText = "Behavior of redis.log(...) when called from Lua scripts.  Defaults to Enable.")]
+        public LuaLoggingMode LuaLoggingMode { get; set; }
+
+        // Parsing is a tad tricky here as JSON wants to set to empty at certain points
+        //
+        // A bespoke union-on-set gets the desired semantics.
+        private readonly HashSet<string> luaAllowedFunctions = [];
+
+        [OptionValidation]
+        [Option("lua-allowed-functions", Separator = ',', Required = false, HelpText = "If set, restricts the functions available in Lua scripts to given list.")]
+        public IEnumerable<string> LuaAllowedFunctions
+        {
+            get => luaAllowedFunctions;
+            set
+            {
+                if (value == null)
+                {
+                    return;
+                }
+
+                luaAllowedFunctions.UnionWith(value);
+            }
+        }
+
+        [FilePathValidation(false, true, false)]
+        [Option("unixsocket", Required = false, HelpText = "Unix socket address path to bind server to")]
+        public string UnixSocketPath { get; set; }
+
+        [IntRangeValidation(0, 777, isRequired: false)]
+        [SupportedOSValidation(isRequired: false, nameof(OSPlatform.Linux), nameof(OSPlatform.OSX), nameof(OSPlatform.FreeBSD))]
+        [Option("unixsocketperm", Required = false, HelpText = "Unix socket permissions in octal (Unix platforms only)")]
+        public int UnixSocketPermission { get; set; }
+
+        [IntRangeValidation(1, 256, isRequired: true)]
+        [Option("max-databases", Required = false, HelpText = "Max number of logical databases allowed in a single Garnet server instance")]
+        public int MaxDatabases { get; set; }
+
+        [IntRangeValidation(-1, int.MaxValue, isRequired: false)]
+        [Option("expired-key-deletion-scan-freq", Required = false, HelpText = "Frequency of background scan for expired key deletion, in seconds")]
+        public int ExpiredKeyDeletionScanFrequencySecs { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue, includeMin: true, isRequired: false)]
+        [Option("cluster-replication-reestablishment-timeout")]
+        public int ClusterReplicationReestablishmentTimeout { get; set; }
+
+        [Option("cluster-replica-resume-with-data", Required = false, HelpText = "If a Cluster Replica resumes with data, allow it to be served prior to a Primary being available")]
+        public bool ClusterReplicaResumeWithData { get; set; }
+
+        [RequiresMinimumMemory(nameof(PageSize), minimumValue: "16K")]
+        [Option("enable-vector-set-preview", Required = false, HelpText = "Enable Vector Sets (preview) - this feature (and associated commands) are incomplete, unstable, and subject to change while still in preview")]
+        public bool EnableVectorSetPreview { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue, isRequired: false)]
+        [Option("vector-set-replay-task-count", Required = false, HelpText = "Configure how many replay tasks are used to replay VectorSet operations at the replica (default: 0 uses the machine CPU count)")]
+        public int VectorSetReplayTaskCount { get; set; }
+
+        // 512k == 2 x RangeIndexManager.DefaultMigrationChunkSize (256k): a migrated range index stream chunk
+        // plus its safety margin must fit in a single AOF page. Validated here to fail before store/AOF allocation.
+        [RequiresMinimumMemory(nameof(AofPageSize), minimumValue: "512k")]
+        [Option("enable-range-index-preview", Required = false, HelpText = "Enable Range Index (preview) - this feature (and associated RI.* commands) are incomplete, unstable, and subject to change while still in preview")]
+        public bool EnableRangeIndexPreview { get; set; }
+
+        [IntRangeValidation(0, int.MaxValue, isRequired: false)]
+        [Option("vector-set-quantization-task-count", Required = false, HelpText = "Configure how many quantization tasks are used to optimize Vector Set operations (default: 0 uses the machine CPU count; maximum: the machine CPU count)")]
+        public int VectorSetQuantizationTaskCount { get; set; }
+
+        /// <summary>
+        /// This property contains all arguments that were not parsed by the command line argument parser
+        /// </summary>
+        [System.Text.Json.Serialization.JsonIgnore]
+        [Value(0)]
+        public IList<string> UnparsedArguments { get; set; }
+
+        /// <summary>
+        /// Logger instance used for runtime option validation
+        /// </summary>
+        public ILogger runtimeLogger { get; set; }
+
+        /// <summary>
+        /// Check the validity of all options with an explicit ValidationAttribute
+        /// </summary>
+        /// <param name="invalidOptions">List of invalid options</param>
+        /// <param name="logger">Logger</param>
+        /// <returns>True if all property values are valid</returns>
+        public bool IsValid(out List<string> invalidOptions, ILogger logger = null)
+        {
+            invalidOptions = [];
+            var isValid = true;
+
+            this.runtimeLogger = logger;
+            foreach (var prop in typeof(Options).GetProperties())
+            {
+                // Ignore if property is not decorated with the OptionsAttribute or the ValidationAttribute
+                var validationAttr = prop.GetCustomAttributes(typeof(ValidationAttribute)).FirstOrDefault();
+                if (!Attribute.IsDefined(prop, typeof(OptionAttribute)) || validationAttr == null)
+                    continue;
+
+                // Get value to validate and set validation context
+                var value = prop.GetValue(this, null);
+                var validationContext = new ValidationContext(this) { MemberName = prop.Name };
+
+                // Validate the current value
+                var validationResults = new List<ValidationResult>();
+                var isValueValid = Validator.TryValidateProperty(value, validationContext, validationResults);
+
+                // Append results 
+                isValid = isValid && isValueValid;
+                foreach (var validationResult in validationResults)
+                {
+                    invalidOptions.AddRange(validationResult.MemberNames);
+                    logger?.LogError("{errorMessage}", validationResult.ErrorMessage);
+                }
+            }
+
+            return isValid;
+        }
+
+        public GarnetServerOptions GetServerOptions(ILogger logger = null)
+        {
+            var enableStorageTier = EnableStorageTier.GetValueOrDefault();
+            var enableRevivification = EnableRevivification.GetValueOrDefault();
+
+            if (UseNativeDeviceLinux.GetValueOrDefault())
+            {
+                logger?.LogWarning("The --use-native-device-linux option is deprecated. Please use --device-type Native instead.");
+                DeviceType = DeviceType.Native;
+            }
+
+            var deviceType = GetDeviceType(logger);
+
+            var useAzureStorage = deviceType == DeviceType.AzureStorage;
+            if (useAzureStorage && string.IsNullOrEmpty(AzureStorageConnectionString) && string.IsNullOrEmpty(AzureStorageServiceUri))
+                throw new InvalidAzureConfiguration("Cannot use AzureStorage device without supplying storage-string or storage-service-uri");
+            if (useAzureStorage && !string.IsNullOrEmpty(AzureStorageConnectionString) && !string.IsNullOrEmpty(AzureStorageServiceUri))
+                throw new InvalidAzureConfiguration("Cannot use AzureStorage device with both storage-string and storage-service-uri");
+
+            var logDir = LogDir;
+            if (!useAzureStorage && enableStorageTier) logDir = new DirectoryInfo(string.IsNullOrEmpty(logDir) ? "." : logDir).FullName;
+            var checkpointDir = CheckpointDir;
+            if (!useAzureStorage) checkpointDir = new DirectoryInfo(string.IsNullOrEmpty(checkpointDir) ? (string.IsNullOrEmpty(logDir) ? "." : logDir) : checkpointDir).FullName;
+
+            if (!Format.TryParseAddressList(Address, Port, out var endpoints, out _, ProtectedMode == CommandLineBooleanOption.True)
+              || endpoints.Length == 0)
+                throw new GarnetException($"Invalid endpoint format {Address} {Port}.");
+
+            EndPoint[] clusterAnnounceEndpoint = null;
+            if (ClusterAnnounceIp != null || ClusterAnnouncePort != 0)
+            {
+                ClusterAnnouncePort = ClusterAnnouncePort == 0 ? Port : ClusterAnnouncePort;
+                var announceIp = ClusterAnnounceIp ?? endpoints.OfType<IPEndPoint>().First().Address.ToString();
+                clusterAnnounceEndpoint = Format.TryCreateEndpoint(announceIp, ClusterAnnouncePort, tryConnect: false, logger: logger);
+                if (clusterAnnounceEndpoint == null)
+                    throw new GarnetException("Invalid cluster announce endpoint!");
+            }
+
+            if (!string.IsNullOrEmpty(UnixSocketPath))
+                endpoints = [.. endpoints, new UnixDomainSocketEndPoint(UnixSocketPath)];
+
+            // Unix file permission octal to UnixFileMode
+            var unixSocketPermissions = (UnixFileMode)Convert.ToInt32(UnixSocketPermission.ToString(), 8);
+
+            var revivBinRecordSizes = this.RevivBinRecordSizes?.ToArray();
+            var revivBinRecordCounts = this.RevivBinRecordCounts?.ToArray();
+            bool hasRecordSizes = revivBinRecordSizes?.Length > 0, hasRecordCounts = revivBinRecordCounts?.Length > 0;
+            bool useRevivBinsPowerOf2 = enableRevivification; // may be overridden
+
+            if (hasRecordSizes)
+            {
+                if (hasRecordCounts && revivBinRecordCounts.Length > 1 && revivBinRecordCounts.Length != revivBinRecordSizes.Length)
+                    throw new Exception("Incompatible revivification record size and count cardinality.");
+                if (RevivInChainOnly.GetValueOrDefault())
+                    throw new Exception("Revivification cannot specify both record sizes and in-chain-only.");
+                useRevivBinsPowerOf2 = false;
+            }
+            if (hasRecordCounts)
+            {
+                if (useRevivBinsPowerOf2)
+                    throw new Exception("Revivification cannot specify both record counts and powerof2 bins.");
+                if (!hasRecordSizes)
+                    throw new Exception("Revivification bin counts require bin sizes.");
+                useRevivBinsPowerOf2 = false;
+            }
+            if (RevivBinBestFitScanLimit != 0)
+            {
+                if (!hasRecordSizes && !enableRevivification)
+                    throw new Exception("Revivification cannot specify best fit scan limit without specifying bins.");
+                if (RevivBinBestFitScanLimit < 0)
+                    throw new Exception("RevivBinBestFitScanLimit must be >= 0.");
+            }
+            if (RevivifiableFraction != RevivificationSettings.DefaultRevivifiableFraction)
+            {
+                if (!hasRecordSizes && !enableRevivification)
+                    throw new Exception("Revivification cannot specify RevivifiableFraction without specifying bins.");
+            }
+
+            // Warn users who explicitly opt into Scan compaction about the memory-spike cost.
+            // Scan builds a temporary parallel KV index proportional to the keyspace; Lookup is the recommended alternative.
+            if (CompactionType == LogCompactionType.Scan)
+            {
+                logger?.LogWarning("Compaction type Scan builds a temporary parallel KV index proportional to the keyspace, causing significant transient memory use. Use Lookup instead unless you have a specific reason for Scan.");
+            }
+
+            if (SlowLogThreshold > 0)
+            {
+                if (SlowLogThreshold < 100)
+                    throw new Exception("SlowLogThreshold must be at least 100 microseconds.");
+            }
+
+
+            if (!EnableAOF.GetValueOrDefault())
+            {
+                if (!string.IsNullOrEmpty(AofSizeLimit))
+                    throw new GarnetException("AofSizeLimit cannot be enforced with disabled AOF!");
+            }
+
+            Func<INamedDeviceFactoryCreator> azureFactoryCreator = () =>
+            {
+                if (!string.IsNullOrEmpty(AzureStorageConnectionString))
+                {
+                    return new AzureStorageNamedDeviceFactoryCreator(AzureStorageConnectionString, logger);
+                }
+                var credential = new ChainedTokenCredential(
+                    new WorkloadIdentityCredential(),
+                    new ManagedIdentityCredential(clientId: AzureStorageManagedIdentity)
+                );
+                return new AzureStorageNamedDeviceFactoryCreator(AzureStorageServiceUri, credential, logger);
+            };
+
+            return new GarnetServerOptions(logger)
+            {
+                EndPoints = endpoints,
+                ClusterAnnounceEndpoint = clusterAnnounceEndpoint?[0],
+                ClusterAnnounceHostname = ClusterAnnounceHostname,
+                ClusterAddress = ClusterAddress,
+                ClusterPort = ClusterPort,
+                ClusterPreferredEndpointType = ClusterPreferredEndpointType,
+                LogMemorySize = LogMemorySize,
+                PageSize = PageSize,
+                PageCount = PageCount,
+                SegmentSize = SegmentSize,
+                ObjectLogSegmentSize = ObjectLogSegmentSize,
+                IndexMemorySize = IndexMemorySize,
+                IndexMaxMemorySize = IndexMaxMemorySize,
+                UseNativeAllocator = UseNativeAllocator.GetValueOrDefault(),
+                UseLegacyBufferPool = UseLegacyBufferPool.GetValueOrDefault(),
+                BufferPoolMemoryBudget = BufferPoolMemoryBudget,
+                MutablePercent = MutablePercent,
+                EnableReadCache = EnableReadCache.GetValueOrDefault(),
+                ReadCacheMemorySize = ReadCacheMemorySize,
+                ReadCachePageSize = ReadCachePageSize,
+                ReadCachePageCount = ReadCachePageCount,
+                EnableStorageTier = enableStorageTier,
+                CopyReadsToTail = CopyReadsToTail.GetValueOrDefault(),
+                LogDir = logDir,
+                CheckpointDir = checkpointDir,
+                Recover = Recover.GetValueOrDefault(),
+                DisablePubSub = DisablePubSub.GetValueOrDefault(),
+                PubSubPageSize = PubSubPageSize,
+                DisableObjects = DisableObjects.GetValueOrDefault(),
+                EnableCluster = EnableCluster.GetValueOrDefault(),
+                CleanClusterConfig = CleanClusterConfig.GetValueOrDefault(),
+                ParallelMigrateTaskCount = ParallelMigrateTaskCount,
+                FastMigrate = FastMigrate.GetValueOrDefault(),
+                AuthSettings = GetAuthenticationSettings(logger),
+                AclStrictCustomCommands = AclStrictCustomCommands.GetValueOrDefault(true),
+                EnableAOF = EnableAOF.GetValueOrDefault(),
+                EnableLua = EnableLua.GetValueOrDefault(),
+                LuaTransactionMode = LuaTransactionMode.GetValueOrDefault(),
+                AofMemorySize = AofMemorySize,
+                AofPageSize = AofPageSize,
+                AofSegmentSize = AofSegmentSize,
+                AofPhysicalSublogCount = AofPhysicalSublogCount,
+                AofReplayTaskCount = AofReplayTaskCount,
+                AofReplayDriftThreshold = AofReplayDriftThreshold,
+                AofReplayDriftCheckFreq = AofReplayDriftCheckFreq,
+                AofReplayBarrierSpinUs = AofReplayBarrierSpinUs,
+                AofTailWitnessFreqMs = AofTailWitnessFreqMs,
+                CommitFrequencyMs = CommitFrequencyMs,
+                WaitForCommit = WaitForCommit.GetValueOrDefault(),
+                AofSizeLimit = AofSizeLimit,
+                AofSizeLimitEnforceFrequencySecs = AofSizeLimitEnforceFrequencySecs,
+                CompactionFrequencySecs = CompactionFrequencySecs,
+                CheckpointFrequencySecs = CheckpointFrequencySecs,
+                ExpiredObjectCollectionFrequencySecs = ExpiredObjectCollectionFrequencySecs,
+                CompactionType = CompactionType,
+                CompactionForceDelete = CompactionForceDelete.GetValueOrDefault(),
+                CompactionMaxSegments = CompactionMaxSegments,
+                GossipSamplePercent = GossipSamplePercent,
+                GossipDelay = GossipDelay,
+                GossipClientSwapGraceSecs = GossipClientSwapGraceSecs,
+                ClusterTimeout = ClusterTimeout,
+                ClusterConfigFlushFrequencyMs = ClusterConfigFlushFrequencyMs,
+                FastCommitThrottleFreq = FastCommitThrottleFreq,
+                NetworkSendThrottleMax = NetworkSendThrottleMax,
+                NetworkSendTimeout = NetworkSendTimeout <= 0 ? Timeout.InfiniteTimeSpan : TimeSpan.FromSeconds(NetworkSendTimeout),
+                NetworkBufferMemoryBudget = NetworkBufferMemoryBudget,
+
+                // Not operator-settable, but the standalone server has always run a 64 MB idle pool ceiling.
+                // Left unset, the pool derives a smaller ceiling from its per-level entry bound, so this is
+                // assigned here rather than defaulted in GarnetServerOptions, which embedded hosts share.
+                NetworkBufferPoolSize = "64m",
+                TlsOptions = EnableTLS.GetValueOrDefault() ? new GarnetTlsOptions(
+                    CertFileName, CertPassword,
+                    ClientCertificateRequired.GetValueOrDefault(),
+                    CertificateRevocationCheckMode,
+                    IssuerCertificatePath,
+                    CertSubjectName,
+                    CertificateRefreshFrequency,
+                    EnableCluster.GetValueOrDefault(),
+                    ClusterTlsClientTargetHost,
+                    ServerCertificateRequired.GetValueOrDefault(),
+                    logger: logger) : null,
+                TlsHandshakeTimeout = TlsHandshakeTimeout <= 0 ? Timeout.InfiniteTimeSpan : TimeSpan.FromSeconds(TlsHandshakeTimeout),
+                LatencyMonitor = LatencyMonitor.GetValueOrDefault(),
+                LatencyMonitorPrecision = LatencyMonitorPrecision,
+                CommandStatsMonitor = CommandStatsMonitor.GetValueOrDefault(),
+                SlowLogThreshold = SlowLogThreshold,
+                SlowLogMaxEntries = SlowLogMaxEntries,
+                MetricsSamplingFrequency = MetricsSamplingFrequency,
+                LogLevel = LogLevel,
+                LoggingFrequency = LoggingFrequency,
+                QuietMode = QuietMode.GetValueOrDefault(),
+                ThreadPoolMinThreads = ThreadPoolMinThreads,
+                ThreadPoolMaxThreads = ThreadPoolMaxThreads,
+                ThreadPoolMinIOCompletionThreads = ThreadPoolMinIOCompletionThreads,
+                ThreadPoolMaxIOCompletionThreads = ThreadPoolMaxIOCompletionThreads,
+                NetworkConnectionLimit = NetworkConnectionLimit,
+                DeviceFactoryCreator = deviceType == DeviceType.AzureStorage ? azureFactoryCreator()
+                    : new LocalStorageNamedDeviceFactoryCreator(
+                        deviceType: deviceType,
+                        numCompletionThreads: DeviceCompletionThreads ?? 4,
+                        throttleLimit: DeviceThrottleLimit is > 0 ? DeviceThrottleLimit : null,
+                        logger: logger,
+                        nativeDeviceOptions: new NativeDeviceOptions
+                        {
+                            IoBackend = DeviceIoBackend ?? NativeStorageDevice.IoBackend.Default,
+                            NumIoContexts = DeviceIoContexts ?? 0,
+                            QueueDepth = DeviceQueueDepth ?? 0,
+                            UringSqPoll = DeviceUringSqPoll ?? false,
+                            UringSqPollIdleMs = DeviceUringSqPollIdleMs ?? 0,
+                        }),
+                CheckpointThrottleFlushDelayMs = CheckpointThrottleFlushDelayMs,
+                EnableScatterGatherGet = EnableScatterGatherGet.GetValueOrDefault(true),
+                ReplicaSyncDelayMs = ReplicaSyncDelayMs,
+                AofReplayMaxLagBytes = AofReplayMaxLagBytes,
+                AofSyncMaxLagBytes = AofSyncMaxLagBytes,
+                FastAofTruncate = GetFastAofTruncate(logger),
+                OnDemandCheckpoint = OnDemandCheckpoint.GetValueOrDefault(),
+                ReplicaDisklessSync = ReplicaDisklessSync.GetValueOrDefault(),
+                ReplicaDisklessSyncDelay = ReplicaDisklessSyncDelay,
+                ReplicaSyncTimeout = ReplicaSyncTimeout <= 0 ? Timeout.InfiniteTimeSpan : TimeSpan.FromSeconds(ReplicaSyncTimeout),
+                ReplicaAttachTimeout = ReplicaAttachTimeout <= 0 ? Timeout.InfiniteTimeSpan : TimeSpan.FromSeconds(ReplicaAttachTimeout),
+                ReplicaDisklessSyncFullSyncAofThreshold = ReplicaDisklessSyncFullSyncAofThreshold,
+                UseAofNullDevice = UseAofNullDevice.GetValueOrDefault(),
+                ClusterUsername = ClusterUsername,
+                ClusterPassword = ClusterPassword,
+                DeviceType = deviceType,
+                DeviceIoBackend = DeviceIoBackend ?? NativeStorageDevice.IoBackend.Default,
+                DeviceCompletionThreads = DeviceCompletionThreads ?? 4,
+                DeviceThrottleLimit = DeviceThrottleLimit ?? 0,
+                DeviceIoContexts = DeviceIoContexts ?? 0,
+                DeviceQueueDepth = DeviceQueueDepth ?? 0,
+                DeviceUringSqPoll = DeviceUringSqPoll ?? false,
+                DeviceUringSqPollIdleMs = DeviceUringSqPollIdleMs ?? 0,
+                DeviceAioMaxDevices = DeviceAioMaxDevices ?? 32,
+                ObjectScanCountLimit = ObjectScanCountLimit,
+                RevivBinRecordSizes = revivBinRecordSizes,
+                RevivBinRecordCounts = revivBinRecordCounts,
+                RevivifiableFraction = RevivifiableFraction,
+                UseRevivBinsPowerOf2 = useRevivBinsPowerOf2,
+                RevivBinBestFitScanLimit = RevivBinBestFitScanLimit,
+                RevivNumberOfBinsToSearch = RevivNumberOfBinsToSearch,
+                RevivInChainOnly = RevivInChainOnly.GetValueOrDefault(),
+                EnableDebugCommand = EnableDebugCommand,
+                EnableModuleCommand = EnableModuleCommand,
+                ExtensionBinPaths = FileUtils.ConvertToAbsolutePaths(ExtensionBinPaths),
+                ExtensionAllowUnsignedAssemblies = ExtensionAllowUnsignedAssemblies.GetValueOrDefault(),
+                IndexResizeFrequencySecs = IndexResizeFrequencySecs,
+                IndexResizeThreshold = IndexResizeThreshold,
+                IndexOverflowThreshold = IndexOverflowThreshold,
+                MaxInlineKeySize = MaxInlineKeySize,
+                MaxInlineValueSize = MaxInlineValueSize,
+                InitialIORecordSize = InitialIORecordSize,
+                LoadModuleCS = LoadModuleCS,
+                FailOnRecoveryError = FailOnRecoveryError.GetValueOrDefault(),
+                LuaOptions = EnableLua.GetValueOrDefault() ? new LuaOptions(LuaMemoryManagementMode, LuaScriptMemoryLimit, LuaScriptTimeoutMs == 0 ? Timeout.InfiniteTimeSpan : TimeSpan.FromMilliseconds(LuaScriptTimeoutMs), LuaLoggingMode, LuaAllowedFunctions, logger) : null,
+                UnixSocketPath = UnixSocketPath,
+                UnixSocketPermission = unixSocketPermissions,
+                MaxDatabases = MaxDatabases,
+                ExpiredKeyDeletionScanFrequencySecs = ExpiredKeyDeletionScanFrequencySecs,
+                ClusterReplicationReestablishmentTimeout = ClusterReplicationReestablishmentTimeout,
+                ClusterReplicaResumeWithData = ClusterReplicaResumeWithData,
+                EnableVectorSetPreview = EnableVectorSetPreview,
+                VectorSetReplayTaskCount = VectorSetReplayTaskCount,
+                VectorSetQuantizationTaskCount = VectorSetQuantizationTaskCount,
+                EnableRangeIndexPreview = EnableRangeIndexPreview,
+            };
+        }
+
+        internal DeviceType GetDeviceType(ILogger logger = null)
+        {
+            var deviceType = DeviceType;
+
+            if (deviceType == DeviceType.Default)
+            {
+                deviceType = Devices.GetDefaultDeviceType();
+            }
+            if (UseAzureStorage.GetValueOrDefault())
+            {
+                logger?.LogInformation("The UseAzureStorage flag is deprecated, use DeviceType of AzureStorage instead");
+                deviceType = DeviceType.AzureStorage;
+            }
+            return deviceType;
+        }
+
+        private IAuthenticationSettings GetAuthenticationSettings(ILogger logger = null)
+        {
+            switch (AuthenticationMode)
+            {
+                case GarnetAuthenticationMode.NoAuth:
+                    return new NoAuthSettings();
+                case GarnetAuthenticationMode.Password:
+                    return new PasswordAuthenticationSettings(Password);
+                case GarnetAuthenticationMode.Aad:
+                    return new AadAuthenticationSettings(AuthorizedAadApplicationIds?.Split(','), AadAudiences?.Split(','), AadIssuers?.Split(','), IssuerSigningTokenProvider.Create(AadAuthority, logger));
+                case GarnetAuthenticationMode.ACL:
+                    return new AclAuthenticationPasswordSettings(AclFile, Password);
+                case GarnetAuthenticationMode.AclWithAad:
+                    var aadAuthSettings = new AadAuthenticationSettings(AuthorizedAadApplicationIds?.Split(','), AadAudiences?.Split(','), AadIssuers?.Split(','), IssuerSigningTokenProvider.Create(AadAuthority, logger), AadValidateUsername.GetValueOrDefault());
+                    return new AclAuthenticationAadSettings(AclFile, Password, aadAuthSettings);
+                default:
+                    logger?.LogError("Unsupported authentication mode: {mode}", AuthenticationMode);
+                    throw new Exception($"Authentication mode {AuthenticationMode} is not supported.");
+            }
+        }
+
+        public bool GetFastAofTruncate(ILogger logger = null)
+        {
+            if (MainMemoryReplication.GetValueOrDefault())
+            {
+                logger?.LogError("--main-memory-replication is deprecated. Use --fast-aof-truncate instead.");
+                return true;
+            }
+            return FastAofTruncate.GetValueOrDefault();
+        }
+
+        /// <summary>
+        /// Creates a clone of the current Options object
+        /// This method creates a shallow copy of the values of properties decorated with the OptionAttribute
+        /// For IEnumerable types it creates a list containing a shallow copy of all the values in the original IEnumerable
+        /// </summary>
+        /// <returns>The cloned object</returns>
+        public object Clone()
+        {
+            var clone = new Options();
+            foreach (var prop in typeof(Options).GetProperties(BindingFlags.Instance | BindingFlags.Public))
+            {
+                if (!prop.CanRead || !prop.CanWrite)
+                    continue;
+
+                var optionAttr = (OptionAttribute)prop.GetCustomAttributes(typeof(OptionAttribute)).FirstOrDefault();
+                if (optionAttr == null)
+                    continue;
+
+                var value = prop.GetValue(this);
+
+                if (value == null)
+                {
+                    prop.SetValue(clone, null);
+                    continue;
+                }
+
+                var type = prop.PropertyType;
+                if (type.IsGenericType &&
+                    type.GetGenericTypeDefinition() == typeof(IEnumerable<>))
+                {
+                    var elementType = type.GetGenericArguments()[0];
+                    var listType = typeof(List<>).MakeGenericType(elementType);
+                    var list = (IList)Activator.CreateInstance(listType)!;
+
+                    foreach (var item in (IEnumerable)value)
+                        list.Add(item);
+
+                    prop.SetValue(clone, list);
+                }
+                else
+                {
+                    prop.SetValue(clone, value);
+                }
+            }
+
+            return clone;
+        }
+    }
+
+    /// <summary>
+    /// Current supported configuration types
+    /// </summary>
+    internal enum ConfigFileType
+    {
+        // Garnet.conf file format (JSON serialized Options object)
+        GarnetConf = 0,
+        // Redis.conf file format
+        RedisConf = 1,
+    }
+
+    public sealed class InvalidAzureConfiguration : Exception
+    {
+        public InvalidAzureConfiguration(string message) : base(message) { }
+    }
+
+    /// <summary>
+    /// This attribute ensures that a decorated configuration option is not dumped into the log
+    /// when the DumpConfig flag is set.
+    /// </summary>
+    [AttributeUsage(AttributeTargets.Property)]
+    public class HiddenOptionAttribute : Attribute
+    {
+
+    }
+}

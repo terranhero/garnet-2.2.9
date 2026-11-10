@@ -1,0 +1,236 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Threading;
+using System.Threading.Tasks;
+using Garnet.server;
+using NUnit.Framework;
+using NUnit.Framework.Legacy;
+
+namespace Garnet.test
+{
+    [TestFixture]
+    internal class TaskManagerTests : TestBase
+    {
+        [Test]
+        public async Task TestBasicRegisterAndRunAsync()
+        {
+            using var taskManager = new TaskManager();
+            var taskStarted = new SemaphoreSlim(0);
+            var taskCanComplete = new SemaphoreSlim(0);
+
+            taskManager.RegisterAndRun(TaskType.IndexAutoGrowTask, async token =>
+            {
+                _ = taskStarted.Release();
+                await taskCanComplete.WaitAsync(token).ConfigureAwait(false);
+            });
+
+            ClassicAssert.IsTrue(taskStarted.Wait(TimeSpan.FromSeconds(5)), "Task should start within timeout");
+            _ = taskCanComplete.Release();
+            ClassicAssert.IsTrue(await taskManager.WaitAsync(TaskType.IndexAutoGrowTask));
+        }
+
+        [Test]
+        public async Task TestDoubleRegistrationAsync()
+        {
+            using var taskManager = new TaskManager();
+            var taskStarted = new SemaphoreSlim(0);
+            var taskCanComplete = new SemaphoreSlim(0);
+            var startedCounter = 0;
+
+            Task taskFactory(CancellationToken token) => DummyTask(token);
+
+            taskManager.RegisterAndRun(TaskType.IndexAutoGrowTask, taskFactory);
+            taskManager.RegisterAndRun(TaskType.IndexAutoGrowTask, taskFactory);
+
+            ClassicAssert.IsTrue(taskStarted.Wait(TimeSpan.FromSeconds(5)), "Task should start within timeout");
+            _ = taskCanComplete.Release();
+
+            ClassicAssert.IsTrue(await taskManager.WaitAsync(TaskType.IndexAutoGrowTask));
+            ClassicAssert.AreEqual(1, startedCounter);
+
+            async Task DummyTask(CancellationToken token)
+            {
+                _ = Interlocked.Increment(ref startedCounter);
+                _ = taskStarted.Release();
+                await taskCanComplete.WaitAsync(token).ConfigureAwait(false);
+            }
+        }
+
+        [TestCase(TaskPlacementCategory.Primary)]
+        [TestCase(TaskPlacementCategory.All)]
+        public async Task CategoryCancellationKeepsCommitsUntilMutationsFinish(TaskPlacementCategory category)
+        {
+            using var taskManager = new TaskManager();
+            var canceled = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            var finish = new TaskCompletionSource(TaskCreationOptions.RunContinuationsAsynchronously);
+            taskManager.RegisterAndRun(TaskType.CommitTask, token => Task.Delay(Timeout.Infinite, token));
+            taskManager.RegisterAndRun(TaskType.ObjectCollectTask, async token =>
+            {
+                using var registration = token.Register(() => canceled.TrySetResult());
+                await finish.Task.ConfigureAwait(false);
+            });
+            var cancellation = taskManager.CancelAsync(category);
+            try
+            {
+                await canceled.Task.WaitAsync(TimeSpan.FromSeconds(5));
+                Assert.That(taskManager.IsRunning(TaskType.CommitTask), Is.True,
+                    "Commit cancellation must follow completion of mutation-producing tasks.");
+                Assert.That(cancellation.IsCompleted, Is.False);
+            }
+            finally
+            {
+                finish.TrySetResult();
+                await cancellation.WaitAsync(TimeSpan.FromSeconds(5));
+            }
+            Assert.That(taskManager.IsRegistered(TaskType.CommitTask), Is.False);
+        }
+
+        [Test]
+        [TestCase(TaskPlacementCategory.Primary)]
+        [TestCase(TaskPlacementCategory.All)]
+        [TestCase(TaskPlacementCategory.Replica)]
+        [TestCase(TaskPlacementCategory.ControlPlane)]
+        public async Task TestTaskPlacementCategoryCancellation(TaskPlacementCategory cancelTaskPlacementCategory)
+        {
+            using var taskManager = new TaskManager();
+            var primaryTaskStarted = new SemaphoreSlim(0);
+            var allTaskStarted = new SemaphoreSlim(0);
+
+            Task primaryCategoryTaskFactory(CancellationToken token) => PrimaryCategoryTask(token);
+            Task allCategoryTaskFactory(CancellationToken token) => AllCategoryTask(token);
+
+            taskManager.RegisterAndRun(TaskType.AofSizeLimitTask, primaryCategoryTaskFactory);
+            taskManager.RegisterAndRun(TaskType.IndexAutoGrowTask, allCategoryTaskFactory);
+            taskManager.RegisterAndRun(TaskType.VectorReplicationReplayTask, token => Task.Delay(Timeout.Infinite, token));
+            taskManager.RegisterAndRun(TaskType.FailoverTask, token => Task.Delay(Timeout.Infinite, token));
+
+
+            ClassicAssert.IsTrue(primaryTaskStarted.Wait(TimeSpan.FromSeconds(5)), "Primary task should start");
+            ClassicAssert.IsTrue(allTaskStarted.Wait(TimeSpan.FromSeconds(5)), "All task should start");
+
+            await taskManager.CancelAsync(cancelTaskPlacementCategory).ConfigureAwait(false);
+            ClassicAssert.AreEqual(cancelTaskPlacementCategory is TaskPlacementCategory.Replica or TaskPlacementCategory.ControlPlane,
+                taskManager.IsRunning(TaskType.AofSizeLimitTask));
+            ClassicAssert.AreEqual(cancelTaskPlacementCategory != TaskPlacementCategory.All,
+                taskManager.IsRunning(TaskType.IndexAutoGrowTask));
+            ClassicAssert.AreEqual(cancelTaskPlacementCategory is TaskPlacementCategory.Primary or TaskPlacementCategory.ControlPlane,
+                taskManager.IsRunning(TaskType.VectorReplicationReplayTask));
+            ClassicAssert.AreEqual(cancelTaskPlacementCategory is TaskPlacementCategory.Primary or TaskPlacementCategory.Replica,
+                taskManager.IsRunning(TaskType.FailoverTask));
+            await taskManager.CancelAsync(TaskPlacementCategory.All).ConfigureAwait(false);
+
+            // Shutdown cancels both role-specific and role-independent tasks.
+            ClassicAssert.IsFalse(await taskManager.WaitAsync(TaskType.AofSizeLimitTask));
+            ClassicAssert.IsFalse(await taskManager.WaitAsync(TaskType.IndexAutoGrowTask));
+
+            async Task PrimaryCategoryTask(CancellationToken token)
+            {
+                _ = primaryTaskStarted.Release();
+                await Task.Delay(Timeout.Infinite, token).ConfigureAwait(false);
+            }
+
+            async Task AllCategoryTask(CancellationToken token)
+            {
+                _ = allTaskStarted.Release();
+                await Task.Delay(Timeout.Infinite, token).ConfigureAwait(false);
+            }
+        }
+
+        [Test]
+        public async Task ControlPlaneTaskSurvivesRoleChangesButStopsOnDispose()
+        {
+            var taskManager = new TaskManager();
+            var canceled = false;
+            try
+            {
+                ClassicAssert.IsTrue(taskManager.RegisterAndRun(TaskType.FailoverTask, async token =>
+                {
+                    try
+                    {
+                        await Task.Delay(Timeout.Infinite, token);
+                    }
+                    catch (OperationCanceledException) when (token.IsCancellationRequested)
+                    {
+                        canceled = true;
+                    }
+                }));
+                await taskManager.CancelAsync(TaskPlacementCategory.Primary);
+                await taskManager.CancelAsync(TaskPlacementCategory.Replica);
+                ClassicAssert.IsTrue(taskManager.IsRunning(TaskType.FailoverTask));
+            }
+            finally
+            {
+                taskManager.Dispose();
+            }
+            ClassicAssert.IsTrue(canceled);
+            ClassicAssert.IsFalse(taskManager.IsRegistered(TaskType.FailoverTask));
+        }
+
+        [Test]
+        public void TestTaskRegisterAfterDispose()
+        {
+            var taskManager = new TaskManager();
+            taskManager.Dispose();
+
+            var registered = taskManager.RegisterAndRun(TaskType.IndexAutoGrowTask, (token) => Task.CompletedTask);
+            ClassicAssert.IsFalse(registered);
+        }
+
+        [Test]
+        public void TestTaskFactoryException([Values] bool cleanupOnCompletion)
+        {
+            using var taskManager = new TaskManager();
+
+            // Create a task factory that throws an exception
+            Task ThrowingTaskFactory(CancellationToken token)
+            {
+                throw new InvalidOperationException("Test exception from task factory");
+            }
+
+            // RegisterAndRun should return false when the task factory throws an exception
+            var registered = taskManager.RegisterAndRun(TaskType.IndexAutoGrowTask, ThrowingTaskFactory, cleanupOnCompletion);
+            ClassicAssert.IsFalse(registered, "RegisterAndRun should return false when task factory throws an exception");
+
+            // Verify that the task is not running after the exception
+            ClassicAssert.IsFalse(taskManager.IsRunning(TaskType.IndexAutoGrowTask), "Task should not be running after exception");
+        }
+
+        [Test]
+        public void TestCleanupOnCompletion()
+        {
+            using var taskManager = new TaskManager();
+
+            var registered = taskManager.RegisterAndRun(TaskType.IndexAutoGrowTask, (token) => Task.CompletedTask, cleanupOnCompletion: true);
+            ClassicAssert.IsTrue(registered);
+
+            while (taskManager.IsRegistered(TaskType.IndexAutoGrowTask)) { }
+            ClassicAssert.IsFalse(taskManager.IsRegistered(TaskType.IndexAutoGrowTask));
+        }
+
+        [Test]
+        public void TestCleanupWithException()
+        {
+            using var taskManager = new TaskManager();
+            var taskCanRun = new SemaphoreSlim(0);
+
+            Task taskFactory(CancellationToken token) => ThrowingTaskFactory(token);
+
+            // Create a task factory that throws an exception
+            async Task ThrowingTaskFactory(CancellationToken token)
+            {
+                await taskCanRun.WaitAsync(token).ConfigureAwait(false);
+                throw new InvalidOperationException("Test exception from task factory");
+            }
+
+            var registered = taskManager.RegisterAndRun(TaskType.IndexAutoGrowTask, taskFactory, cleanupOnCompletion: true);
+            ClassicAssert.IsTrue(registered, "RegisterAndRun should return true");
+
+            taskCanRun.Release();
+
+            while (taskManager.IsRegistered(TaskType.IndexAutoGrowTask)) { }
+            ClassicAssert.IsFalse(taskManager.IsRegistered(TaskType.IndexAutoGrowTask));
+        }
+    }
+}

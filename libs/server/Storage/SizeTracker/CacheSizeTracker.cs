@@ -1,0 +1,182 @@
+﻿// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Diagnostics;
+using System.Threading;
+using Microsoft.Extensions.Logging;
+using Tsavorite.core;
+
+namespace Garnet.server
+{
+    /// <summary>
+    /// Tracks the size of the main log and read cache. 
+    /// Based on the current size and the target size, it uses the corresponding LogSizeTracker objects to increase
+    /// or decrease memory utilization.
+    /// </summary>
+    /// <remarks>
+    /// The tracked budget is the log pages plus any heap objects on those pages, regardless of whether the page
+    /// memory is a pinned managed array or a direct-VM (mmap/VirtualAlloc) block, so enabling the native allocator
+    /// does not change what this tracker measures or when it trims.
+    /// </remarks>
+    public class CacheSizeTracker
+    {
+        internal LogSizeTracker<StoreFunctions, StoreAllocator> mainLogTracker;
+        internal LogSizeTracker<StoreFunctions, StoreAllocator> readCacheTracker;
+
+        int isStarted = 0;
+        private const int HighTargetSizeDeltaFraction = 10; // When memory usage grows, trigger trimming at 10% above target size (for both main log and readcache)
+        private const int LowTargetSizeDeltaFraction = HighTargetSizeDeltaFraction * 5;  // When trimming memory, trim down to 1/5 of HighTargetSizeDeltaFraction below target size (for both main log and readcache)
+
+        internal bool IsStopped => (mainLogTracker == null || mainLogTracker.IsStopped) && (readCacheTracker == null || readCacheTracker.IsStopped);
+        internal bool IsStarted => isStarted == 1;
+
+        /// <summary>Whether the tracker has been initialized with a store.</summary>
+        internal bool IsInitialized => mainLogTracker != null || readCacheTracker != null;
+
+        /// <summary>Total memory size target for main log</summary>
+        public long TargetSize
+        {
+            get => mainLogTracker?.TargetSize ?? 0;
+            set
+            {
+                Debug.Assert(value >= 0);
+                mainLogTracker?.UpdateTargetSize(value, value / HighTargetSizeDeltaFraction, value / LowTargetSizeDeltaFraction);
+            }
+        }
+
+        /// <summary>
+        /// Hash-index memory in excess of the configured index budget, charged against the main log's budget. Zero
+        /// when the index fits the budget.
+        /// </summary>
+        public long IndexMemoryChargedToLogBudget => mainLogTracker?.ExternalMemorySize ?? 0;
+
+        /// <summary>Total memory size target for readcache</summary>
+        public long ReadCacheTargetSize
+        {
+            get => readCacheTracker?.TargetSize ?? 0;
+            set
+            {
+                Debug.Assert(value >= 0);
+                readCacheTracker?.UpdateTargetSize(value, value / HighTargetSizeDeltaFraction, value / LowTargetSizeDeltaFraction);
+            }
+        }
+
+        /// <summary>
+        /// Creates an uninitialized CacheSizeTracker. Call <c>Initialize</c> after
+        /// the store is created to subscribe to eviction notifications.
+        /// </summary>
+        public CacheSizeTracker() { }
+
+        /// <summary>Class to track and update cache size</summary>
+        /// <param name="store">Tsavorite store instance</param>
+        /// <param name="targetSize">Total memory size target</param>
+        /// <param name="readCacheTargetSize">Target memory size for read cache</param>
+        /// <param name="loggerFactory"></param>
+        public CacheSizeTracker(TsavoriteKV<StoreFunctions, StoreAllocator> store, long targetSize, long readCacheTargetSize, ILoggerFactory loggerFactory = null)
+            => Initialize(store, targetSize, readCacheTargetSize, loggerFactory, indexMemoryBudget: 0);
+
+        /// <summary>Class to track and update cache size</summary>
+        /// <param name="store">Tsavorite store instance</param>
+        /// <param name="targetSize">Total memory size target</param>
+        /// <param name="readCacheTargetSize">Target memory size for read cache</param>
+        /// <param name="loggerFactory"></param>
+        /// <param name="indexMemoryBudget">Bytes of hash-index memory the configuration budgets for; see <c>Initialize</c></param>
+        public CacheSizeTracker(TsavoriteKV<StoreFunctions, StoreAllocator> store, long targetSize, long readCacheTargetSize, ILoggerFactory loggerFactory, long indexMemoryBudget)
+            => Initialize(store, targetSize, readCacheTargetSize, loggerFactory, indexMemoryBudget);
+
+        /// <summary>
+        /// Initialize the tracker with a store. Wires the <see cref="LogSizeTracker"/> for
+        /// heap-size tracking. Tsavorite handles all creation-site and destruction-site
+        /// accounting internally via <c>logSizeTracker</c>.
+        /// </summary>
+        /// <param name="store">Tsavorite store instance</param>
+        /// <param name="targetSize">Total memory size target for the main log</param>
+        /// <param name="readCacheTargetSize">Target memory size for read cache</param>
+        /// <param name="loggerFactory">Logger factory</param>
+        public void Initialize(TsavoriteKV<StoreFunctions, StoreAllocator> store, long targetSize, long readCacheTargetSize, ILoggerFactory loggerFactory = null)
+            => Initialize(store, targetSize, readCacheTargetSize, loggerFactory, indexMemoryBudget: 0);
+
+        /// <summary>
+        /// Initialize the tracker with a store. Wires the <see cref="LogSizeTracker"/> for
+        /// heap-size tracking. Tsavorite handles all creation-site and destruction-site
+        /// accounting internally via <c>logSizeTracker</c>.
+        /// </summary>
+        /// <param name="store">Tsavorite store instance</param>
+        /// <param name="targetSize">Total memory size target for the main log</param>
+        /// <param name="readCacheTargetSize">Target memory size for read cache</param>
+        /// <param name="loggerFactory">Logger factory</param>
+        /// <param name="indexMemoryBudget">
+        /// Bytes of hash-index memory the configuration budgets for. Index memory beyond it, which is overflow buckets
+        /// that grow with record count and that no index setting bounds, is charged against <paramref name="targetSize"/>
+        /// so the log sheds pages as the index grows. Pass 0 to leave the index out of the log budget.
+        /// </param>
+        public void Initialize(TsavoriteKV<StoreFunctions, StoreAllocator> store, long targetSize, long readCacheTargetSize, ILoggerFactory loggerFactory, long indexMemoryBudget)
+        {
+            Debug.Assert(store != null);
+            Debug.Assert(targetSize > 0 || readCacheTargetSize > 0);
+
+            if (targetSize > 0)
+            {
+                mainLogTracker = new LogSizeTracker<StoreFunctions, StoreAllocator>(store.Log, targetSize,
+                        targetSize / HighTargetSizeDeltaFraction, targetSize / LowTargetSizeDeltaFraction, loggerFactory?.CreateLogger("MainLogSizeTracker"));
+                store.Log.SetLogSizeTracker(mainLogTracker);
+
+                // The generation an index resize replaces is freed when its split completes, so it is not charged:
+                // charging it would evict log pages for memory that is about to be released.
+                if (indexMemoryBudget > 0)
+                    mainLogTracker.ExternalMemorySizeProvider = () => Math.Max(0, store.IndexSettledSizeBytes - indexMemoryBudget);
+            }
+
+            if (store.ReadCache != null && readCacheTargetSize > 0)
+            {
+                readCacheTracker = new LogSizeTracker<StoreFunctions, StoreAllocator>(store.ReadCache, readCacheTargetSize,
+                        readCacheTargetSize / HighTargetSizeDeltaFraction, readCacheTargetSize / LowTargetSizeDeltaFraction, loggerFactory?.CreateLogger("ReadCacheSizeTracker"));
+                store.ReadCache.SetLogSizeTracker(readCacheTracker);
+            }
+        }
+
+        /// <summary>Start the trackers, ensuring that only one thread does so. We may start it on Checkpoint recovery before starting database operations.</summary>
+        public void Start(CancellationToken token)
+        {
+            // Prevent multiple calls to Start
+            var prevIsStarted = Interlocked.CompareExchange(ref isStarted, 1, 0);
+            if (prevIsStarted == 0)
+            {
+                mainLogTracker?.Start(token);
+                readCacheTracker?.Start(token);
+            }
+        }
+
+        /// <summary>Add to the tracked size of the cache.</summary>
+        /// <param name="size">Size to be added</param>
+        public void AddHeapSize(long size)
+        {
+            // mainLogTracker could be null if heap size limit is set just for the read cache
+            if (size != 0)
+                mainLogTracker?.IncrementSize(size);
+        }
+
+        /// <summary>Add to the tracked size of read cache.</summary>
+        /// <param name="size">Size to be added</param>
+        public void AddReadCacheHeapSize(long size)
+        {
+            // readCacheTracker could be null if read cache is not enabled or heap size limit is set only for the main log
+            if (size != 0)
+                readCacheTracker?.IncrementSize(size);
+        }
+
+        /// <summary>
+        /// If tracker has not started, prevent it from starting, else stop it.
+        /// </summary>
+        public void Stop()
+        {
+            var prevStarted = Interlocked.CompareExchange(ref isStarted, 1, 0);
+            if (prevStarted != 0)
+            {
+                mainLogTracker?.Stop(wait: false);
+                readCacheTracker?.Stop(wait: false);
+            }
+        }
+    }
+}

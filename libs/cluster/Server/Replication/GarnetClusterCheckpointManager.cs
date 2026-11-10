@@ -1,0 +1,167 @@
+﻿// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.IO;
+using System.Text;
+using Garnet.server;
+using Microsoft.Extensions.Logging;
+using Tsavorite.core;
+
+namespace Garnet.cluster
+{
+    /// <summary>
+    /// Checkpoint manager for Garnet cluster, inherits from GarnetCheckpointManager.
+    /// </summary>
+    internal sealed class GarnetClusterCheckpointManager : GarnetCheckpointManager, IDisposable
+    {
+        readonly bool isMainStore;
+        public Action<bool, long, long, bool> checkpointVersionShiftStart;
+        public Action<bool, long, long, bool> checkpointVersionShiftEnd;
+
+        readonly bool safelyRemoveOutdated;
+
+        readonly ILogger logger;
+
+        public GarnetClusterCheckpointManager(
+            int aofPhysicalSublogCount,
+            INamedDeviceFactoryCreator deviceFactoryCreator,
+            ICheckpointNamingScheme checkpointNamingScheme,
+            bool isMainStore,
+            bool safelyRemoveOutdated = false,
+            int fastCommitThrottleFreq = 0,
+            ILogger logger = null)
+            : base(aofPhysicalSublogCount, deviceFactoryCreator, checkpointNamingScheme, removeOutdated: false, fastCommitThrottleFreq, logger)
+        {
+            this.isMainStore = isMainStore;
+            this.safelyRemoveOutdated = safelyRemoveOutdated;
+            this.logger = logger;
+        }
+
+        /// <summary>
+        /// Cluster mode manages checkpoint cleanup externally via CheckpointStore with reader-safety checks.
+        /// </summary>
+        public override bool PerformAutomaticCleanup => false;
+
+        public override void CheckpointVersionShiftStart(long oldVersion, long newVersion, bool isStreaming)
+            => checkpointVersionShiftStart?.Invoke(isMainStore, oldVersion, newVersion, isStreaming);
+
+        public override void CheckpointVersionShiftEnd(long oldVersion, long newVersion, bool isStreaming)
+            => checkpointVersionShiftEnd?.Invoke(isMainStore, oldVersion, newVersion, isStreaming);
+
+        public void DeleteLogCheckpoint(Guid logToken)
+            => deviceFactory.Delete(checkpointNamingScheme.LogCheckpointBase(logToken));
+
+        public void DeleteIndexCheckpoint(Guid indexToken)
+            => deviceFactory.Delete(checkpointNamingScheme.IndexCheckpointBase(indexToken));
+
+        public IDevice GetDevice(CheckpointFileType retStateType, Guid fileToken)
+        {
+            var device = retStateType switch
+            {
+                CheckpointFileType.STORE_INDEX => GetIndexDevice(fileToken),
+                CheckpointFileType.STORE_SNAPSHOT => GetSnapshotLogDevice(fileToken),
+                CheckpointFileType.STORE_SNAPSHOT_OBJ => GetSnapshotObjectLogDevice(fileToken),
+                _ => throw new Exception($"RetrieveCheckpointFile: unexpected state{retStateType}")
+            };
+            return device;
+        }
+
+        #region ICheckpointManager
+
+        private HybridLogRecoveryInfo ConvertMetadata(byte[] checkpointMetadata)
+        {
+            HybridLogRecoveryInfo recoveryInfo = new();
+
+            // Try to parse new format where cookie is embedded inside the HybridLogRecoveryInfo
+            try
+            {
+                using var s = new StreamReader(new MemoryStream(checkpointMetadata));
+                recoveryInfo.Initialize(s);
+            }
+            catch (Exception ex)
+            {
+                logger?.LogError(ex, "Best effort read of checkpoint metadata failed");
+                throw;
+            }
+
+            return recoveryInfo;
+        }
+
+        /// <summary>
+        /// Commit log checkpoint metadata with included cookie in byte array
+        /// </summary>
+        /// <param name="logToken"></param>
+        /// <param name="checkpointMetadata"></param>
+        public void CommitLogCheckpointSendFromPrimary(Guid logToken, byte[] checkpointMetadata)
+        {
+            var recoveryInfo = ConvertMetadata(checkpointMetadata);
+            CommitLogCheckpointMetadata(logToken, recoveryInfo.ToByteArray());
+        }
+
+        /// <summary>
+        /// Retrieve RecoveredSafeAofAddress and RecoveredReplicationId for checkpoint
+        /// </summary>
+        /// <param name="logToken"></param>
+        /// <param name="recoveredSafeAofAddress"></param>
+        /// <param name="recoveredReplicationId"></param>
+        /// <exception cref="Exception"></exception>
+        public unsafe void GetCheckpointCookieMetadata(Guid logToken, ref AofAddress recoveredSafeAofAddress, out string recoveredReplicationId)
+        {
+            var metadata = GetLogCheckpointMetadata(logToken);
+            var hlri = ConvertMetadata(metadata);
+
+            recoveredReplicationId = null;
+            if (RecoveredSafeAofAddress.Length == 1)
+            {
+                // Legacy single log deserialization for backward compatibility
+                var bytesRead = sizeof(int);
+                fixed (byte* ptr = hlri.cookie)
+                {
+                    if (hlri.cookie.Length < 4) throw new Exception($"invalid metadata length: {hlri.cookie.Length} < 4");
+                    var cookieSize = *(int*)ptr;
+                    bytesRead += cookieSize;
+
+                    if (hlri.cookie.Length < 12) throw new Exception($"invalid metadata length: {hlri.cookie.Length} < 12");
+                    recoveredSafeAofAddress[0] = *(long*)(ptr + 4);
+
+                    if (hlri.cookie.Length < 52) throw new Exception($"invalid metadata length: {hlri.cookie.Length} < 52");
+                    recoveredReplicationId = Encoding.ASCII.GetString(ptr + 12, 40);
+                }
+            }
+            else
+            {
+                // Multi-log cookie
+                using var ms = new MemoryStream(hlri.cookie);
+                using var reader = new BinaryReader(ms, Encoding.ASCII);
+                recoveredReplicationId = reader.ReadInt32() > 0 ? reader.ReadString() : null;
+                recoveredSafeAofAddress = AofAddress.Deserialize(reader);
+                reader.Dispose();
+                ms.Dispose();
+            }
+        }
+
+        public override byte[] GetLogCheckpointMetadata(Guid logToken)
+        {
+            HybridLogRecoveryInfo hlri;
+
+            using var device = deviceFactory.Get(checkpointNamingScheme.LogCheckpointMetadata(logToken));
+
+            ReadInto(device, 0, out byte[] writePad, sizeof(int));
+            var size = BitConverter.ToInt32(writePad, 0);
+            ThrowIfInvalidMetadataSize(size, checkpointNamingScheme.LogCheckpointMetadata(logToken));
+
+            byte[] body;
+            if (writePad.Length >= size + sizeof(int))
+                body = writePad;
+            else
+                ReadInto(device, 0, out body, size + sizeof(int));
+
+            body = body.AsSpan().Slice(sizeof(int), size).ToArray();
+            hlri = ConvertMetadata(body);
+            return hlri.ToByteArray();
+        }
+
+        #endregion
+    }
+}

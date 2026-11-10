@@ -1,0 +1,854 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Collections.Generic;
+using System.Diagnostics;
+using System.Globalization;
+using System.Runtime.CompilerServices;
+using System.Text;
+using System.Threading;
+using Garnet.client;
+using Garnet.common;
+
+namespace Garnet.server
+{
+    /// <summary>
+    /// Central table of runtime-adjustable server configuration values, indexed by
+    /// <see cref="ServerConfigType"/>. Values are seeded from <see cref="GarnetServerOptions"/> at
+    /// startup and may be updated at runtime through CONFIG SET. Held by
+    /// <see cref="StoreWrapper"/> so the live value is reachable across the server and cluster layers.
+    /// <para/>
+    /// Backed by a single <see cref="long"/>[] (allocation-free, contiguous, O(1) indexed,
+    /// <see cref="Volatile"/> access is atomic on 64-bit). Each slot is a raw 8-byte cell whose
+    /// interpretation is given by the per-option <see cref="ConfigMeta"/> — heterogeneous types
+    /// (int, long, bool, enum, seconds-based timeout) are losslessly encoded into the slot.
+    /// </summary>
+    public sealed class RuntimeServerConfig
+    {
+        // Number of slots needed to index every declared ServerConfigType by its underlying value.
+        static readonly int TableSize = ComputeTableSize();
+
+        // Metadata for every ServerConfigType (index == (int)ServerConfigType). Non-runtime types keep
+        // the default (IsRuntime == false) and are served by the bespoke CONFIG code, not this table.
+        static readonly ConfigMeta[] Meta = BuildMeta();
+
+        // Wire name (and aliases) -> ServerConfigType, for CONFIG parameter parsing.
+        static readonly Dictionary<byte[], ServerConfigType> NameToType = BuildNameLookup();
+        static readonly Dictionary<byte[], ServerConfigType>.AlternateLookup<ReadOnlySpan<byte>> NameToTypeSpanLookup =
+            NameToType.GetAlternateLookup<ReadOnlySpan<byte>>();
+
+        // All types handled by this table (settable + read-only), for CONFIG GET *.
+        static readonly ServerConfigType[] runtimeTypes = BuildRuntimeTypes();
+
+        readonly long[] values = new long[TableSize];
+
+        // Logical configuration groups indexed by (int)ServerConfigGroupType, mirroring the Meta[]/values[]
+        // tables. Each group publishes its parameters together as one versioned, consistent unit so a reader
+        // never observes a partially-applied multi-parameter change. Built once; thereafter the array itself
+        // is read-only (only the interior groups mutate), so concurrent lookup needs no lock.
+        readonly IConfigGroup[] groups = BuildGroups();
+
+        // Serializes CONFIG SET batches: the slot writes, group validation, rollback, and publish of one batch
+        // run as a unit, so a group snapshot never captures part of another batch's multi-parameter update.
+        readonly object setLock = new();
+
+        // Startup options are retained only to resolve read-only parameters that derive from live server
+        // state. Runtime-adjustable values are seeded into the table at construction and are thereafter
+        // read exclusively through the typed accessors so a CONFIG SET is observed everywhere.
+        readonly GarnetServerOptions serverOptions;
+
+        // Owning server, through which update actions reach the live background tasks (AOF commit, expiry
+        // collection/scan) to enact lifecycle changes. Null in unit tests that construct the config
+        // standalone, in which case an update action simply stores the value with no lifecycle effect.
+        readonly StoreWrapper owner;
+
+        /// <summary>All configuration types handled by this table.</summary>
+        public static ReadOnlySpan<ServerConfigType> RuntimeTypes => runtimeTypes;
+
+        /// <summary>
+        /// Returns the configuration group registered for <paramref name="type"/>, or <see langword="null"/>
+        /// for <see cref="ServerConfigGroupType.NONE"/> (ungrouped parameters). Consumers cast to the typed
+        /// <see cref="IConfigGroup{TOptions}"/> to read a group's materialized options, or use the non-generic
+        /// surface for versioned staleness checks.
+        /// </summary>
+        public IConfigGroup GetConfigGroup(ServerConfigGroupType type) => groups[(int)type];
+
+        /// <summary>
+        /// Create a runtime configuration seeded from the startup options.
+        /// </summary>
+        /// <param name="serverOptions">Startup options supplying the initial value of every slot.</param>
+        /// <param name="owner">
+        /// Owning server, through which update actions enact task lifecycle changes. May be
+        /// <see langword="null"/> for a standalone configuration with no live server to act on.
+        /// </param>
+        public RuntimeServerConfig(GarnetServerOptions serverOptions, StoreWrapper owner = null)
+        {
+            ArgumentNullException.ThrowIfNull(serverOptions);
+            this.serverOptions = serverOptions;
+            this.owner = owner;
+            Init(serverOptions);
+        }
+
+        /// <summary>
+        /// Sizes the metadata and value tables from the largest declared <see cref="ServerConfigType"/>
+        /// value, so no sentinel member is required and gaps in the enum remain safe to index.
+        /// </summary>
+        static int ComputeTableSize()
+        {
+            var max = 0;
+            foreach (var v in Enum.GetValuesAsUnderlyingType<ServerConfigType>())
+            {
+                var i = (int)v;
+                if (i > max) max = i;
+            }
+            return max + 1;
+        }
+
+        /// <summary>
+        /// Sizes the group table from the largest declared <see cref="ServerConfigGroupType"/> value, mirroring
+        /// <see cref="ComputeTableSize"/> so the group enum needs no sentinel and gaps stay safe to index.
+        /// </summary>
+        static int ComputeGroupTableSize()
+        {
+            var max = 0;
+            foreach (var v in Enum.GetValuesAsUnderlyingType<ServerConfigGroupType>())
+            {
+                var i = (int)v;
+                if (i > max) max = i;
+            }
+            return max + 1;
+        }
+
+        /// <summary>
+        /// Builds the group table indexed by <see cref="ServerConfigGroupType"/>. Each registered group lands
+        /// at its own type's index; the NONE slot stays <see langword="null"/> (ungrouped parameters).
+        /// </summary>
+        static IConfigGroup[] BuildGroups()
+        {
+            var g = new IConfigGroup[ComputeGroupTableSize()];
+            Register(g, new GossipClientConfigGroup());
+            return g;
+
+            static void Register(IConfigGroup[] table, IConfigGroup group)
+                => table[(int)group.GetGroupType()] = group;
+        }
+
+        static ConfigMeta[] BuildMeta()
+        {
+            var m = new ConfigMeta[TableSize];
+
+            void RegisterReadWrite(ServerConfigType t, string name, ConfigKind kind, long min, long max, ServerConfigGroupType groupType = ServerConfigGroupType.NONE, Type enumType = null,
+                ConfigTimeUnit timeUnit = ConfigTimeUnit.None, ConfigUpdateAction updateAction = null)
+            {
+                if ((kind & ConfigKind.Enum) != 0)
+                    EnsureSupportedEnum(enumType);
+                EnsureValidKind(name, kind, timeUnit);
+                m[(int)t] = new ConfigMeta(name, kind, min, max, enumType, IsRuntime: true, IsReadOnly: false, GroupType: groupType,
+                    timeUnit, UpdateAction: updateAction);
+            }
+
+            void RegisterReadOnly(ServerConfigType t, string name, ConfigKind kind,
+                Func<GarnetServerOptions, string> formatter, ServerConfigGroupType groupType = ServerConfigGroupType.NONE, ConfigTimeUnit timeUnit = ConfigTimeUnit.None)
+            {
+                EnsureValidKind(name, kind, timeUnit);
+                m[(int)t] = new ConfigMeta(name, kind, 0, 0, null, IsRuntime: true, IsReadOnly: true, GroupType: groupType,
+                    TimeUnit: timeUnit, ReadOnlyFormatter: formatter);
+            }
+
+            // Read-only parameters: exposed through CONFIG GET (and GET *) via this table, but CONFIG SET
+            // rejects them because they are constants or physical (require restart). Their CONFIG GET value
+            // is computed by the per-option formatter, which reads directly from the startup
+            // GarnetServerOptions (the read-only fall-through) — no runtime slot is used.
+            // NOTE: slave-read-only is intentionally not here because it is a fixed compatibility setting
+            // handled directly by CONFIG GET.
+            RegisterReadOnly(ServerConfigType.TIMEOUT, "timeout",
+                ConfigKind.Int32 | ConfigKind.Seconds | ConfigKind.TimeSpan, static _ => "0", timeUnit: ConfigTimeUnit.Seconds);
+            RegisterReadOnly(ServerConfigType.SAVE, "save", ConfigKind.String, static _ => "");
+            RegisterReadOnly(ServerConfigType.APPENDONLY, "appendonly", ConfigKind.Bool,
+                static o => o.EnableAOF ? "yes" : "no");
+            RegisterReadOnly(ServerConfigType.DATABASES, "databases", ConfigKind.Int32,
+                static o => o.MaxDatabases.ToString(CultureInfo.InvariantCulture));
+
+            // Read-only non-numeric parameters resolved directly from the startup options (file paths,
+            // sockets, physical toggles). These have no runtime slot and are surfaced purely for CONFIG GET.
+            RegisterReadOnly(ServerConfigType.DIR, "dir", ConfigKind.String,
+                static o => o.CheckpointBaseDirectory);
+            RegisterReadOnly(ServerConfigType.LOGDIR, "logdir", ConfigKind.String,
+                static o => o.LogDir ?? string.Empty);
+            RegisterReadOnly(ServerConfigType.UNIXSOCKET, "unixsocket", ConfigKind.String,
+                static o => o.UnixSocketPath ?? string.Empty);
+            RegisterReadOnly(ServerConfigType.CLUSTER_ENABLED, "cluster-enabled", ConfigKind.Bool,
+                static o => o.EnableCluster ? "yes" : "no");
+
+            // Read-only AOF parameters resolved directly from the startup options. These describe the
+            // physical AOF layout or startup-only toggles and require a restart to change, so CONFIG SET
+            // rejects them; they have no runtime slot and are surfaced purely for CONFIG GET.
+            RegisterReadOnly(ServerConfigType.AOF_MEMORY, "aof-memory", ConfigKind.String,
+                static o => o.AofMemorySize ?? string.Empty);
+            RegisterReadOnly(ServerConfigType.AOF_PAGE_SIZE, "aof-page-size", ConfigKind.String,
+                static o => o.AofPageSize ?? string.Empty);
+            RegisterReadOnly(ServerConfigType.AOF_SEGMENT_SIZE, "aof-segment-size", ConfigKind.String,
+                static o => o.AofSegmentSize ?? string.Empty);
+            RegisterReadOnly(ServerConfigType.AOF_PHYSICAL_SUBLOG_COUNT, "aof-physical-sublog-count", ConfigKind.Int32,
+                static o => o.AofPhysicalSublogCount.ToString(CultureInfo.InvariantCulture));
+            RegisterReadOnly(ServerConfigType.AOF_REPLAY_TASK_COUNT, "aof-replay-task-count", ConfigKind.Int32,
+                static o => o.AofReplayTaskCount.ToString(CultureInfo.InvariantCulture));
+            RegisterReadOnly(ServerConfigType.AOF_COMMIT_WAIT, "aof-commit-wait", ConfigKind.Bool,
+                static o => o.WaitForCommit ? "yes" : "no");
+            RegisterReadOnly(ServerConfigType.AOF_SIZE_LIMIT, "aof-size-limit", ConfigKind.String,
+                static o => o.AofSizeLimit ?? string.Empty);
+            RegisterReadOnly(ServerConfigType.FAST_AOF_TRUNCATE, "fast-aof-truncate", ConfigKind.Bool,
+                static o => o.FastAofTruncate ? "yes" : "no");
+            RegisterReadOnly(ServerConfigType.AOF_NULL_DEVICE, "aof-null-device", ConfigKind.Bool,
+                static o => o.UseAofNullDevice ? "yes" : "no");
+
+            RegisterReadWrite(ServerConfigType.CLUSTER_NODE_TIMEOUT, "cluster-node-timeout",
+                ConfigKind.Int32 | ConfigKind.Seconds | ConfigKind.TimeSpan, 0, int.MaxValue,
+                timeUnit: ConfigTimeUnit.Seconds);
+            RegisterReadWrite(ServerConfigType.REPLICA_SYNC_DELAY, "replica-sync-delay",
+                ConfigKind.Int32 | ConfigKind.Milliseconds | ConfigKind.Seconds | ConfigKind.TimeSpan, 0, int.MaxValue,
+                timeUnit: ConfigTimeUnit.Milliseconds);
+            RegisterReadWrite(ServerConfigType.AOF_REPLAY_MAX_LAG_BYTES, "aof-replay-max-lag-bytes", ConfigKind.Int32, -1, int.MaxValue);
+            // Primary-side replication backpressure budget (whole-log bytes). The always-constructed
+            // AofBackpressure of every database reads plain fields, so ApplyAofSyncMaxLagUpdate pushes a
+            // CONFIG SET straight into the live gate — no restart, no lifecycle task.
+            RegisterReadWrite(ServerConfigType.AOF_SYNC_MAX_LAG_BYTES, "aof-sync-max-lag-bytes", ConfigKind.Int64, -1, long.MaxValue,
+                updateAction: ApplyAofSyncMaxLagUpdate);
+            RegisterReadWrite(ServerConfigType.AOF_TAIL_WITNESS_FREQ, "aof-tail-witness-freq",
+                ConfigKind.Int32 | ConfigKind.Milliseconds | ConfigKind.Seconds | ConfigKind.TimeSpan, 0, int.MaxValue,
+                timeUnit: ConfigTimeUnit.Milliseconds);
+            RegisterReadWrite(ServerConfigType.REPL_DISKLESS_SYNC_DELAY, "repl-diskless-sync-delay",
+                ConfigKind.Int32 | ConfigKind.Seconds | ConfigKind.TimeSpan, 0, int.MaxValue,
+                timeUnit: ConfigTimeUnit.Seconds);
+            RegisterReadWrite(ServerConfigType.REPL_ATTACH_TIMEOUT, "repl-attach-timeout",
+                ConfigKind.Int32 | ConfigKind.Seconds | ConfigKind.TimeSpan, 0, int.MaxValue,
+                timeUnit: ConfigTimeUnit.Seconds);
+            RegisterReadWrite(ServerConfigType.CLUSTER_REPLICATION_REESTABLISHMENT_TIMEOUT, "cluster-replication-reestablishment-timeout",
+                ConfigKind.Int32 | ConfigKind.Seconds | ConfigKind.TimeSpan, 0, int.MaxValue,
+                timeUnit: ConfigTimeUnit.Seconds);
+            RegisterReadWrite(ServerConfigType.COMPACTION_MAX_SEGMENTS, "compaction-max-segments", ConfigKind.Int32, 0, int.MaxValue);
+            RegisterReadWrite(ServerConfigType.COMPACTION_FORCE_DELETE, "compaction-force-delete", ConfigKind.Bool, 0, 1);
+            RegisterReadWrite(ServerConfigType.COMPACTION_TYPE, "compaction-type", ConfigKind.Enum, 0, 0, enumType: typeof(LogCompactionType));
+            RegisterReadWrite(ServerConfigType.SLOWLOG_LOG_SLOWER_THAN, "slowlog-log-slower-than",
+                ConfigKind.Int32 | ConfigKind.Microseconds | ConfigKind.TimeSpan, 0, int.MaxValue,
+                timeUnit: ConfigTimeUnit.Microseconds);
+            RegisterReadWrite(ServerConfigType.OBJECT_SCAN_COUNT_LIMIT, "object-scan-count-limit", ConfigKind.Int32, 0, int.MaxValue);
+            RegisterReadWrite(ServerConfigType.SG_GET, "sg-get", ConfigKind.Bool, 0, 1);
+
+            // Process-wide connection admission control. The listeners share one ConnectionLimit
+            // object, so the update action pushes straight into the live accept path -- no restart
+            // and no lifecycle task. -1 disables the limit.
+            RegisterReadWrite(ServerConfigType.MAXCLIENTS, "maxclients", ConfigKind.Int32, -1, int.MaxValue,
+                updateAction: ApplyMaxClientsUpdate);
+
+            // AOF size-limit enforcement frequency (seconds): the background checkpoint-enforcement task
+            // re-reads this each iteration, so CONFIG SET takes effect on the running task.
+            RegisterReadWrite(ServerConfigType.AOF_SIZE_LIMIT_ENFORCE_FREQUENCY, "aof-size-limit-enforce-frequency",
+                ConfigKind.Int32, 0, int.MaxValue);
+
+            // checkpoint-freq (seconds): 0 = disabled, > 0 = gap between scheduled checkpoints. The scheduler
+            // re-reads this each iteration; the UpdateAction only wakes it so a change is observed promptly.
+            RegisterReadWrite(ServerConfigType.CHECKPOINT_FREQ, "checkpoint-freq", ConfigKind.Int32, 0, int.MaxValue,
+                updateAction: ApplyCheckpointFrequencyUpdate);
+
+            // Background-task frequencies whose change is enacted by restarting / killing the owning task
+            // through the UpdateAction: the tasks capture their interval at start, so a runtime change
+            // requires a kill+restart rather than a re-read.
+            //
+            // aof-commit-freq (ms): -1 = manual commit (no periodic task), > 0 = periodic commit interval.
+            // A value of 0 (per-operation auto-commit) is baked into the AOF log at startup and cannot be
+            // toggled on a live log; ApplyCommitFrequencyUpdate rejects moving to 0 and rejects any change
+            // when the server started at 0.
+            RegisterReadWrite(ServerConfigType.AOF_COMMIT_FREQ, "aof-commit-freq", ConfigKind.Int32, -1, int.MaxValue,
+                updateAction: ApplyCommitFrequencyUpdate);
+            // expired-object-collection-freq (seconds): <= 0 = disabled (no task), > 0 = collection interval.
+            RegisterReadWrite(ServerConfigType.EXPIRED_OBJECT_COLLECTION_FREQ, "expired-object-collection-freq",
+                ConfigKind.Int32, 0, int.MaxValue, updateAction: ApplyExpiredObjectCollectionUpdate);
+            // expired-key-deletion-scan-freq (seconds): <= 0 = disabled (no task, on-demand EXPDELSCAN
+            // allowed), > 0 = background scan interval.
+            RegisterReadWrite(ServerConfigType.EXPIRED_KEY_DELETION_SCAN_FREQ, "expired-key-deletion-scan-freq",
+                ConfigKind.Int32, -1, int.MaxValue, updateAction: ApplyExpiredKeyDeletionUpdate);
+
+            // GarnetClient (gossip) network-writer options, published together as the GOSSIP_CLIENT group.
+            // Ranges only bound each stored value; cross-field constraints enforced by NetworkWriterOptions
+            // (power-of-two sizes, inline buffer capacity) are checked per group by TrySetAll, which rolls back
+            // the batch's changes to the group when they would not materialize.
+            RegisterReadWrite(ServerConfigType.GOSSIP_NETWORK_BUFFER_SIZE_BYTES, "gossip-network-buffer-size", ConfigKind.Int32, 1, int.MaxValue, groupType: ServerConfigGroupType.GOSSIP_CLIENT);
+            RegisterReadWrite(ServerConfigType.GOSSIP_REQUEST_PAGE_SIZE_BYTES, "gossip-request-page-size", ConfigKind.Int32, 1, int.MaxValue, groupType: ServerConfigGroupType.GOSSIP_CLIENT);
+            RegisterReadWrite(ServerConfigType.GOSSIP_REQUEST_PAGE_COUNT, "gossip-request-page-count", ConfigKind.Int32, 1, int.MaxValue, groupType: ServerConfigGroupType.GOSSIP_CLIENT);
+            RegisterReadWrite(ServerConfigType.GOSSIP_MAX_OUTSTANDING_REQUESTS, "gossip-max-outstanding-requests", ConfigKind.Int32, 1, int.MaxValue, groupType: ServerConfigGroupType.GOSSIP_CLIENT);
+            RegisterReadWrite(ServerConfigType.GOSSIP_MAX_OUTSTANDING_COMPLETIONS, "gossip-max-outstanding-completions", ConfigKind.Int32, 1, int.MaxValue, groupType: ServerConfigGroupType.GOSSIP_CLIENT);
+            RegisterReadWrite(ServerConfigType.GOSSIP_MAX_CONCURRENT_NETWORK_SENDS, "gossip-max-concurrent-network-sends", ConfigKind.Int32, 1, int.MaxValue, groupType: ServerConfigGroupType.GOSSIP_CLIENT);
+            RegisterReadWrite(ServerConfigType.GOSSIP_MAX_OUT_OF_LINE_RENTED_BYTES, "gossip-max-out-of-line-rented-bytes", ConfigKind.Int64, 0, long.MaxValue, groupType: ServerConfigGroupType.GOSSIP_CLIENT);
+            RegisterReadWrite(ServerConfigType.GOSSIP_FLUSH_RESULT_ALLOCATION_MODE, "gossip-flush-result-allocation-mode", ConfigKind.Enum, 0, 0, groupType: ServerConfigGroupType.GOSSIP_CLIENT, enumType: typeof(FlushResultAllocationMode));
+
+            RegisterReadWrite(ServerConfigType.GOSSIP_CLIENT_SWAP_GRACE, "gossip-client-swap-grace",
+                ConfigKind.Int32 | ConfigKind.Seconds | ConfigKind.TimeSpan, 0, int.MaxValue,
+                timeUnit: ConfigTimeUnit.Seconds);
+
+            return m;
+        }
+
+        static Dictionary<byte[], ServerConfigType> BuildNameLookup()
+        {
+            var d = new Dictionary<byte[], ServerConfigType>(ConfigNameComparer.Instance);
+            for (var i = 0; i < Meta.Length; i++)
+            {
+                if (Meta[i].IsRuntime)
+                    d[Encoding.ASCII.GetBytes(Meta[i].Name)] = (ServerConfigType)i;
+            }
+
+            // Redis / CLI compatible alias for cluster-node-timeout.
+            d["cluster-timeout"u8.ToArray()] = ServerConfigType.CLUSTER_NODE_TIMEOUT;
+            return d;
+        }
+
+        static ServerConfigType[] BuildRuntimeTypes()
+        {
+            var list = new List<ServerConfigType>();
+            for (var i = 0; i < Meta.Length; i++)
+            {
+                if (Meta[i].IsRuntime)
+                    list.Add((ServerConfigType)i);
+            }
+            return [.. list];
+        }
+
+        /// <summary>Seed every runtime slot from the startup options.</summary>
+        void Init(GarnetServerOptions o)
+        {
+            values[(int)ServerConfigType.CLUSTER_NODE_TIMEOUT] = o.ClusterTimeout;
+            values[(int)ServerConfigType.REPLICA_SYNC_DELAY] = o.ReplicaSyncDelayMs;
+            values[(int)ServerConfigType.AOF_REPLAY_MAX_LAG_BYTES] = o.AofReplayMaxLagBytes;
+            values[(int)ServerConfigType.AOF_TAIL_WITNESS_FREQ] = o.AofTailWitnessFreqMs;
+            values[(int)ServerConfigType.AOF_SYNC_MAX_LAG_BYTES] = o.AofSyncMaxLagBytes;
+            values[(int)ServerConfigType.REPL_DISKLESS_SYNC_DELAY] = o.ReplicaDisklessSyncDelay;
+            values[(int)ServerConfigType.REPL_ATTACH_TIMEOUT] = SecondsFromTimeSpan(o.ReplicaAttachTimeout);
+            values[(int)ServerConfigType.CLUSTER_REPLICATION_REESTABLISHMENT_TIMEOUT] = o.ClusterReplicationReestablishmentTimeout;
+            values[(int)ServerConfigType.COMPACTION_MAX_SEGMENTS] = o.CompactionMaxSegments;
+            values[(int)ServerConfigType.COMPACTION_FORCE_DELETE] = o.CompactionForceDelete ? 1 : 0;
+            values[(int)ServerConfigType.COMPACTION_TYPE] = (int)o.CompactionType;
+            values[(int)ServerConfigType.SLOWLOG_LOG_SLOWER_THAN] = o.SlowLogThreshold;
+            values[(int)ServerConfigType.OBJECT_SCAN_COUNT_LIMIT] = o.ObjectScanCountLimit;
+            values[(int)ServerConfigType.SG_GET] = o.EnableScatterGatherGet ? 1 : 0;
+            values[(int)ServerConfigType.MAXCLIENTS] = o.NetworkConnectionLimit;
+            values[(int)ServerConfigType.AOF_SIZE_LIMIT_ENFORCE_FREQUENCY] = o.AofSizeLimitEnforceFrequencySecs;
+            values[(int)ServerConfigType.AOF_COMMIT_FREQ] = o.CommitFrequencyMs;
+            values[(int)ServerConfigType.CHECKPOINT_FREQ] = o.CheckpointFrequencySecs;
+            values[(int)ServerConfigType.EXPIRED_OBJECT_COLLECTION_FREQ] = o.ExpiredObjectCollectionFrequencySecs;
+            values[(int)ServerConfigType.EXPIRED_KEY_DELETION_SCAN_FREQ] = o.ExpiredKeyDeletionScanFrequencySecs;
+
+            // Seed the gossip (GarnetClient) network-writer slots from NetworkWriterOptions.Default.
+            // The slots are authoritative for CONFIG GET / SET; the live gossip clients consume the options
+            // materialized from them by the GOSSIP_CLIENT group, published once below.
+            var gossipOptions = NetworkWriterOptions.Default;
+            values[(int)ServerConfigType.GOSSIP_NETWORK_BUFFER_SIZE_BYTES] = gossipOptions.NetworkBufferSizeBytes;
+            values[(int)ServerConfigType.GOSSIP_REQUEST_PAGE_SIZE_BYTES] = gossipOptions.RequestPageSizeBytes;
+            values[(int)ServerConfigType.GOSSIP_REQUEST_PAGE_COUNT] = gossipOptions.RequestPageCount;
+            values[(int)ServerConfigType.GOSSIP_MAX_OUTSTANDING_REQUESTS] = gossipOptions.MaxOutstandingRequests;
+            values[(int)ServerConfigType.GOSSIP_MAX_OUTSTANDING_COMPLETIONS] = gossipOptions.MaxOutstandingCompletions;
+            values[(int)ServerConfigType.GOSSIP_MAX_CONCURRENT_NETWORK_SENDS] = gossipOptions.MaxConcurrentNetworkSends;
+            values[(int)ServerConfigType.GOSSIP_MAX_OUT_OF_LINE_RENTED_BYTES] = gossipOptions.MaxOutOfLineRentedBytes;
+            values[(int)ServerConfigType.GOSSIP_FLUSH_RESULT_ALLOCATION_MODE] = (long)gossipOptions.FlushResultAllocationMode;
+            values[(int)ServerConfigType.GOSSIP_CLIENT_SWAP_GRACE] = o.GossipClientSwapGraceSecs;
+
+            // Publish the initial state of every configuration group so a consumer constructed before any
+            // CONFIG SET always reads consistent, already-materialized options (groups start dirty).
+            PublishDirtyGroups();
+        }
+
+        /// <summary>
+        /// Publishes every group marked dirty since the last call: re-materializes its options from the current
+        /// slots, bumps its version, and clears the flag. A multi-parameter group that had several members
+        /// changed is published exactly once. Callers other than construction must hold <see cref="setLock"/>.
+        /// </summary>
+        void PublishDirtyGroups(List<ServerConfigGroupType> published = null)
+        {
+            foreach (var group in groups)
+            {
+                if (group != null && group.PublishIfDirty(this))
+                    published?.Add(group.GetGroupType());
+            }
+        }
+
+        /// <summary>Current value of <paramref name="type"/> as a 32-bit integer, in its native unit.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public int GetInt(ServerConfigType type)
+        {
+            AssertKind(type, ConfigKind.Int32);
+            return (int)Volatile.Read(ref values[(int)type]);
+        }
+
+        /// <summary>Current value of <paramref name="type"/> as a 64-bit integer, in its native unit.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public long GetLong(ServerConfigType type)
+        {
+            AssertKind(type, ConfigKind.Int64);
+            return Volatile.Read(ref values[(int)type]);
+        }
+
+        /// <summary>Current value of <paramref name="type"/> as a boolean.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public bool GetBool(ServerConfigType type)
+        {
+            AssertKind(type, ConfigKind.Bool);
+            return Volatile.Read(ref values[(int)type]) != 0;
+        }
+
+        /// <summary>Current value of <paramref name="type"/> converted to microseconds.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public long GetMicroseconds(ServerConfigType type)
+            => ConvertDuration(type, ConfigKind.Microseconds, ConfigTimeUnit.Microseconds);
+
+        /// <summary>Current value of <paramref name="type"/> converted to milliseconds.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public long GetMilliseconds(ServerConfigType type)
+            => ConvertDuration(type, ConfigKind.Milliseconds, ConfigTimeUnit.Milliseconds);
+
+        /// <summary>Current value of <paramref name="type"/> converted to seconds.</summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public long GetSeconds(ServerConfigType type)
+            => ConvertDuration(type, ConfigKind.Seconds, ConfigTimeUnit.Seconds);
+
+        /// <summary>
+        /// Current value of <paramref name="type"/> as a <see cref="TimeSpan"/>. A non-positive stored
+        /// value is interpreted as an infinite timeout and returns <see cref="Timeout.InfiniteTimeSpan"/>,
+        /// following the repo-wide "non-positive means infinite" convention for timeout-valued options.
+        /// Options where zero denotes "no delay" rather than "infinite" (for example replica-sync-delay)
+        /// must be read through <see cref="GetMilliseconds"/> / <see cref="GetSeconds"/>, not this method.
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public TimeSpan GetTimeSpan(ServerConfigType type)
+        {
+            AssertKind(type, ConfigKind.TimeSpan);
+
+            ref readonly var meta = ref Meta[(int)type];
+            var raw = Volatile.Read(ref values[(int)type]);
+            if (raw <= 0)
+                return Timeout.InfiniteTimeSpan;
+
+            return meta.TimeUnit switch
+            {
+                ConfigTimeUnit.Microseconds => TimeSpan.FromTicks(raw * (TimeSpan.TicksPerMillisecond / 1000)),
+                ConfigTimeUnit.Milliseconds => TimeSpan.FromMilliseconds(raw),
+                _ => TimeSpan.FromSeconds(raw),
+            };
+        }
+
+        /// <summary>
+        /// Current value of <paramref name="type"/> as <typeparamref name="TEnum"/>.
+        /// </summary>
+        /// <typeparam name="TEnum">Enum type the option is declared as.</typeparam>
+        /// <param name="type">Configuration parameter to read.</param>
+        /// <returns>The current value as a declared member of <typeparamref name="TEnum"/>.</returns>
+        /// <exception cref="InvalidOperationException">
+        /// The slot does not hold a declared member of <typeparamref name="TEnum"/>. Unreachable in
+        /// practice: every write goes through <see cref="TrySet"/>, which rejects undeclared values.
+        /// Unlike the debug-only assertions above, this check is retained in release builds so a corrupt
+        /// slot surfaces as a fault rather than an out-of-range enum flowing into the server.
+        /// </exception>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        public TEnum GetEnum<TEnum>(ServerConfigType type) where TEnum : unmanaged, Enum
+        {
+            AssertKind(type, ConfigKind.Enum);
+            Debug.Assert(Meta[(int)type].EnumType == typeof(TEnum),
+                $"Configuration '{type}' is declared as '{Meta[(int)type].EnumType}' and cannot be read as '{typeof(TEnum)}'.");
+
+            // The slot holds the underlying value widened to 64 bits (long)
+            var raw = Volatile.Read(ref values[(int)type]);
+
+            // Use the extension method to validate boundaries, check definition, and safely narrow/cast
+            if (!raw.TryParseToEnum(out TEnum enumValue))
+            {
+                throw new InvalidOperationException(
+                    $"The raw configuration value {raw} is out of bounds or not a defined member of enum {typeof(TEnum).Name}.");
+            }
+
+            return enumValue;
+        }
+
+        /// <summary>
+        /// Validate <paramref name="value"/> and, if valid, update the slot for <paramref name="type"/> and
+        /// publish its group. A grouped parameter is committed only if its group still materializes into valid options.
+        /// </summary>
+        /// <param name="type">Configuration parameter to update.</param>
+        /// <param name="value">Value as supplied on the CONFIG SET wire.</param>
+        /// <param name="error">Error message prefixed with "ERR " when the value is rejected.</param>
+        /// <returns><see langword="true"/> if the slot was updated.</returns>
+        public bool TrySet(ServerConfigType type, string value, out string error)
+        {
+            string firstError = null;
+            TrySetAll([(type, value)], e => firstError ??= e);
+            error = firstError;
+            return error == null;
+        }
+
+        /// <summary>
+        /// Applies a CONFIG SET batch and publishes the groups it changed. Each parameter is parsed, range-checked,
+        /// and updated independently; <paramref name="onError"/> receives one message per rejected parameter.
+        /// Grouped parameters are then validated per group: if a group's updated slots do not materialize into
+        /// valid options, every slot this batch changed in that group is restored and the group is reported as
+        /// rejected; otherwise the group is republished once with all of the batch's changes.
+        /// </summary>
+        /// <remarks>
+        /// Batches are serialized, so a published group reflects whole batches only. <paramref name="onPublished"/>
+        /// runs after the batch is released, once per republished group, to notify downstream consumers; a
+        /// consumer reads the group's latest published options, which may already include a later batch.
+        /// </remarks>
+        /// <param name="sets">Parameters and wire values to apply, in order.</param>
+        /// <param name="onError">Receives each error message, prefixed with "ERR ".</param>
+        /// <param name="onPublished">Optional callback invoked for each republished group.</param>
+        public void TrySetAll(IReadOnlyList<(ServerConfigType type, string value)> sets, Action<string> onError,
+            Action<ServerConfigGroupType> onPublished = null)
+        {
+            List<ServerConfigGroupType> published = null;
+            lock (setLock)
+            {
+                if (ApplyBatch(sets, onError))
+                    PublishDirtyGroups(published = []);
+            }
+
+            if (published != null && onPublished != null)
+            {
+                foreach (var group in published)
+                    onPublished(group);
+            }
+        }
+
+        // Applies the batch's slot writes and validates each touched group, rolling back a group that does not
+        // materialize. Returns true if any group was marked dirty. Caller holds setLock.
+        bool ApplyBatch(IReadOnlyList<(ServerConfigType type, string value)> sets, Action<string> onError)
+        {
+            List<(ServerConfigType type, long oldValue)> groupedUpdates = null;
+            foreach (var (type, value) in sets)
+            {
+                if (!TrySetSlot(type, value, out var oldValue, out var error))
+                {
+                    onError(error);
+                    continue;
+                }
+
+                if (Meta[(int)type].GroupType != ServerConfigGroupType.NONE)
+                    (groupedUpdates ??= []).Add((type, oldValue));
+            }
+
+            if (groupedUpdates == null)
+                return false;
+
+            var anyDirty = false;
+            foreach (var group in groups)
+            {
+                if (group == null)
+                    continue;
+
+                var groupType = group.GetGroupType();
+                if (!groupedUpdates.Exists(u => Meta[(int)u.type].GroupType == groupType))
+                    continue;
+
+                if (group.TryValidate(this, out var error))
+                {
+                    group.MarkDirty();
+                    anyDirty = true;
+                    continue;
+                }
+
+                // Restore in reverse so a parameter set more than once in the batch returns to its pre-batch value.
+                for (var i = groupedUpdates.Count - 1; i >= 0; i--)
+                {
+                    var (type, oldValue) = groupedUpdates[i];
+                    if (Meta[(int)type].GroupType == groupType)
+                        Volatile.Write(ref values[(int)type], oldValue);
+                }
+                onError(error);
+            }
+
+            return anyDirty;
+        }
+
+        bool TrySetSlot(ServerConfigType type, string value, out long oldValue, out string error)
+        {
+            error = null;
+            oldValue = 0;
+            ref readonly var meta = ref Meta[(int)type];
+            if (meta.IsReadOnly)
+            {
+                error = $"ERR Option '{meta.Name}' is read-only and cannot be set at runtime.";
+                return false;
+            }
+
+            long parsed;
+            switch (meta.Kind & ConfigKind.StorageMask)
+            {
+                case ConfigKind.Int32:
+                    {
+                        if (!int.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var i32))
+                        {
+                            error = $"ERR Invalid value for '{meta.Name}': expected an integer.";
+                            return false;
+                        }
+                        if (i32 < meta.Min || i32 > meta.Max)
+                        {
+                            error = $"ERR Value for '{meta.Name}' is out of range ({meta.Min}..{meta.Max}).";
+                            return false;
+                        }
+                        parsed = i32;
+                        break;
+                    }
+                case ConfigKind.Int64:
+                    {
+                        if (!long.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, out var i64))
+                        {
+                            error = $"ERR Invalid value for '{meta.Name}': expected an integer.";
+                            return false;
+                        }
+                        if (i64 < meta.Min || i64 > meta.Max)
+                        {
+                            error = $"ERR Value for '{meta.Name}' is out of range ({meta.Min}..{meta.Max}).";
+                            return false;
+                        }
+                        parsed = i64;
+                        break;
+                    }
+                case ConfigKind.Bool:
+                    {
+                        switch (value.ToLowerInvariant())
+                        {
+                            case "yes":
+                            case "true":
+                            case "1":
+                                parsed = 1;
+                                break;
+                            case "no":
+                            case "false":
+                            case "0":
+                                parsed = 0;
+                                break;
+                            default:
+                                error = $"ERR Invalid value for '{meta.Name}': expected 'yes' or 'no'.";
+                                return false;
+                        }
+                        break;
+                    }
+                case ConfigKind.Enum:
+                    {
+                        if (!value.TryParseEnumToLong(meta.EnumType, out var enumValue))
+                        {
+                            error = $"ERR Invalid value for '{meta.Name}': '{value}'.";
+                            return false;
+                        }
+                        parsed = enumValue;
+                        break;
+                    }
+                default:
+                    error = $"ERR Option '{meta.Name}' is not runtime-adjustable.";
+                    return false;
+            }
+
+            // Publish the new value first so any task an update action restarts observes it, then run the
+            // action. On rejection, roll the slot back so the option is left unchanged.
+            oldValue = Volatile.Read(ref values[(int)type]);
+            Volatile.Write(ref values[(int)type], parsed);
+
+            if (meta.UpdateAction != null && !meta.UpdateAction(this, oldValue, parsed, out error))
+            {
+                Volatile.Write(ref values[(int)type], oldValue);
+                return false;
+            }
+
+            return true;
+        }
+
+        // Enacts an aof-commit-freq change on the periodic AOF commit task. A value of 0 (per-operation
+        // auto-commit) is fixed into the AOF log at construction and cannot be toggled on a live log, so a
+        // move to 0 — or any change when the server started at 0 — is rejected. For the safe {-1, >0}
+        // transitions the commit task is restarted (or killed) to pick up the new interval.
+        static bool ApplyCommitFrequencyUpdate(RuntimeServerConfig config, long oldValue, long newValue, out string error)
+        {
+            error = null;
+            if (newValue == 0)
+            {
+                error = "ERR 'aof-commit-freq' cannot be set to 0 at runtime; per-operation auto-commit is fixed at startup.";
+                return false;
+            }
+            if (config.serverOptions.CommitFrequencyMs == 0)
+            {
+                error = "ERR 'aof-commit-freq' cannot be changed at runtime because the server started with per-operation auto-commit (0).";
+                return false;
+            }
+            config.owner?.ReconcilePrimaryTask(TaskType.CommitTask);
+            return true;
+        }
+
+        // Enacts an aof-sync-max-lag-bytes change by pushing the new whole-log budget into the
+        // always-constructed primary-side AofBackpressure of every database. The gate reads plain
+        // fields, so retuning the budget — or enabling from a disabled start — takes effect without a
+        // restart and with no lifecycle task involved.
+        static bool ApplyAofSyncMaxLagUpdate(RuntimeServerConfig config, long oldValue, long newValue, out string error)
+        {
+            error = null;
+            config.owner?.ApplyAofSyncMaxLagBytes(newValue);
+            return true;
+        }
+
+        // Enacts a maxclients change by writing the new ceiling into the ConnectionLimit the
+        // listeners consult on every accept. Every listener shares one instance, so assigning
+        // through each of them is idempotent; iterating rather than taking the first keeps this
+        // correct even if a host ever gives its listeners separate limits.
+        //
+        // Lowering below the live population disconnects nobody: the accept path only refuses new
+        // connections, which is also how Redis treats a lowered maxclients.
+        static bool ApplyMaxClientsUpdate(RuntimeServerConfig config, long oldValue, long newValue, out string error)
+        {
+            error = null;
+
+            var servers = config.owner?.Servers;
+            if (servers == null)
+                return true;
+
+            foreach (var server in servers)
+            {
+                if (server is GarnetServerBase serverBase)
+                    serverBase.ConnectionLimit.Limit = (int)newValue;
+            }
+
+            return true;
+        }
+
+        // Enacts an expired-object-collection-freq change by restarting / killing the collection task so it
+        // picks up the new interval (or stops when disabled).
+        static bool ApplyExpiredObjectCollectionUpdate(RuntimeServerConfig config, long oldValue, long newValue, out string error)
+        {
+            error = null;
+            config.owner?.ReconcilePrimaryTask(TaskType.ObjectCollectTask);
+            return true;
+        }
+
+        // Enacts a checkpoint-freq change by starting or waking the scheduler so it observes the new interval.
+        // Disabling lets the task unregister itself after any running checkpoint finishes, so a CONFIG SET
+        // never waits for that checkpoint. Setting the current value again leaves the pending interval untouched.
+        static bool ApplyCheckpointFrequencyUpdate(RuntimeServerConfig config, long oldValue, long newValue, out string error)
+        {
+            error = null;
+            config.owner?.NotifyCheckpointFrequencyChanged(intervalChanged: oldValue != newValue);
+            return true;
+        }
+
+        // Enacts an expired-key-deletion-scan-freq change by restarting / killing the scan task so it picks
+        // up the new interval (or stops, re-enabling on-demand EXPDELSCAN, when disabled).
+        static bool ApplyExpiredKeyDeletionUpdate(RuntimeServerConfig config, long oldValue, long newValue, out string error)
+        {
+            error = null;
+            config.owner?.ReconcilePrimaryTask(TaskType.ExpiredKeyDeletionTask);
+            return true;
+        }
+
+        /// <summary>Canonical wire name of <paramref name="type"/>.</summary>
+        public static string Name(ServerConfigType type) => Meta[(int)type].Name;
+
+        /// <summary>Resolve a config parameter name (honoring aliases) to a config type handled by this table.</summary>
+        public static bool TryGetType(ReadOnlySpan<byte> name, out ServerConfigType type)
+        {
+            return NameToTypeSpanLookup.TryGetValue(name, out type);
+        }
+
+        // The CLI/config surface expresses these timeouts in seconds and treats <= 0 as an infinite timeout.
+        static int SecondsFromTimeSpan(TimeSpan ts)
+            => ts == Timeout.InfiniteTimeSpan || ts < TimeSpan.Zero ? 0 : (int)ts.TotalSeconds;
+
+        [Conditional("DEBUG")]
+        static void AssertKind(ServerConfigType type, ConfigKind requestedKind)
+        {
+            Debug.Assert((Meta[(int)type].Kind & requestedKind) != 0,
+                $"Configuration '{type}' is declared as {Meta[(int)type].Kind} and cannot be read as {requestedKind}.");
+        }
+
+        // Read a duration-valued slot and convert it from its stored unit to the requested unit.
+        // Conversion to a coarser unit truncates; use GetTimeSpan when full precision is required.
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        long ConvertDuration(ServerConfigType type, ConfigKind requestedKind, ConfigTimeUnit requestedUnit)
+        {
+            AssertKind(type, requestedKind);
+
+            ref readonly var meta = ref Meta[(int)type];
+            var raw = Volatile.Read(ref values[(int)type]);
+            if (meta.TimeUnit == requestedUnit)
+                return raw;
+
+            var storedMicros = meta.TimeUnit switch
+            {
+                ConfigTimeUnit.Microseconds => raw,
+                ConfigTimeUnit.Milliseconds => raw * 1000,
+                _ => raw * 1000_000,
+            };
+
+            return requestedUnit switch
+            {
+                ConfigTimeUnit.Microseconds => storedMicros,
+                ConfigTimeUnit.Milliseconds => storedMicros / 1000,
+                _ => storedMicros / 1000_000,
+            };
+        }
+
+        static void EnsureValidKind(string name, ConfigKind kind, ConfigTimeUnit timeUnit)
+        {
+            var storageKind = kind & ConfigKind.StorageMask;
+            if (storageKind == ConfigKind.None || (storageKind & (storageKind - 1)) != 0)
+                throw new InvalidOperationException(
+                    $"Configuration '{name}' must declare exactly one storage kind, but declares '{storageKind}'.");
+
+            if ((kind & ConfigKind.DurationMask) != 0 && timeUnit == ConfigTimeUnit.None)
+                throw new InvalidOperationException(
+                    $"Configuration '{name}' declares duration views but no time unit.");
+
+            if ((kind & ConfigKind.DurationMask) == 0 && timeUnit != ConfigTimeUnit.None)
+                throw new InvalidOperationException(
+                    $"Configuration '{name}' declares a time unit but no duration views.");
+        }
+
+        static void EnsureSupportedEnum(Type enumType)
+        {
+            if (enumType == null || !enumType.IsEnum)
+                throw new InvalidOperationException(
+                    $"Runtime configuration option declares '{enumType}', which is not an enum type.");
+
+            // Every value is widened into the 64-bit slot, so any integral backing type is supported.
+            // The guard exists to reject a backing type that could not round-trip through the slot.
+            switch (Type.GetTypeCode(Enum.GetUnderlyingType(enumType)))
+            {
+                case TypeCode.SByte:
+                case TypeCode.Byte:
+                case TypeCode.Int16:
+                case TypeCode.UInt16:
+                case TypeCode.Int32:
+                case TypeCode.UInt32:
+                case TypeCode.Int64:
+                case TypeCode.UInt64:
+                    return;
+                default:
+                    throw new InvalidOperationException(
+                        $"Enum '{enumType}' is backed by '{Enum.GetUnderlyingType(enumType)}', which is not supported.");
+            }
+        }
+
+        /// <summary>Current value of <paramref name="type"/> as its RESP string representation.</summary>
+        public string RespFormat(ServerConfigType type)
+        {
+            ref readonly var meta = ref Meta[(int)type];
+            if (meta.IsReadOnly)
+                // Read-only fall-through: the value comes straight from the live startup options.
+                return meta.ReadOnlyFormatter?.Invoke(serverOptions) ?? string.Empty;
+
+            var raw = Volatile.Read(ref values[(int)type]);
+            return (meta.Kind & ConfigKind.StorageMask) switch
+            {
+                ConfigKind.Int32 => ((int)raw).ToString(CultureInfo.InvariantCulture),
+                ConfigKind.Int64 => raw.ToString(CultureInfo.InvariantCulture),
+                ConfigKind.Bool => raw != 0 ? "yes" : "no",
+                ConfigKind.Enum => Enum.GetName(meta.EnumType, raw.ToEnumLiteral(Enum.GetUnderlyingType(meta.EnumType)))
+                    ?? raw.ToString(CultureInfo.InvariantCulture),
+                _ => raw.ToString(CultureInfo.InvariantCulture),
+            };
+        }
+    }
+}

@@ -1,0 +1,178 @@
+﻿// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Collections.Generic;
+using System.Threading;
+using System.Threading.Tasks;
+using Garnet.common;
+using Garnet.networking;
+using Garnet.server.ACL;
+using Garnet.server.Auth;
+using Microsoft.Extensions.Logging;
+
+namespace Garnet.server
+{
+    /// <summary>
+    /// Cluster provider
+    /// </summary>
+    public interface IClusterProvider : IDisposable
+    {
+        /// <summary>
+        /// Create cluster session
+        /// </summary>
+        IClusterSession CreateClusterSession(TransactionManager txnManager, IGarnetAuthenticator authenticator, UserHandle userHandle, GarnetSessionMetrics garnetSessionMetrics, BasicGarnetApi basicGarnetApi, StringBasicContext basicContext, VectorBasicContext vectorContext, INetworkSender networkSender, ILogger logger = null);
+
+
+        /// <summary>
+        /// Are we allowed to incur AOF data loss: { using null AOF device } OR { main memory replication AND no on-demand checkpoints }
+        /// </summary>
+        bool AllowDataLoss { get; }
+
+        /// <summary>
+        /// Flush config
+        /// </summary>
+        void FlushConfig();
+
+        /// <summary>
+        /// Get gossip stats
+        /// </summary>
+        MetricsItem[] GetGossipStats(bool metricsDisabled);
+
+        /// <summary>
+        /// Get replication info
+        /// </summary>
+        MetricsItem[] GetReplicationInfo();
+
+        /// <summary>
+        /// Get buffer poolt stats
+        /// </summary>
+        /// <returns></returns>
+        MetricsItem[] GetBufferPoolStats();
+
+        /// <summary>
+        /// Get info on primary from replica perspective.
+        /// </summary>
+        /// <returns></returns>
+        (AofAddress replication_offset, List<RoleInfo> replicaInfo) GetPrimaryInfo();
+
+        /// <summary>
+        /// Get info on replicas from primary perspective.
+        /// </summary>
+        /// <returns></returns>
+        RoleInfo GetReplicaInfo();
+
+        /// <summary>
+        /// Purger buffer pool for provided manager
+        /// </summary>
+        /// <param name="managerType"></param>
+        void PurgeBufferPool(ManagerType managerType);
+
+        /// <summary>
+        /// Issue a cluster publish message to remote nodes
+        /// </summary>
+        /// <param name="cmd"></param>
+        /// <param name="channel"></param>
+        /// <param name="message"></param>
+        ValueTask ClusterPublishAsync(RespCommand cmd, Span<byte> channel, Span<byte> message);
+
+        /// <summary>
+        /// Is Primary
+        /// </summary>
+        /// <returns></returns>
+        bool IsPrimary();
+
+        /// <summary>
+        /// Is replica
+        /// </summary>
+        /// <returns></returns>
+        bool IsReplica();
+
+        /// <summary>
+        /// Whether application writes are paused for failover.
+        /// </summary>
+        bool IsWritePaused { get; }
+
+        /// <summary>
+        /// Advances the cluster epoch and waits for active sessions to observe the transition.
+        /// </summary>
+        /// <param name="token">Cancellation token for the transition wait.</param>
+        /// <returns>True if sessions drained; false if the wait was canceled.</returns>
+        ValueTask<bool> BumpAndWaitForEpochTransitionAsync(CancellationToken token = default);
+
+        /// <summary>
+        /// Returns true if the given nodeId is a replica, according to the current cluster configuration.
+        /// </summary>
+        bool IsReplica(string nodeId);
+
+        /// <summary>
+        /// On checkpoint initiated
+        /// </summary>
+        /// <param name="CheckpointCoveredAofAddress"></param>
+        void OnCheckpointInitiated(ref AofAddress CheckpointCoveredAofAddress);
+
+        /// <summary>
+        /// Recover the cluster
+        /// </summary>
+        ValueTask RecoverAsync();
+
+        /// <summary>
+        /// Reset gossip stats
+        /// </summary>
+        void ResetGossipStats();
+
+        /// <summary>
+        /// Safe truncate AOF
+        /// </summary>
+        void AddNewCheckpointEntry(bool full, AofAddress CheckpointCoveredAofAddress, Guid storeCheckpointToken, Guid objectStoreCheckpointToken);
+
+        /// <summary>
+        /// Safe truncate AOF until address
+        /// </summary>
+        /// <param name="truncateUntil"></param>
+        void SafeTruncateAOF(in AofAddress truncateUntil);
+
+        /// <summary>
+        /// Start cluster operations
+        /// </summary>
+        void Start();
+
+        /// <summary>
+        /// Update cluster auth (atomically)
+        /// </summary>
+        void UpdateClusterAuth(string clusterUsername, string clusterPassword);
+
+        /// <summary>
+        /// Notifies the cluster provider that the gossip-client configuration group changed at runtime so the
+        /// live gossip clients can be swapped for new instances built from the updated configuration. The swap
+        /// is best-effort: new work observes the replacement immediately and the previous clients are retired
+        /// gracefully in the background so their in-flight requests can drain.
+        /// </summary>
+        void OnGossipClientConfigChanged();
+
+        /// <summary>
+        /// Get checkpoint info
+        /// </summary>
+        MetricsItem[] GetCheckpointInfo();
+
+        /// <summary>
+        /// RunID to identify checkpoint history
+        /// </summary>
+        /// <returns></returns>
+        string GetRunId();
+
+        /// <summary>
+        /// Call to prevent this node from changing its current role.
+        /// 
+        /// If this returns true, must be followed by a single call to 
+        /// <see cref="AllowRoleChange"/>
+        /// </summary>
+        bool PreventRoleChange();
+
+        /// <summary>
+        /// After a successful call to <see cref="PreventRoleChange"/>, 
+        /// allows the node to change roles again.
+        /// </summary>
+        void AllowRoleChange();
+    }
+}
